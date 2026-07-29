@@ -1,0 +1,36 @@
+[package]
+name = "lpc-llm"
+version = "0.1.0"
+edition = "2024"
+description = "Hybrid LLM inference engine — Ollama-like CUI + NVMe weight prefetch"
+license = "MIT"
+
+[dependencies]
+# Inference (pure Rust — no C toolchain required)
+candle-core = "0.9"
+candle-nn = "0.9"
+candle-transformers = "0.9"
+# Tokenizers without oniguruma/C++ (fancy-regex backend)
+tokenizers = { version = "0.19", default-features = false, features = ["unstable_wasm"] }
+
+# CUI
+clap = { version = "4", features = ["derive"] }
+console = "0.15"
+dialoguer = "0.11"
+dirs = "6"
+indicatif = "0.17"
+
+# Shared
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+# Existing I/O demo
+io-uring = "0.7"
+libc = "0.2"
+memmap2 = "0.9"
+
+[profile.release]
+lto = true
+codegen-units = 1

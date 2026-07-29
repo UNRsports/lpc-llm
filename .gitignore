@@ -1,0 +1,42 @@
+# --- build ---
+/target/
+**/*.rs.bk
+
+# --- local model module / engine cache (NEVER push weights) ---
+.lpc-llm/
+**/blobs/
+**/*.gguf
+**/*.pack
+**/*.pack.json
+**/*.pack.partial
+**/layers.pack
+**/layers.pack.json
+
+# --- synthetic / demo weight files ---
+/demo_weights.bin
+**/*.bin
+
+# --- secrets / credentials ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+HF_TOKEN
+**/secrets/
+
+# --- toolchain / editor ---
+.tools/
+.idea/
+.vscode/
+.rename-tmp/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# --- misc ---
+*.log
+*.tmp
+*.partial
