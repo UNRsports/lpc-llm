@@ -14,7 +14,6 @@ use candle_core::quantized::GgmlDType;
 use candle_core::Device;
 
 use super::error::{IoError, Result};
-use super::pipeline::LayerExtent;
 use super::prefetch::{align_up, DIRECT_ALIGN};
 
 /// One tensor's location inside a layer DMA window (or hot region).
@@ -46,21 +45,6 @@ pub struct LayerDmaPlan {
     pub sparse: bool,
 }
 
-impl LayerDmaPlan {
-    /// Convert to the simpler [`LayerExtent`] used by the generic pipeline.
-    pub fn as_extent(&self) -> LayerExtent {
-        LayerExtent {
-            index: self.index,
-            offset: self.read_offset,
-            len: self.read_len,
-        }
-    }
-
-    pub fn uses_dma(&self) -> bool {
-        !self.sparse
-    }
-}
-
 /// Full GGUF layout plan for hybrid prefetch.
 #[derive(Debug, Clone)]
 pub struct GgufLayerMap {
@@ -74,6 +58,11 @@ pub struct GgufLayerMap {
     pub rope_dim: usize,
     pub rms_norm_eps: f64,
     pub rope_freq_base: f32,
+    /// Attention-score softcap (Gemma2); `None` = disabled.
+    pub attn_logit_softcapping: Option<f64>,
+    /// Final logit softcap (Gemma2); `None` = disabled.
+    pub final_logit_softcapping: Option<f64>,
+    pub sliding_window: Option<usize>,
     pub tensor_data_offset: u64,
     pub layers: Vec<LayerDmaPlan>,
     pub hot: Vec<TensorLoc>,
@@ -82,6 +71,13 @@ pub struct GgufLayerMap {
 }
 
 impl GgufLayerMap {
+    pub fn is_gemma_family(&self) -> bool {
+        matches!(
+            self.architecture.as_str(),
+            "gemma" | "gemma2" | "gemma3"
+        )
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let mut file = File::open(path).map_err(|e| {
@@ -143,6 +139,16 @@ impl GgufLayerMap {
         let rope_freq_base = md_f32_arch(&content, &architecture, "rope.freq_base")
             .or_else(|| md_f32(&content, "llama.rope.freq_base"))
             .unwrap_or(10_000.0);
+
+        let attn_logit_softcapping = md_f32_arch(&content, &architecture, "attn_logit_softcapping")
+            .map(|v| v as f64)
+            .filter(|v| *v > 0.0);
+        let final_logit_softcapping = md_f32_arch(&content, &architecture, "final_logit_softcapping")
+            .map(|v| v as f64)
+            .filter(|v| *v > 0.0);
+        let sliding_window = md_u32_arch(&content, &architecture, "attention.sliding_window")
+            .map(|v| v as usize)
+            .filter(|v| *v > 0);
 
         let tensor_data_offset = content.tensor_data_offset;
 
@@ -217,21 +223,14 @@ impl GgufLayerMap {
             rope_dim,
             rms_norm_eps,
             rope_freq_base,
+            attn_logit_softcapping,
+            final_logit_softcapping,
+            sliding_window,
             tensor_data_offset,
             layers,
             hot,
             max_layer_bytes,
         })
-    }
-
-    pub fn extents(&self) -> Vec<LayerExtent> {
-        self.layers.iter().map(LayerDmaPlan::as_extent).collect()
-    }
-
-    /// Prefetch slot size: max layer DMA rounded up to 1 MiB (min 1 MiB).
-    pub fn recommended_slot_bytes(&self) -> usize {
-        let mib = 1024 * 1024;
-        align_up(self.max_layer_bytes.max(mib), mib)
     }
 }
 

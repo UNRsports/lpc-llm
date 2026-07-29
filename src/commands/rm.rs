@@ -5,7 +5,7 @@ use crate::store::LocalStore;
 
 pub fn run(name: &str) -> Result<()> {
     let store = LocalStore::open()?;
-    if store.resolve_name(name)?.is_none() {
+    if !store.is_installed(name)? {
         return Err(AppError::NotInstalled(name.into()));
     }
     store.remove(name)?;

@@ -47,12 +47,17 @@ pub fn run(name: &str, auto_pull: bool) -> Result<()> {
         GgufLayerMap::open(&installed.model_path).map_err(|e| AppError::msg(e.to_string()))?;
 
     let sparse_before = map.layers.iter().filter(|l| l.sparse).count();
+    let dense_before = map.layers.iter().filter(|l| !l.sparse).count();
     println!(
-        "raw GGUF: arch={} blocks={} layers={} sparse={} max_layer={} KiB",
+        "raw GGUF: path={} arch={} blocks={} layers={} dense={} sparse={} \
+         tensor_data_offset=0x{:x} max_layer={} KiB",
+        map.path.display(),
         map.architecture,
         map.block_count,
         map.layers.len(),
+        dense_before,
         sparse_before,
+        map.tensor_data_offset,
         map.max_layer_bytes / 1024
     );
 

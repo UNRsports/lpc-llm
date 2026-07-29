@@ -40,6 +40,14 @@ pub fn run() -> Result<()> {
         println!(
             "{}",
             style(format!(
+                "Data root: {}  (blobs + engine cache under here)",
+                store.root().display()
+            ))
+            .dim()
+        );
+        println!(
+            "{}",
+            style(format!(
                 "Engine cache (regenerable): {}",
                 store.cache_dir().display()
             ))

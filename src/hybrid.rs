@@ -13,7 +13,6 @@ use candle_core::quantized::{ggml_file, QMatMul, QTensor};
 use candle_core::{DType, Device, IndexOp, Module, Tensor};
 use candle_nn::{ops, Embedding};
 use candle_transformers::generation::LogitsProcessor;
-use candle_transformers::quantized_nn::RmsNorm;
 use tokenizers::Tokenizer;
 
 use crate::error::{AppError, Result};
@@ -49,14 +48,41 @@ struct Mlp {
     gate: QMatMul,
     up: QMatMul,
     down: QMatMul,
+    /// Gemma2 GGUF uses GeLU; llama-family uses SiLU.
+    use_gelu: bool,
 }
 
 impl Mlp {
     fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
-        let lhs = candle_nn::ops::silu(&self.gate.forward(xs)?)?;
+        let gate = self.gate.forward(xs)?;
+        let lhs = if self.use_gelu {
+            gate.gelu()?
+        } else {
+            candle_nn::ops::silu(&gate)?
+        };
         let rhs = self.up.forward(xs)?;
         let mid = (lhs * rhs)?;
         self.down.forward(&mid)
+    }
+}
+
+/// RMSNorm. GGUF Gemma weights are already converted to full scale `(1+δ)`
+/// by the HF→GGUF exporter, so we always multiply by `w` (never `1+w` again).
+struct Norm {
+    weight: Tensor,
+    eps: f64,
+}
+
+impl Norm {
+    fn from_qtensor(q: QTensor, eps: f64) -> Result<Self> {
+        Ok(Self {
+            weight: q.dequantize(&q.device())?,
+            eps,
+        })
+    }
+
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        Ok(ops::rms_norm(xs, &self.weight, self.eps as f32)?)
     }
 }
 
@@ -65,8 +91,10 @@ struct LayerLive {
     wk: QMatMul,
     wv: QMatMul,
     wo: QMatMul,
-    attn_norm: RmsNorm,
-    ffn_norm: RmsNorm,
+    attn_norm: Norm,
+    ffn_norm: Norm,
+    post_attention_norm: Option<Norm>,
+    post_ffw_norm: Option<Norm>,
     mlp: Mlp,
 }
 
@@ -77,7 +105,7 @@ pub struct HybridEngine {
     packed_layers: Vec<LayerDmaPlan>,
     device: Device,
     embeddings: Embedding,
-    output_norm: RmsNorm,
+    output_norm: Norm,
     output: QMatMul,
     cos: Tensor,
     sin: Tensor,
@@ -96,10 +124,6 @@ pub struct HybridEngine {
 }
 
 impl HybridEngine {
-    pub fn load(path: impl AsRef<std::path::Path>, pack_cache: impl AsRef<std::path::Path>) -> Result<Self> {
-        Self::load_with_config(path, HybridConfig::default(), pack_cache)
-    }
-
     pub fn load_with_config(
         path: impl AsRef<std::path::Path>,
         config: HybridConfig,
@@ -151,7 +175,7 @@ impl HybridEngine {
         let tok_q = read_tensor_from_file(&mut file, tok_loc, &device)?;
         let emb_dim = map.embedding_length;
         let embeddings = Embedding::new(tok_q.dequantize(&device)?, emb_dim);
-        let output_norm = RmsNorm::from_qtensor(
+        let output_norm = Norm::from_qtensor(
             read_tensor_from_file(&mut file, norm_loc, &device)?,
             map.rms_norm_eps,
         )?;
@@ -185,14 +209,19 @@ impl HybridEngine {
         }
 
         eprintln!(
-            "hybrid: arch={} layers={} hot={} stream={} slot={} MiB pack={}",
+            "hybrid: arch={} layers={} hot={} stream={} slot={} MiB softcap={:?}/{:?} pack={}",
             map.architecture,
             n_layers,
             hot_count,
             n_layers.saturating_sub(hot_count),
             slot / (1024 * 1024),
+            map.attn_logit_softcapping,
+            map.final_logit_softcapping,
             packed.pack_path.display()
         );
+        if let Some(sw) = map.sliding_window {
+            eprintln!("hybrid: sliding_window={sw} (short prompts use full causal mask)");
+        }
 
         Ok(Self {
             map,
@@ -303,6 +332,10 @@ impl HybridEngine {
         };
 
         let mut xs = self.embeddings.forward(x)?;
+        // Gemma/Gemma2: scale embeddings by √hidden.
+        if self.map.is_gemma_family() {
+            xs = (xs * (self.map.embedding_length as f64).sqrt())?;
+        }
         let n = self.packed_layers.len();
 
         // Bootstrap first streamed layer into slot 0 (double-buffer start).
@@ -371,7 +404,11 @@ impl HybridEngine {
 
         let xs = self.output_norm.forward(&xs)?;
         let xs = xs.i((.., seq_len - 1, ..))?;
-        Ok(self.output.forward(&xs)?)
+        let logits = self.output.forward(&xs)?;
+        match self.map.final_logit_softcapping {
+            Some(sc) if sc > 0.0 => Ok(((logits / sc)?.tanh()? * sc)?),
+            _ => Ok(logits),
+        }
     }
 
     fn forward_one_layer(
@@ -385,11 +422,19 @@ impl HybridEngine {
         let residual = xs;
         let x = layer.attn_norm.forward(xs)?;
         let attn = self.forward_attn(layer_idx, layer, &x, mask, index_pos)?;
+        let attn = match &layer.post_attention_norm {
+            Some(n) => n.forward(&attn)?,
+            None => attn,
+        };
         let x = (attn + residual)?;
 
         let residual = &x;
         let x = layer.ffn_norm.forward(&x)?;
         let x = layer.mlp.forward(&x)?;
+        let x = match &layer.post_ffw_norm {
+            Some(n) => n.forward(&x)?,
+            None => x,
+        };
         Ok((x + residual)?)
     }
 
@@ -423,8 +468,20 @@ impl HybridEngine {
             .transpose(1, 2)?
             .contiguous()?;
 
-        let q = apply_rope(&q, &self.cos, &self.sin, index_pos)?;
-        let k = apply_rope(&k, &self.cos, &self.sin, index_pos)?;
+        let q = apply_rope(
+            &q,
+            &self.cos,
+            &self.sin,
+            index_pos,
+            self.map.is_gemma_family(),
+        )?;
+        let k = apply_rope(
+            &k,
+            &self.cos,
+            &self.sin,
+            index_pos,
+            self.map.is_gemma_family(),
+        )?;
 
         let (k, v) = match &self.kv_cache[layer_idx] {
             None => (k, v),
@@ -440,7 +497,10 @@ impl HybridEngine {
         let k = repeat_kv(k, n_head / n_kv.max(1))?;
         let v = repeat_kv(v, n_head / n_kv.max(1))?;
 
-        let att = (q.matmul(&k.t()?)? / (head_dim as f64).sqrt())?;
+        let mut att = (q.matmul(&k.t()?)? / (head_dim as f64).sqrt())?;
+        if let Some(sc) = self.map.attn_logit_softcapping {
+            att = ((att / sc)?.tanh()? * sc)?;
+        }
         let att = match mask {
             None => att,
             Some(m) => {
@@ -498,46 +558,66 @@ fn choose_hot_layers(
     by_ram.min(n_layers.saturating_mul(1) / 2).min(8)
 }
 
+fn try_tensor<'a>(plan: &'a LayerDmaPlan, suffix: &str) -> Option<&'a TensorLoc> {
+    let name = format!("blk.{}.{}", plan.index, suffix);
+    plan.tensors.iter().find(|t| t.name == name)
+}
+
+fn require_tensor<'a>(plan: &'a LayerDmaPlan, suffix: &str) -> Result<&'a TensorLoc> {
+    try_tensor(plan, suffix).ok_or_else(|| {
+        AppError::msg(format!(
+            "missing tensor blk.{}.{}",
+            plan.index, suffix
+        ))
+    })
+}
+
+fn build_layer_live(
+    map: &GgufLayerMap,
+    plan: &LayerDmaPlan,
+    dma: &[u8],
+    device: &Device,
+) -> Result<LayerLive> {
+    let gemma = map.is_gemma_family();
+    let q = |suffix: &str| -> Result<QTensor> {
+        let loc = require_tensor(plan, suffix)?;
+        Ok(qtensor_from_loc(loc, dma, device)?)
+    };
+    let opt_norm = |suffix: &str| -> Result<Option<Norm>> {
+        match try_tensor(plan, suffix) {
+            Some(loc) => Ok(Some(Norm::from_qtensor(
+                qtensor_from_loc(loc, dma, device)?,
+                map.rms_norm_eps,
+            )?)),
+            None => Ok(None),
+        }
+    };
+    Ok(LayerLive {
+        wq: QMatMul::from_qtensor(q("attn_q.weight")?)?,
+        wk: QMatMul::from_qtensor(q("attn_k.weight")?)?,
+        wv: QMatMul::from_qtensor(q("attn_v.weight")?)?,
+        wo: QMatMul::from_qtensor(q("attn_output.weight")?)?,
+        attn_norm: Norm::from_qtensor(q("attn_norm.weight")?, map.rms_norm_eps)?,
+        ffn_norm: Norm::from_qtensor(q("ffn_norm.weight")?, map.rms_norm_eps)?,
+        post_attention_norm: opt_norm("post_attention_norm.weight")?,
+        post_ffw_norm: opt_norm("post_ffw_norm.weight")?,
+        mlp: Mlp {
+            gate: QMatMul::from_qtensor(q("ffn_gate.weight")?)?,
+            down: QMatMul::from_qtensor(q("ffn_down.weight")?)?,
+            up: QMatMul::from_qtensor(q("ffn_up.weight")?)?,
+            // llama.cpp Gemma2 uses ggml_gelu (tanh approx); candle `gelu` matches.
+            use_gelu: gemma,
+        },
+    })
+}
+
 fn materialize_layer(
     plan: &LayerDmaPlan,
     dma: &[u8],
     map: &GgufLayerMap,
     device: &Device,
 ) -> Result<LayerLive> {
-    let q = |suffix: &str| -> Result<QTensor> {
-        let loc = require_tensor(plan, suffix)?;
-        Ok(qtensor_from_loc(loc, dma, device)?)
-    };
-    build_layer_live(map, q)
-}
-
-fn require_tensor<'a>(plan: &'a LayerDmaPlan, suffix: &str) -> Result<&'a TensorLoc> {
-    let name = format!("blk.{}.{}", plan.index, suffix);
-    plan.tensors
-        .iter()
-        .find(|t| t.name == name)
-        .ok_or_else(|| AppError::msg(format!("missing tensor {name}")))
-}
-
-fn build_layer_live(
-    map: &GgufLayerMap,
-    mut q: impl FnMut(&str) -> Result<QTensor>,
-) -> Result<LayerLive> {
-    let attn_norm = RmsNorm::from_qtensor(q("attn_norm.weight")?, map.rms_norm_eps)?;
-    let ffn_norm = RmsNorm::from_qtensor(q("ffn_norm.weight")?, map.rms_norm_eps)?;
-    Ok(LayerLive {
-        wq: QMatMul::from_qtensor(q("attn_q.weight")?)?,
-        wk: QMatMul::from_qtensor(q("attn_k.weight")?)?,
-        wv: QMatMul::from_qtensor(q("attn_v.weight")?)?,
-        wo: QMatMul::from_qtensor(q("attn_output.weight")?)?,
-        attn_norm,
-        ffn_norm,
-        mlp: Mlp {
-            gate: QMatMul::from_qtensor(q("ffn_gate.weight")?)?,
-            down: QMatMul::from_qtensor(q("ffn_down.weight")?)?,
-            up: QMatMul::from_qtensor(q("ffn_up.weight")?)?,
-        },
-    })
+    build_layer_live(map, plan, dma, device)
 }
 
 fn find_hot<'a>(hot: &'a [TensorLoc], name: &str) -> Result<&'a TensorLoc> {
@@ -575,11 +655,24 @@ fn precompute_rope(head_dim: usize, freq_base: f32, device: &Device) -> Result<(
     Ok((idx_theta.cos()?, idx_theta.sin()?))
 }
 
-fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor, index_pos: usize) -> Result<Tensor> {
+fn apply_rope(
+    x: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    index_pos: usize,
+    neox: bool,
+) -> Result<Tensor> {
     let (_b, _h, seq_len, _) = x.dims4()?;
     let cos = cos.narrow(0, index_pos, seq_len)?;
     let sin = sin.narrow(0, index_pos, seq_len)?;
-    Ok(candle_nn::rotary_emb::rope_i(&x.contiguous()?, &cos, &sin)?)
+    let x = x.contiguous()?;
+    if neox {
+        // Gemma / Gemma2: rotate-half (Neox) RoPE.
+        Ok(candle_nn::rotary_emb::rope(&x, &cos, &sin)?)
+    } else {
+        // Llama-family GGUF: interleaved pairs.
+        Ok(candle_nn::rotary_emb::rope_i(&x, &cos, &sin)?)
+    }
 }
 
 fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {

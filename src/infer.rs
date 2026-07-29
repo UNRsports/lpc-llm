@@ -79,12 +79,6 @@ pub struct ChatSession {
 }
 
 impl ChatSession {
-    pub fn load(installed: &InstalledModel, entry: ModelEntry, hybrid: bool) -> Result<Self> {
-        let store = crate::store::LocalStore::open()?;
-        let pack_cache = store.pack_cache_dir(&entry.name);
-        Self::load_with_config(installed, entry, hybrid, HybridConfig::default(), &pack_cache)
-    }
-
     pub fn load_with_config(
         installed: &InstalledModel,
         entry: ModelEntry,
