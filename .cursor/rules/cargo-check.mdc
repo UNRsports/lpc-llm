@@ -1,0 +1,23 @@
+---
+description: Rust ビルド検証は cargo check を優先し、release はユーザー確認時のみ
+alwaysApply: true
+---
+
+# Cargo 検証方針
+
+コーディング・リファクタ中の検証は高速な `cargo check`（必要なら `cargo test`）に限定する。
+
+- **開発中（エージェントが行う検証）**: `cargo check` を使う。型・コンパイルエラーの確認で十分ならこれで止める。
+- **ユニットテストが必要なとき**: `cargo test`（debug）。`--release` は付けない。
+- **`cargo build --release` / `cargo test --release`**: ユーザーが最終確認・性能確認すると明示したとき、またはユーザーが依頼したときに限る。エージェントが毎回 release ビルドしない。
+
+```bash
+# ✅ コーディング中
+cargo check
+cargo test
+
+# ❌ エージェントが勝手にやらない（ユーザー最終確認時のみ）
+cargo build --release
+```
+
+`CARGO_TARGET_DIR` が環境で別パスを指す場合は、プロジェクトの `./target` を使うなら `CARGO_TARGET_DIR` を合わせて指定してよい。
