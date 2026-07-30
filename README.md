@@ -315,7 +315,7 @@ mv ~/.local/share/l3m ~/.local/share/lpc-llm
 - 主要クレート: `candle-core` / `candle-nn` / `candle-transformers` / `tokenizers` / `io-uring` / `memmap2`
 - バイナリ名: `lpc-llm`（`Cargo.toml` の package name）
 - Ollama との関係: **非依存**。CUI の操作感のみ類似
-- ライセンス: MIT（`Cargo.toml`）
+- ライセンス: Apache-2.0（`LICENSE` / `Cargo.toml`）
 
 ```bash
 cargo check
@@ -326,4 +326,4 @@ cargo build --release
 
 ## ライセンス
 
-MIT
+[Apache License 2.0](LICENSE)

@@ -3,7 +3,7 @@ name = "lpc-llm"
 version = "0.1.0"
 edition = "2024"
 description = "Hybrid LLM inference engine — Ollama-like CUI + NVMe weight prefetch"
-license = "MIT"
+license = "Apache-2.0"
 
 [dependencies]
 # Inference (pure Rust — no C toolchain required)
