@@ -3,8 +3,11 @@
 use std::io::{self, Write};
 
 use console::style;
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
 use tokenizers::Tokenizer;
 
+use crate::adapter::AdapterSet;
 use crate::catalog::ModelEntry;
 use crate::engine::Engine;
 use crate::error::{AppError, Result};
@@ -85,16 +88,29 @@ impl ChatSession {
         hybrid: bool,
         cfg: HybridConfig,
         pack_cache: &std::path::Path,
+        adapter: Option<AdapterSet>,
     ) -> Result<Self> {
+        if adapter.is_some() && !hybrid {
+            return Err(AppError::msg(
+                "--adapter requires hybrid inference (internal: hybrid flag was false)",
+            ));
+        }
+
+        let adapter_label = adapter
+            .as_ref()
+            .map(|a| format!("+adapter:{}", a.name()))
+            .unwrap_or_default();
+
         eprintln!(
-            "{} loading {} ({}) …",
+            "{} loading {} ({}{}) …",
             style("·").cyan(),
             style(&entry.name).bold(),
             if hybrid {
                 "hybrid pack+io_uring"
             } else {
                 "eager"
-            }
+            },
+            adapter_label
         );
 
         let backend = if hybrid {
@@ -102,6 +118,7 @@ impl ChatSession {
                 &installed.model_path,
                 cfg,
                 pack_cache,
+                adapter,
             )?)
         } else {
             Backend::Eager(Engine::load(&installed.model_path)?)
@@ -135,24 +152,31 @@ impl ChatSession {
             style(&self.entry.display).bold()
         );
 
-        let stdin = io::stdin();
-        let mut stdout = io::stdout();
+        // rustyline edits by Unicode scalar / display width, so Backspace on
+        // CJK (e.g. 「化」) removes one character instead of one UTF-8 byte.
+        let mut rl = DefaultEditor::new().map_err(|e| {
+            AppError::msg(format!("readline init: {e}"))
+        })?;
         let mut last_user: Option<String> = None;
 
         loop {
-            print!("{} ", style(">>>").cyan().bold());
-            stdout.flush()?;
-
-            let mut line = String::new();
-            let n = stdin.read_line(&mut line)?;
-            if n == 0 {
-                println!();
-                break;
-            }
+            let line = match rl.readline(">>> ") {
+                Ok(l) => l,
+                Err(ReadlineError::Interrupted) => {
+                    println!("{}", style("(Ctrl-C — type /bye to exit)").dim());
+                    continue;
+                }
+                Err(ReadlineError::Eof) => {
+                    println!();
+                    break;
+                }
+                Err(e) => return Err(AppError::msg(format!("readline: {e}"))),
+            };
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
+            let _ = rl.add_history_entry(line);
             match line {
                 "/bye" | "/exit" | "/quit" => break,
                 "/clear" => {

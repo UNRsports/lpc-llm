@@ -32,7 +32,7 @@ pub fn run() -> Result<()> {
 
         match action {
             0 => {
-                commands::cmd_run(None, false, false, None, 4096, 24)?;
+                commands::cmd_run(None, false, false, None, 4096, 24, None)?;
                 return Ok(());
             }
             1 => commands::cmd_list()?,

@@ -1,5 +1,6 @@
 //! lpc-llm — Ollama-like local LLM CUI (pure Rust) + hybrid NVMe prefetch.
 
+mod adapter;
 mod catalog;
 mod commands;
 mod engine;
@@ -21,11 +22,13 @@ use commands::io_demo::IoArgs;
     name = "lpc-llm",
     about = "Local LLM runner (Ollama-style CUI) + hybrid NVMe prefetch I/O",
     long_about = "Pull and run quantized GGUF models via Candle (pure Rust).\n\
-                  Subcommands: list / pull / run / rm / show / prefetch / io.\n\
+                  Subcommands: list / pull / run / rm / show / adapter / prefetch / io.\n\
                   Model blobs live under ~/.local/share/lpc-llm/blobs (durable);\n\
+                  adapters under ~/.local/share/lpc-llm/adapters;\n\
                   engine packs under ~/.local/share/lpc-llm/cache (regenerable).\n\
                   Engine upgrades reuse downloaded weights (e.g. gemma2:2b).\n\
-                  `run --hybrid` streams layers via io_uring double buffers."
+                  `run --hybrid` streams layers via io_uring double buffers.\n\
+                  `run --adapter <name>` binds a LoRA side-path (forces hybrid)."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -62,6 +65,15 @@ enum Commands {
         /// Tokens to stream on the first reply burst (TTFT / 思考の小分け)
         #[arg(long, default_value_t = 24)]
         burst: usize,
+        /// Bind a LoRA / diff adapter by name (forces hybrid)
+        #[arg(long)]
+        adapter: Option<String>,
+    },
+
+    /// Manage diff adapters (LoRA)
+    Adapter {
+        #[command(subcommand)]
+        cmd: AdapterCmd,
     },
 
     /// Map GGUF layers and benchmark io_uring ping-pong prefetch
@@ -85,6 +97,38 @@ enum Commands {
     Io(IoArgs),
 }
 
+#[derive(Debug, Subcommand)]
+enum AdapterCmd {
+    /// List registered adapters
+    List,
+    /// Create an adapter from a local dataset (Phase 4 — not implemented yet)
+    Create {
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        out: Option<String>,
+        #[arg(long)]
+        base: Option<String>,
+    },
+    /// Install a zero-filled demo adapter for integration tests
+    InstallDemo {
+        /// Adapter name (directory under adapters/)
+        #[arg(long, default_value = "demo-zero")]
+        name: String,
+        /// Catalog base model this adapter is shaped for
+        #[arg(long, default_value = "gemma2:2b")]
+        base: String,
+        /// Transformer layer count (gemma2:2b = 26)
+        #[arg(long, default_value_t = 26)]
+        layers: usize,
+        /// Embedding / hidden size (gemma2:2b = 2304)
+        #[arg(long, default_value_t = 2304)]
+        emb_dim: usize,
+        #[arg(long, default_value_t = 8)]
+        rank: usize,
+    },
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
@@ -98,7 +142,21 @@ fn main() -> ExitCode {
             hot_layers,
             ram_mib,
             burst,
-        }) => commands::cmd_run(name, pull, hybrid, hot_layers, ram_mib, burst),
+            adapter,
+        }) => commands::cmd_run(name, pull, hybrid, hot_layers, ram_mib, burst, adapter),
+        Some(Commands::Adapter { cmd }) => match cmd {
+            AdapterCmd::List => commands::cmd_adapter_list(),
+            AdapterCmd::Create { from, out, base } => {
+                commands::cmd_adapter_create(from, out, base)
+            }
+            AdapterCmd::InstallDemo {
+                name,
+                base,
+                layers,
+                emb_dim,
+                rank,
+            } => commands::cmd_adapter_install_demo(name, base, layers, emb_dim, rank),
+        },
         Some(Commands::Prefetch { name, pull }) => commands::cmd_prefetch(&name, pull),
         Some(Commands::Rm { name }) => commands::cmd_rm(&name),
         Some(Commands::Show { name }) => commands::cmd_show(&name),

@@ -1,3 +1,4 @@
+pub mod adapter;
 pub mod io_demo;
 pub mod list;
 pub mod menu;
@@ -37,6 +38,7 @@ pub fn cmd_run(
     hot_layers: Option<usize>,
     ram_mib: usize,
     burst: usize,
+    adapter: Option<String>,
 ) -> Result<()> {
     run::run(run::RunOpts {
         name,
@@ -45,6 +47,7 @@ pub fn cmd_run(
         hot_layers,
         ram_mib,
         burst,
+        adapter,
     })
 }
 
@@ -54,4 +57,26 @@ pub fn cmd_prefetch(name: &str, auto_pull: bool) -> Result<()> {
 
 pub fn cmd_menu() -> Result<()> {
     menu::run()
+}
+
+pub fn cmd_adapter_list() -> Result<()> {
+    adapter::list()
+}
+
+pub fn cmd_adapter_create(
+    from: Option<String>,
+    out: Option<String>,
+    base: Option<String>,
+) -> Result<()> {
+    adapter::create(from, out, base)
+}
+
+pub fn cmd_adapter_install_demo(
+    name: String,
+    base: String,
+    layers: usize,
+    emb_dim: usize,
+    rank: usize,
+) -> Result<()> {
+    adapter::install_demo(name, base, layers, emb_dim, rank)
 }

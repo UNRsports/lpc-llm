@@ -1,9 +1,10 @@
-//! Local data layout — **model module** vs **engine module**.
+//! Local data layout — **model module** vs **engine module** vs **adapters**.
 //!
 //! ```text
 //! ~/.local/share/lpc-llm/
 //!   blobs/          # MODEL MODULE (durable). GGUF + tokenizer by HF repo.
 //!                   # Survives engine upgrades; never re-downloaded if present.
+//!   adapters/       # Diff modules (LoRA). Durable; independent of blobs.
 //!   cache/          # ENGINE MODULE (regenerable). packs/, derived I/O layout.
 //!                   # Safe to delete; rebuilt from blobs on next hybrid run.
 //!   manifest.json   # Soft index (rebuildable by scanning blobs + catalog).
@@ -33,9 +34,21 @@ pub struct InstalledModel {
     pub pulled_at_unix: u64,
 }
 
+/// Soft registry entry for a LoRA / diff adapter under [`LocalStore::adapters_dir`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstalledAdapter {
+    pub name: String,
+    /// Absolute path to the adapter directory (`adapter.json` + `weights.bin`).
+    pub path: PathBuf,
+    pub base_model: String,
+    pub recorded_at_unix: u64,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Manifest {
     models: BTreeMap<String, InstalledModel>,
+    #[serde(default)]
+    adapters: BTreeMap<String, InstalledAdapter>,
 }
 
 pub struct LocalStore {
@@ -46,12 +59,14 @@ impl LocalStore {
     pub fn open() -> Result<Self> {
         let root = data_dir()?;
         fs::create_dir_all(root.join("blobs"))?;
+        fs::create_dir_all(root.join("adapters"))?;
         fs::create_dir_all(root.join("cache").join("packs"))?;
         // legacy empty dir from earlier layouts
         fs::create_dir_all(root.join("models"))?;
         let store = Self { root };
         // Repair soft index from durable blobs (engine upgrade / wiped manifest).
         store.reconcile()?;
+        store.reconcile_adapters()?;
         Ok(store)
     }
 
@@ -62,6 +77,17 @@ impl LocalStore {
     /// Durable model assets (GGUF, tokenizer). Do not wipe on engine upgrade.
     pub fn blobs_dir(&self) -> PathBuf {
         self.root.join("blobs")
+    }
+
+    /// Durable LoRA / diff adapters (`<name>/adapter.json` + `weights.bin`).
+    pub fn adapters_dir(&self) -> PathBuf {
+        self.root.join("adapters")
+    }
+
+    /// Canonical path for one adapter directory.
+    pub fn adapter_path(&self, name: &str) -> PathBuf {
+        let safe = name.replace([':', '/'], "_");
+        self.adapters_dir().join(safe)
     }
 
     /// Regenerable engine artifacts (layer packs, etc.).
@@ -205,11 +231,116 @@ impl LocalStore {
         }
         Ok(added)
     }
+
+    pub fn list_adapters(&self) -> Result<Vec<InstalledAdapter>> {
+        let m = self.load()?;
+        Ok(m.adapters.into_values().collect())
+    }
+
+    pub fn get_adapter(&self, name: &str) -> Result<Option<InstalledAdapter>> {
+        Ok(self.load()?.adapters.get(name).cloned())
+    }
+
+    pub fn record_adapter(&self, entry: InstalledAdapter) -> Result<()> {
+        let mut m = self.load()?;
+        m.adapters.insert(entry.name.clone(), entry);
+        self.save(&m)
+    }
+
+    #[allow(dead_code)]
+    pub fn remove_adapter(&self, name: &str) -> Result<bool> {
+        let mut m = self.load()?;
+        let removed = m.adapters.remove(name).is_some();
+        if removed {
+            self.save(&m)?;
+        }
+        Ok(removed)
+    }
+
+    /// Resolve an adapter by name: valid manifest → discover on disk → `None`.
+    pub fn resolve_adapter(&self, name: &str) -> Result<Option<InstalledAdapter>> {
+        if let Some(a) = self.get_adapter(name)? {
+            if adapter_paths_ok(&a) {
+                return Ok(Some(a));
+            }
+        }
+        if let Some(a) = self.discover_adapter(name)? {
+            self.record_adapter(a.clone())?;
+            return Ok(Some(a));
+        }
+        Ok(None)
+    }
+
+    /// If `adapters/<name>/adapter.json` exists, build an [`InstalledAdapter`].
+    pub fn discover_adapter(&self, name: &str) -> Result<Option<InstalledAdapter>> {
+        let path = self.adapter_path(name);
+        let meta_path = path.join("adapter.json");
+        if !file_nonempty(&meta_path)? {
+            return Ok(None);
+        }
+        let text = fs::read_to_string(&meta_path)?;
+        let meta: AdapterManifestPeek = serde_json::from_str(&text)?;
+        if meta.name != name && meta.name.replace([':', '/'], "_") != name.replace([':', '/'], "_")
+        {
+            // Allow directory name to be the registry key even if meta.name differs slightly.
+        }
+        let base_model = meta.base_model;
+        Ok(Some(InstalledAdapter {
+            name: name.to_string(),
+            path,
+            base_model,
+            recorded_at_unix: now_unix(),
+        }))
+    }
+
+    /// Scan `adapters/*/adapter.json` and repair the soft index.
+    pub fn reconcile_adapters(&self) -> Result<usize> {
+        let dir = self.adapters_dir();
+        if !dir.exists() {
+            return Ok(0);
+        }
+        let mut added = 0usize;
+        let mut m = self.load()?;
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let stale = match m.adapters.get(&name) {
+                Some(a) => !adapter_paths_ok(a),
+                None => true,
+            };
+            if !stale {
+                continue;
+            }
+            if let Some(found) = self.discover_adapter(&name)? {
+                m.adapters.insert(name, found);
+                added += 1;
+            }
+        }
+        if added > 0 {
+            self.save(&m)?;
+        }
+        Ok(added)
+    }
+}
+
+/// Minimal peek of `adapter.json` for store indexing (full parse lives in `adapter`).
+#[derive(Debug, Deserialize)]
+struct AdapterManifestPeek {
+    name: String,
+    base_model: String,
 }
 
 fn paths_ok(m: &InstalledModel) -> bool {
     file_nonempty(&m.model_path).unwrap_or(false)
         && file_nonempty(&m.tokenizer_path).unwrap_or(false)
+}
+
+fn adapter_paths_ok(a: &InstalledAdapter) -> bool {
+    file_nonempty(&a.path.join("adapter.json")).unwrap_or(false)
+        && file_nonempty(&a.path.join("weights.bin")).unwrap_or(false)
 }
 
 fn file_nonempty(path: &Path) -> Result<bool> {

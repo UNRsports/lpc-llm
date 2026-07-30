@@ -15,6 +15,7 @@ use candle_nn::{ops, Embedding};
 use candle_transformers::generation::LogitsProcessor;
 use tokenizers::Tokenizer;
 
+use crate::adapter::{qmatmul_with_lora, AdapterSet, LayerLora};
 use crate::error::{AppError, Result};
 use crate::io::gguf_map::{qtensor_from_loc, GgufLayerMap, LayerDmaPlan, TensorLoc};
 use crate::io::nvme::AsyncNvmeReader;
@@ -32,6 +33,8 @@ pub struct HybridConfig {
     pub hot_layers: Option<usize>,
     /// Tokens to emit ASAP on the first turn (body of “思考の小分け”).
     pub first_burst_tokens: usize,
+    /// Extra resident bytes reserved for a bound LoRA adapter (deducted from hot budget).
+    pub adapter_resident_bytes: usize,
 }
 
 impl Default for HybridConfig {
@@ -40,6 +43,7 @@ impl Default for HybridConfig {
             ram_budget_mib: 4096,
             hot_layers: None,
             first_burst_tokens: 24,
+            adapter_resident_bytes: 0,
         }
     }
 }
@@ -53,16 +57,16 @@ struct Mlp {
 }
 
 impl Mlp {
-    fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
-        let gate = self.gate.forward(xs)?;
+    fn forward(&self, xs: &Tensor, lora: Option<&LayerLora>) -> Result<Tensor> {
+        let gate = qmatmul_with_lora(&self.gate, lora.and_then(|l| l.gate.as_ref()), xs)?;
         let lhs = if self.use_gelu {
             gate.gelu()?
         } else {
             candle_nn::ops::silu(&gate)?
         };
-        let rhs = self.up.forward(xs)?;
+        let rhs = qmatmul_with_lora(&self.up, lora.and_then(|l| l.up.as_ref()), xs)?;
         let mid = (lhs * rhs)?;
-        self.down.forward(&mid)
+        qmatmul_with_lora(&self.down, lora.and_then(|l| l.down.as_ref()), &mid)
     }
 }
 
@@ -118,6 +122,8 @@ pub struct HybridEngine {
     resident: Vec<Option<LayerLive>>,
     hot_count: usize,
     config: HybridConfig,
+    /// Per-layer LoRA slots (empty when no adapter bound).
+    lora: Vec<LayerLora>,
     /// Rolling average wait / compute micros (chunk-size feedback).
     avg_wait_us: f64,
     avg_compute_us: f64,
@@ -128,6 +134,7 @@ impl HybridEngine {
         path: impl AsRef<std::path::Path>,
         config: HybridConfig,
         pack_cache: impl AsRef<std::path::Path>,
+        adapter: Option<AdapterSet>,
     ) -> Result<Self> {
         let path = path.as_ref();
         let pack_cache = pack_cache.as_ref();
@@ -154,6 +161,7 @@ impl HybridEngine {
             packed.max_layer_bytes,
             config.ram_budget_mib,
             config.hot_layers,
+            config.adapter_resident_bytes,
         );
 
         let buffers = match PrefetchBufferManager::new(slot) {
@@ -188,6 +196,20 @@ impl HybridEngine {
             precompute_rope(map.head_dim.max(map.rope_dim), map.rope_freq_base, &device)?;
         let neg_inf = Tensor::new(f32::NEG_INFINITY, &device)?;
         let n_layers = packed.layers.len();
+
+        let mut lora = vec![LayerLora::default(); n_layers];
+        if let Some(set) = adapter {
+            eprintln!(
+                "binding adapter `{}` ({:.1} MiB resident) …",
+                set.name(),
+                set.resident_bytes as f64 / (1024.0 * 1024.0)
+            );
+            for (i, layer) in set.layers.into_iter().enumerate() {
+                if i < lora.len() {
+                    lora[i] = layer;
+                }
+            }
+        }
 
         // --- (中〜大) pin hot layers ---
         let mut resident = Vec::with_capacity(n_layers);
@@ -240,6 +262,7 @@ impl HybridEngine {
             resident,
             hot_count,
             config,
+            lora,
             avg_wait_us: 0.0,
             avg_compute_us: 0.0,
         })
@@ -430,7 +453,10 @@ impl HybridEngine {
 
         let residual = &x;
         let x = layer.ffn_norm.forward(&x)?;
-        let x = layer.mlp.forward(&x)?;
+        let x = {
+            let lora = self.lora.get(layer_idx);
+            layer.mlp.forward(&x, lora)?
+        };
         let x = match &layer.post_ffw_norm {
             Some(n) => n.forward(&x)?,
             None => x,
@@ -451,9 +477,13 @@ impl HybridEngine {
         let n_kv = self.map.head_count_kv;
         let head_dim = self.map.head_dim;
 
-        let q = layer.wq.forward(x)?;
-        let k = layer.wk.forward(x)?;
-        let v = layer.wv.forward(x)?;
+        let (q, k, v) = {
+            let lora = self.lora.get(layer_idx);
+            let q = qmatmul_with_lora(&layer.wq, lora.and_then(|l| l.q.as_ref()), x)?;
+            let k = qmatmul_with_lora(&layer.wk, lora.and_then(|l| l.k.as_ref()), x)?;
+            let v = qmatmul_with_lora(&layer.wv, lora.and_then(|l| l.v.as_ref()), x)?;
+            (q, k, v)
+        };
 
         let q = q
             .reshape((b_sz, seq_len, n_head, head_dim))?
@@ -514,7 +544,8 @@ impl HybridEngine {
         let y = y
             .transpose(1, 2)?
             .reshape(&[b_sz, seq_len, n_head * head_dim])?;
-        Ok(layer.wo.forward(&y)?)
+        let lora = self.lora.get(layer_idx);
+        qmatmul_with_lora(&layer.wo, lora.and_then(|l| l.o.as_ref()), &y)
     }
 
     fn mask(&mut self, t: usize) -> Result<Tensor> {
@@ -543,6 +574,7 @@ fn choose_hot_layers(
     layer_bytes: usize,
     budget_mib: usize,
     override_hot: Option<usize>,
+    adapter_resident_bytes: usize,
 ) -> usize {
     if let Some(h) = override_hot {
         return h.min(n_layers);
@@ -551,8 +583,11 @@ fn choose_hot_layers(
         return 0;
     }
     let budget = budget_mib.saturating_mul(1024 * 1024);
-    // Reserve two prefetch slots + ~512 MiB headroom (KV / runtime).
-    let reserve = layer_bytes.saturating_mul(2).saturating_add(512 * 1024 * 1024);
+    // Reserve two prefetch slots + ~512 MiB headroom (KV / runtime) + adapter.
+    let reserve = layer_bytes
+        .saturating_mul(2)
+        .saturating_add(512 * 1024 * 1024)
+        .saturating_add(adapter_resident_bytes);
     let hot_budget = budget.saturating_sub(reserve);
     let by_ram = hot_budget / layer_bytes;
     by_ram.min(n_layers.saturating_mul(1) / 2).min(8)

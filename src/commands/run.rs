@@ -1,12 +1,14 @@
 use console::style;
 use dialoguer::{Confirm, Select};
 
+use crate::adapter::AdapterSet;
 use crate::catalog;
 use crate::error::{AppError, Result};
 use crate::hybrid::HybridConfig;
 use crate::infer::ChatSession;
 use crate::pull;
 use crate::store::LocalStore;
+use candle_core::Device;
 
 pub struct RunOpts {
     pub name: Option<String>,
@@ -15,6 +17,7 @@ pub struct RunOpts {
     pub hot_layers: Option<usize>,
     pub ram_mib: usize,
     pub burst: usize,
+    pub adapter: Option<String>,
 }
 
 pub fn run(opts: RunOpts) -> Result<()> {
@@ -27,11 +30,51 @@ pub fn run(opts: RunOpts) -> Result<()> {
 
     let entry = catalog::find(&name).ok_or_else(|| AppError::UnknownModel(name.clone()))?;
 
-    let use_hybrid = opts.hybrid || entry.name.starts_with("gemma");
+    // Adapters require the hybrid path (side-path LoRA on HybridEngine).
+    let use_hybrid = opts.hybrid || opts.adapter.is_some() || entry.name.starts_with("gemma");
+
+    let adapter_set = if let Some(ref adapter_name) = opts.adapter {
+        let installed = store.resolve_adapter(adapter_name)?.ok_or_else(|| {
+            AppError::msg(format!(
+                "adapter `{adapter_name}` not found — run `lpc-llm adapter list` \
+                 or place files under adapters/{adapter_name}/"
+            ))
+        })?;
+        if installed.base_model != entry.name {
+            return Err(AppError::msg(format!(
+                "adapter `{}` is for base `{}`, but run target is `{}`",
+                adapter_name, installed.base_model, entry.name
+            )));
+        }
+        let set = AdapterSet::load(&installed.path, &Device::Cpu)?;
+        if set.base_model() != entry.name {
+            return Err(AppError::msg(format!(
+                "adapter file base `{}` mismatches run target `{}`",
+                set.base_model(),
+                entry.name
+            )));
+        }
+        eprintln!(
+            "{} adapter `{}` ({:.1} MiB)",
+            style("·").cyan(),
+            style(set.name()).bold(),
+            set.resident_bytes as f64 / (1024.0 * 1024.0)
+        );
+        Some(set)
+    } else {
+        None
+    };
+
+    let adapter_resident_bytes = adapter_set
+        .as_ref()
+        .map(|s| s.resident_bytes)
+        .unwrap_or(0);
+
     let cfg = HybridConfig {
         ram_budget_mib: opts.ram_mib,
         hot_layers: opts.hot_layers,
         first_burst_tokens: opts.burst,
+        adapter_resident_bytes,
     };
 
     // Prefer durable blobs via resolve (no re-download after engine upgrade).
@@ -62,8 +105,14 @@ pub fn run(opts: RunOpts) -> Result<()> {
     };
 
     let pack_cache = store.pack_cache_dir(&entry.name);
-    let mut session =
-        ChatSession::load_with_config(&installed, entry, use_hybrid, cfg, &pack_cache)?;
+    let mut session = ChatSession::load_with_config(
+        &installed,
+        entry,
+        use_hybrid,
+        cfg,
+        &pack_cache,
+        adapter_set,
+    )?;
     session.run_repl()?;
     Ok(())
 }

@@ -30,6 +30,7 @@ thiserror = "2"
 io-uring = "0.7"
 libc = "0.2"
 memmap2 = "0.9"
+rustyline = "14"
 
 [profile.release]
 lto = true
