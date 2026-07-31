@@ -8,14 +8,16 @@
    3. [Command reference](#3-command-reference)
    4. [Troubleshooting](#4-troubleshooting)
    5. [Development notes](#5-development-notes)
-   6. [License](#6-license)
+   6. [Roadmap / planned work](#6-roadmap--planned-work)
+   7. [License](#7-license)
 2. [日本語](#日本語)
    1. [現状の仕様](#1-現状の仕様)
    2. [マニュアル（導入〜起動〜停止）](#2-マニュアル導入起動停止)
    3. [コマンドリファレンス](#3-コマンドリファレンス)
    4. [トラブルシューティング](#4-トラブルシューティング)
    5. [開発メモ](#5-開発メモ)
-   6. [ライセンス](#6-ライセンス)
+   6. [今後の工程予定](#6-今後の工程予定)
+   7. [ライセンス](#7-ライセンス)
 
 ---
 
@@ -27,6 +29,7 @@ It runs quantized GGUF with Candle, and on the hybrid path streams weights via p
 - **Inference engine**: in-house (Candle + hybrid I/O). No Ollama / llama.cpp binaries
 - **CUI**: Ollama-like `list` / `pull` / `run` / `rm` / `show`
 - **Storage**: model blobs and engine-derived cache are separated. Engine upgrades do not force re-download
+- **Roadmap**: progress and planned phases are tracked in [`todo.md`](todo.md)
 
 ## English table of contents
 
@@ -35,7 +38,8 @@ It runs quantized GGUF with Candle, and on the hybrid path streams weights via p
 3. [Command reference](#3-command-reference)
 4. [Troubleshooting](#4-troubleshooting)
 5. [Development notes](#5-development-notes)
-6. [License](#6-license)
+6. [Roadmap / planned work](#6-roadmap--planned-work)
+7. [License](#7-license)
 
 ---
 
@@ -344,7 +348,17 @@ cargo build --release
 
 ---
 
-## 6. License
+## 6. Roadmap / planned work
+
+Implementation progress (MoE, delta adapters, lightweight agent, and later phases) and the recommended next steps are maintained in:
+
+- **[`todo.md`](todo.md)** — extension roadmap (English / Japanese)
+
+See especially the summary, engineering checklist (Phases 4–8), and recommended next steps in that document.
+
+---
+
+## 7. License
 
 [Apache License 2.0](LICENSE)
 
@@ -358,6 +372,7 @@ Ollama に依存しない、**純 Rust のローカル LLM プレイヤー**で�
 - **推論エンジン**: 自前（Candle + hybrid I/O）。Ollama / llama.cpp バイナリは使いません
 - **CUI**: Ollama 風の `list` / `pull` / `run` / `rm` / `show`
 - **ストレージ**: モデル本体（blobs）とエンジン派生物（cache）を分離。エンジン更新でも再ダウンロードしません
+- **今後の工程**: 進捗と予定は [`todo.md`](todo.md) を参照
 
 ## 日本語目次
 
@@ -366,7 +381,8 @@ Ollama に依存しない、**純 Rust のローカル LLM プレイヤー**で�
 3. [コマンドリファレンス](#3-コマンドリファレンス)
 4. [トラブルシューティング](#4-トラブルシューティング)
 5. [開発メモ](#5-開発メモ)
-6. [ライセンス](#6-ライセンス)
+6. [今後の工程予定](#6-今後の工程予定)
+7. [ライセンス](#7-ライセンス)
 
 ---
 
@@ -675,6 +691,16 @@ cargo build --release
 
 ---
 
-## 6. ライセンス
+## 6. 今後の工程予定
+
+MoE・差分アダプタ・軽量エージェント以降の実装進捗と推奨次工程は、次のドキュメントにまとめています。
+
+- **[`todo.md`](todo.md)** — 拡張ロードマップ（英語 / 日本語）
+
+特に総括・工程チェックリスト（Phase 4〜8）・推奨する次工程を参照してください。
+
+---
+
+## 7. ライセンス
 
 [Apache License 2.0](LICENSE)
