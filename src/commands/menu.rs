@@ -32,7 +32,17 @@ pub fn run() -> Result<()> {
 
         match action {
             0 => {
-                commands::cmd_run(None, false, false, None, 4096, 24, None)?;
+                commands::cmd_run(
+                    None,
+                    false,
+                    false,
+                    None,
+                    4096,
+                    24,
+                    None,
+                    false,
+                    "smollm2:360m".into(),
+                )?;
                 return Ok(());
             }
             1 => commands::cmd_list()?,

@@ -18,9 +18,10 @@ use tokenizers::Tokenizer;
 use crate::adapter::{qmatmul_with_lora, AdapterSet, LayerLora};
 use crate::error::{AppError, Result};
 use crate::io::gguf_map::{qtensor_from_loc, GgufLayerMap, LayerDmaPlan, TensorLoc};
+use crate::io::moe::{ExpertDmaPlan, MoeInfo};
 use crate::io::nvme::AsyncNvmeReader;
-use crate::io::pack::ensure_packed;
-use crate::io::prefetch::PrefetchBufferManager;
+use crate::io::pack::{ensure_experts_packed, ensure_packed, PackedExperts};
+use crate::io::prefetch::{PrefetchBufferManager, PrefetchRing};
 
 const MAX_SEQ_LEN: usize = 4096;
 
@@ -70,6 +71,16 @@ impl Mlp {
     }
 }
 
+/// Dense MLP or MoE block (router resident; experts DMA'd on demand).
+enum FeedForward {
+    Dense(Mlp),
+    MoE {
+        router: QMatMul,
+        n_expert_used: usize,
+        use_gelu: bool,
+    },
+}
+
 /// RMSNorm. GGUF Gemma weights are already converted to full scale `(1+δ)`
 /// by the HF→GGUF exporter, so we always multiply by `w` (never `1+w` again).
 struct Norm {
@@ -99,7 +110,7 @@ struct LayerLive {
     ffn_norm: Norm,
     post_attention_norm: Option<Norm>,
     post_ffw_norm: Option<Norm>,
-    mlp: Mlp,
+    ff: FeedForward,
 }
 
 /// Streaming llama-family model: packed DMA + hot resident layers.
@@ -118,15 +129,29 @@ pub struct HybridEngine {
     masks: HashMap<usize, Tensor>,
     buffers: PrefetchBufferManager,
     reader: AsyncNvmeReader,
+    /// MoE expert pack + DMA ring (absent on dense models).
+    moe_runtime: Option<MoeRuntime>,
     /// First `hot_count` layers kept in RAM.
     resident: Vec<Option<LayerLive>>,
     hot_count: usize,
     config: HybridConfig,
     /// Per-layer LoRA slots (empty when no adapter bound).
     lora: Vec<LayerLora>,
+    /// Optional Top-K expert affinity hints from the Phase 3 agent.
+    expert_prefetch_hints: Vec<usize>,
     /// Rolling average wait / compute micros (chunk-size feedback).
     avg_wait_us: f64,
     avg_compute_us: f64,
+}
+
+/// Expert streaming state: packed plans + dedicated io_uring reader + ring.
+struct MoeRuntime {
+    /// Soft link / introspection (kept for API completeness).
+    #[allow(dead_code)]
+    info: MoeInfo,
+    packed: PackedExperts,
+    reader: AsyncNvmeReader,
+    ring: PrefetchRing,
 }
 
 impl HybridEngine {
@@ -155,6 +180,14 @@ impl HybridEngine {
         map.layers = packed.layers.clone();
         map.max_layer_bytes = packed.max_layer_bytes;
 
+        let packed_experts = ensure_experts_packed(path, &map, pack_cache)
+            .map_err(|e| AppError::msg(e.to_string()))?;
+        if let Some(ref pe) = packed_experts {
+            map.experts = pe.experts.clone();
+            map.max_expert_bytes = pe.max_expert_bytes;
+            map.moe = Some(pe.moe.clone());
+        }
+
         let slot = packed.recommended_slot_bytes();
         let hot_count = choose_hot_layers(
             map.layers.len(),
@@ -162,6 +195,10 @@ impl HybridEngine {
             config.ram_budget_mib,
             config.hot_layers,
             config.adapter_resident_bytes,
+            packed_experts
+                .as_ref()
+                .map(|p| p.recommended_slot_bytes().saturating_mul(p.moe.expert_used_count.max(2)))
+                .unwrap_or(0),
         );
 
         let buffers = match PrefetchBufferManager::new(slot) {
@@ -174,6 +211,37 @@ impl HybridEngine {
         };
         let reader =
             AsyncNvmeReader::open(&packed.pack_path).map_err(|e| AppError::msg(e.to_string()))?;
+
+        let moe_runtime = if let Some(pe) = packed_experts {
+            let n_slots = pe.moe.expert_used_count.max(2);
+            let expert_slot = pe.recommended_slot_bytes();
+            let ring = match PrefetchRing::new(expert_slot, n_slots) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("warning: expert mlock failed ({e}); using unlocked ring");
+                    PrefetchRing::new_unlocked(expert_slot, n_slots)
+                        .map_err(|e| AppError::msg(e.to_string()))?
+                }
+            };
+            let expert_reader =
+                AsyncNvmeReader::open(&pe.pack_path).map_err(|e| AppError::msg(e.to_string()))?;
+            eprintln!(
+                "MoE: family={:?} experts={} top-k={} expert_slot={} KiB ring={}",
+                pe.moe.family,
+                pe.moe.expert_count,
+                pe.moe.expert_used_count,
+                expert_slot / 1024,
+                n_slots
+            );
+            Some(MoeRuntime {
+                info: pe.moe.clone(),
+                packed: pe,
+                reader: expert_reader,
+                ring,
+            })
+        } else {
+            None
+        };
 
         let mut file = File::open(path)?;
         let tok_loc = find_hot(&map.hot, "token_embd.weight")?;
@@ -259,13 +327,25 @@ impl HybridEngine {
             masks: HashMap::new(),
             buffers,
             reader,
+            moe_runtime,
             resident,
             hot_count,
             config,
             lora,
+            expert_prefetch_hints: Vec::new(),
             avg_wait_us: 0.0,
             avg_compute_us: 0.0,
         })
+    }
+
+    /// Agent / caller may set preferred expert IDs for the next forward (prefetch hints).
+    pub fn set_expert_prefetch_hints(&mut self, hints: Vec<usize>) {
+        self.expert_prefetch_hints = hints;
+    }
+
+    #[allow(dead_code)]
+    pub fn moe_info(&self) -> Option<&MoeInfo> {
+        self.moe_runtime.as_ref().map(|m| &m.info)
     }
 
     pub fn config(&self) -> &HybridConfig {
@@ -455,13 +535,162 @@ impl HybridEngine {
         let x = layer.ffn_norm.forward(&x)?;
         let x = {
             let lora = self.lora.get(layer_idx);
-            layer.mlp.forward(&x, lora)?
+            match &layer.ff {
+                FeedForward::Dense(mlp) => mlp.forward(&x, lora)?,
+                FeedForward::MoE {
+                    router,
+                    n_expert_used,
+                    use_gelu,
+                } => self.forward_moe(
+                    layer_idx,
+                    router,
+                    *n_expert_used,
+                    *use_gelu,
+                    &x,
+                )?,
+            }
         };
         let x = match &layer.post_ffw_norm {
             Some(n) => n.forward(&x)?,
             None => x,
         };
         Ok((x + residual)?)
+    }
+
+    /// Gating → Top-K → expert DMA from `experts.pack` → weighted combine.
+    fn forward_moe(
+        &mut self,
+        layer_idx: usize,
+        router: &QMatMul,
+        n_expert_used: usize,
+        use_gelu: bool,
+        xs: &Tensor,
+    ) -> Result<Tensor> {
+        let (b_size, seq_len, hidden_dim) = xs.dims3()?;
+        let xs_flat = xs.reshape(((), hidden_dim))?;
+        let router_logits = router.forward(&xs_flat)?;
+        let routing = ops::softmax_last_dim(&router_logits)?;
+        let routing_vec = routing.to_vec2::<f32>()?;
+
+        // Apply optional agent affinity: boost hinted experts slightly.
+        let hints = &self.expert_prefetch_hints;
+
+        let mut top_x: Vec<Vec<u32>> = vec![Vec::new(); routing_vec.first().map(|r| r.len()).unwrap_or(0)];
+        let mut selected_rws: Vec<Vec<f32>> = vec![Vec::new(); top_x.len()];
+
+        for (row_idx, rw) in routing_vec.iter().enumerate() {
+            let mut dst: Vec<u32> = (0..rw.len() as u32).collect();
+            dst.sort_by(|&i, &j| {
+                let mut wi = rw[i as usize];
+                let mut wj = rw[j as usize];
+                if hints.contains(&(i as usize)) {
+                    wi *= 1.05;
+                }
+                if hints.contains(&(j as usize)) {
+                    wj *= 1.05;
+                }
+                wj.total_cmp(&wi)
+            });
+            let mut sum = 0f32;
+            for &expert_idx in dst.iter().take(n_expert_used) {
+                sum += rw[expert_idx as usize];
+            }
+            let norm = if sum > 0.0 { sum } else { 1.0 };
+            for &expert_idx in dst.iter().take(n_expert_used) {
+                let expert_idx = expert_idx as usize;
+                top_x[expert_idx].push(row_idx as u32);
+                selected_rws[expert_idx].push(rw[expert_idx] / norm);
+            }
+        }
+
+        let mut ys = xs_flat.zeros_like()?;
+
+        // Collect experts that have tokens, prefetch via ring while computing.
+        let active: Vec<usize> = top_x
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| if v.is_empty() { None } else { Some(i) })
+            .collect();
+
+        for (ai, &expert_id) in active.iter().enumerate() {
+            let slot = ai % self
+                .moe_runtime
+                .as_ref()
+                .map(|m| m.ring.len())
+                .unwrap_or(2);
+
+            // Prefetch next active expert into the other ring slot.
+            if let Some(&next_id) = active.get(ai + 1) {
+                let next_slot = (ai + 1)
+                    % self
+                        .moe_runtime
+                        .as_ref()
+                        .map(|m| m.ring.len())
+                        .unwrap_or(2);
+                self.dma_expert(layer_idx, next_id, next_slot)?;
+            }
+
+            let mlp = self.load_expert_mlp(layer_idx, expert_id, slot, use_gelu)?;
+            let row_ids = &top_x[expert_id];
+            if row_ids.is_empty() {
+                continue;
+            }
+            let index = Tensor::new(row_ids.as_slice(), &self.device)?;
+            let indexed = xs_flat.index_select(&index, 0)?;
+            let out = mlp.forward(&indexed, None)?;
+            let rw = Tensor::new(selected_rws[expert_id].as_slice(), &self.device)?
+                .reshape((row_ids.len(), 1))?;
+            let weighted = out.broadcast_mul(&rw)?;
+            ys = ys.index_add(&index, &weighted, 0)?;
+        }
+
+        Ok(ys.reshape((b_size, seq_len, hidden_dim))?)
+    }
+
+    fn dma_expert(&mut self, layer_idx: usize, expert_id: usize, slot: usize) -> Result<()> {
+        let rt = self
+            .moe_runtime
+            .as_mut()
+            .ok_or_else(|| AppError::msg("MoE runtime missing"))?;
+        let plan = rt
+            .packed
+            .plan(layer_idx, expert_id)
+            .ok_or_else(|| {
+                AppError::msg(format!(
+                    "missing expert plan layer={layer_idx} expert={expert_id}"
+                ))
+            })?
+            .clone();
+        if rt.reader.has_in_flight() {
+            rt.reader.wait_completion()?;
+        }
+        let buf = rt.ring.get_mut(slot)?;
+        rt.reader
+            .submit_read(buf, slot, plan.read_offset, plan.read_len)?;
+        rt.reader.wait_completion()?;
+        Ok(())
+    }
+
+    fn load_expert_mlp(
+        &mut self,
+        layer_idx: usize,
+        expert_id: usize,
+        slot: usize,
+        use_gelu: bool,
+    ) -> Result<Mlp> {
+        // Ensure this expert is in the ring slot.
+        self.dma_expert(layer_idx, expert_id, slot)?;
+        let rt = self
+            .moe_runtime
+            .as_ref()
+            .ok_or_else(|| AppError::msg("MoE runtime missing"))?;
+        let plan = rt.packed.plan(layer_idx, expert_id).ok_or_else(|| {
+            AppError::msg(format!(
+                "missing expert plan layer={layer_idx} expert={expert_id}"
+            ))
+        })?;
+        let dma = rt.ring.get(slot)?.as_slice();
+        materialize_expert_mlp(plan, dma, &self.device, use_gelu)
     }
 
     fn forward_attn(
@@ -575,6 +804,7 @@ fn choose_hot_layers(
     budget_mib: usize,
     override_hot: Option<usize>,
     adapter_resident_bytes: usize,
+    expert_ring_bytes: usize,
 ) -> usize {
     if let Some(h) = override_hot {
         return h.min(n_layers);
@@ -583,11 +813,12 @@ fn choose_hot_layers(
         return 0;
     }
     let budget = budget_mib.saturating_mul(1024 * 1024);
-    // Reserve two prefetch slots + ~512 MiB headroom (KV / runtime) + adapter.
+    // Reserve two prefetch slots + ~512 MiB headroom (KV / runtime) + adapter + MoE ring.
     let reserve = layer_bytes
         .saturating_mul(2)
         .saturating_add(512 * 1024 * 1024)
-        .saturating_add(adapter_resident_bytes);
+        .saturating_add(adapter_resident_bytes)
+        .saturating_add(expert_ring_bytes);
     let hot_budget = budget.saturating_sub(reserve);
     let by_ram = hot_budget / layer_bytes;
     by_ram.min(n_layers.saturating_mul(1) / 2).min(8)
@@ -627,6 +858,32 @@ fn build_layer_live(
             None => Ok(None),
         }
     };
+
+    let ff = if try_tensor(plan, "ffn_gate.weight").is_some() {
+        FeedForward::Dense(Mlp {
+            gate: QMatMul::from_qtensor(q("ffn_gate.weight")?)?,
+            down: QMatMul::from_qtensor(q("ffn_down.weight")?)?,
+            up: QMatMul::from_qtensor(q("ffn_up.weight")?)?,
+            use_gelu: gemma,
+        })
+    } else if try_tensor(plan, "ffn_gate_inp.weight").is_some() {
+        let n_used = map
+            .moe
+            .as_ref()
+            .map(|m| m.expert_used_count)
+            .unwrap_or(2);
+        FeedForward::MoE {
+            router: QMatMul::from_qtensor(q("ffn_gate_inp.weight")?)?,
+            n_expert_used: n_used,
+            use_gelu: gemma,
+        }
+    } else {
+        return Err(AppError::msg(format!(
+            "layer {} has neither dense FFN nor MoE router (ffn_gate / ffn_gate_inp)",
+            plan.index
+        )));
+    };
+
     Ok(LayerLive {
         wq: QMatMul::from_qtensor(q("attn_q.weight")?)?,
         wk: QMatMul::from_qtensor(q("attn_k.weight")?)?,
@@ -636,13 +893,7 @@ fn build_layer_live(
         ffn_norm: Norm::from_qtensor(q("ffn_norm.weight")?, map.rms_norm_eps)?,
         post_attention_norm: opt_norm("post_attention_norm.weight")?,
         post_ffw_norm: opt_norm("post_ffw_norm.weight")?,
-        mlp: Mlp {
-            gate: QMatMul::from_qtensor(q("ffn_gate.weight")?)?,
-            down: QMatMul::from_qtensor(q("ffn_down.weight")?)?,
-            up: QMatMul::from_qtensor(q("ffn_up.weight")?)?,
-            // llama.cpp Gemma2 uses ggml_gelu (tanh approx); candle `gelu` matches.
-            use_gelu: gemma,
-        },
+        ff,
     })
 }
 
@@ -653,6 +904,40 @@ fn materialize_layer(
     device: &Device,
 ) -> Result<LayerLive> {
     build_layer_live(map, plan, dma, device)
+}
+
+fn materialize_expert_mlp(
+    plan: &ExpertDmaPlan,
+    dma: &[u8],
+    device: &Device,
+    use_gelu: bool,
+) -> Result<Mlp> {
+    let find = |role: &str| -> Result<&TensorLoc> {
+        let suffix = format!("ffn_{role}.{}.weight", plan.expert_id);
+        plan.tensors
+            .iter()
+            .find(|t| t.name.ends_with(&suffix) || t.name.contains(&format!("ffn_{role}.")))
+            .or_else(|| {
+                // Packed names are canonical `blk.L.ffn_ROLE.E.weight`.
+                let full = format!("blk.{}.ffn_{}.{}.weight", plan.layer_index, role, plan.expert_id);
+                plan.tensors.iter().find(|t| t.name == full)
+            })
+            .ok_or_else(|| {
+                AppError::msg(format!(
+                    "expert L{} E{} missing ffn_{role}",
+                    plan.layer_index, plan.expert_id
+                ))
+            })
+    };
+    let gate = QMatMul::from_qtensor(qtensor_from_loc(find("gate")?, dma, device)?)?;
+    let up = QMatMul::from_qtensor(qtensor_from_loc(find("up")?, dma, device)?)?;
+    let down = QMatMul::from_qtensor(qtensor_from_loc(find("down")?, dma, device)?)?;
+    Ok(Mlp {
+        gate,
+        up,
+        down,
+        use_gelu,
+    })
 }
 
 fn find_hot<'a>(hot: &'a [TensorLoc], name: &str) -> Result<&'a TensorLoc> {

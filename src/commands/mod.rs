@@ -39,6 +39,8 @@ pub fn cmd_run(
     ram_mib: usize,
     burst: usize,
     adapter: Option<String>,
+    agent: bool,
+    agent_model: String,
 ) -> Result<()> {
     run::run(run::RunOpts {
         name,
@@ -48,6 +50,8 @@ pub fn cmd_run(
         ram_mib,
         burst,
         adapter,
+        agent,
+        agent_model,
     })
 }
 

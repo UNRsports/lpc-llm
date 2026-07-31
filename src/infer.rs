@@ -8,11 +8,13 @@ use rustyline::DefaultEditor;
 use tokenizers::Tokenizer;
 
 use crate::adapter::AdapterSet;
+use crate::agent;
 use crate::catalog::ModelEntry;
+use crate::commands::run::resolve_adapter;
 use crate::engine::Engine;
 use crate::error::{AppError, Result};
 use crate::hybrid::{HybridConfig, HybridEngine};
-use crate::store::InstalledModel;
+use crate::store::{InstalledModel, LocalStore};
 
 enum Backend {
     Eager(Engine),
@@ -68,6 +70,12 @@ impl Backend {
         match self {
             Self::Hybrid(e) => Some(e.io_compute_ratio()),
             Self::Eager(_) => None,
+        }
+    }
+
+    fn set_expert_hints(&mut self, hints: Vec<usize>) {
+        if let Self::Hybrid(e) = self {
+            e.set_expert_prefetch_hints(hints);
         }
     }
 }
@@ -139,10 +147,102 @@ impl ChatSession {
             tokenizer,
             entry,
             history: Vec::new(),
-            // Cap default length so first reply arrives sooner (思考の小分け).
             max_tokens: 96,
             temperature: 0.7,
         })
+    }
+
+    /// Phase 3 agent REPL: first user turn → router (exclusive RAM) → drop → main.
+    pub fn run_agent_repl(
+        store: &LocalStore,
+        installed: &InstalledModel,
+        entry: ModelEntry,
+        cfg: HybridConfig,
+        pack_cache: &std::path::Path,
+        _force_hybrid: bool,
+        explicit_adapter: Option<String>,
+        agent_model: String,
+    ) -> Result<()> {
+        println!(
+            "{} {} — agent mode (`{}` router, exclusive RAM) — `/bye` exit",
+            style(">>>").cyan().bold(),
+            style(&entry.display).bold(),
+            agent_model
+        );
+
+        let mut rl = DefaultEditor::new()
+            .map_err(|e| AppError::msg(format!("readline init: {e}")))?;
+
+        // Wait for the first real user turn before loading anything heavy.
+        let first_user = loop {
+            let line = match rl.readline(">>> ") {
+                Ok(l) => l,
+                Err(ReadlineError::Interrupted) => {
+                    println!("{}", style("(Ctrl-C — type /bye to exit)").dim());
+                    continue;
+                }
+                Err(ReadlineError::Eof) => {
+                    println!();
+                    return Ok(());
+                }
+                Err(e) => return Err(AppError::msg(format!("readline: {e}"))),
+            };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let _ = rl.add_history_entry(line);
+            match line {
+                "/bye" | "/exit" | "/quit" => return Ok(()),
+                "/clear" | "/more" => {
+                    println!("{}", style("(load the first message first)").dim());
+                    continue;
+                }
+                _ => break line.to_string(),
+            }
+        };
+
+        let adapters_for_base: Vec<_> = store
+            .list_adapters()?
+            .into_iter()
+            .filter(|a| a.base_model == entry.name)
+            .collect();
+
+        // Router occupies RAM alone; classify_intent drops it before return.
+        let decision = agent::classify_intent(store, &first_user, &adapters_for_base, &agent_model)?;
+
+        let adapter_name = explicit_adapter
+            .as_deref()
+            .or(decision.adapter.as_deref());
+        if explicit_adapter.is_none() {
+            if let Some(a) = adapter_name {
+                eprintln!(
+                    "{} agent selected adapter `{a}` (intent={})",
+                    style("·").cyan(),
+                    decision.intent
+                );
+            }
+        }
+
+        let (adapter_set, cfg) = resolve_adapter(store, &entry.name, adapter_name, cfg)?;
+        // Agent always prefers hybrid so LoRA + MoE expert hints apply.
+        let use_hybrid = true;
+
+        let mut session =
+            Self::load_with_config(installed, entry, use_hybrid, cfg, pack_cache, adapter_set)?;
+        session.backend.set_expert_hints(decision.expert_hints);
+
+        // First turn already collected — generate immediately, then normal REPL.
+        let burst = session.backend.first_burst().min(session.max_tokens);
+        let reply = session.generate_burst(&first_user, burst)?;
+        session.history.push((first_user, reply));
+        session.run_repl_continue(rl)?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn set_expert_hints(&mut self, hints: Vec<usize>) {
+        self.backend.set_expert_hints(hints);
     }
 
     pub fn run_repl(&mut self) -> Result<()> {
@@ -152,12 +252,12 @@ impl ChatSession {
             style(&self.entry.display).bold()
         );
 
-        // rustyline edits by Unicode scalar / display width, so Backspace on
-        // CJK (e.g. 「化」) removes one character instead of one UTF-8 byte.
-        let mut rl = DefaultEditor::new().map_err(|e| {
-            AppError::msg(format!("readline init: {e}"))
-        })?;
-        let mut last_user: Option<String> = None;
+        let rl = DefaultEditor::new().map_err(|e| AppError::msg(format!("readline init: {e}")))?;
+        self.run_repl_continue(rl)
+    }
+
+    fn run_repl_continue(&mut self, mut rl: DefaultEditor) -> Result<()> {
+        let mut last_user: Option<String> = self.history.last().map(|(u, _)| u.clone());
 
         loop {
             let line = match rl.readline(">>> ") {
@@ -188,7 +288,6 @@ impl ChatSession {
                 }
                 "/more" => {
                     if let Some(ref u) = last_user.clone() {
-                        // Continue generation with another burst (小分け).
                         let reply = self.generate_burst(u, self.max_tokens)?;
                         if let Some(last) = self.history.last_mut() {
                             last.1.push_str(&reply);
@@ -202,7 +301,6 @@ impl ChatSession {
             }
 
             last_user = Some(line.to_string());
-            // First burst: shorter cap for faster TTFT feel.
             let burst = self.backend.first_burst().min(self.max_tokens);
             let reply = self.generate_burst(line, burst)?;
             self.history.push((line.to_string(), reply));

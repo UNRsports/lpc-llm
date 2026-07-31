@@ -10,15 +10,18 @@
 |----|------|------|
 | 基盤（既存） | GGUF 層パック + io_uring ダブルバッファ hybrid | **完了**（本拡張の前提） |
 | 軸2 / Phase 1 | 差分アダプタ管理・サイドパス LoRA・`--adapter` | **完了** |
-| 軸1 / Phase 2 | MoE Expert 分割パック + 動的 DMA | **未着手** |
-| 軸3 / Phase 3 | 超軽量ルーターエージェント + メモリ排他 | **未着手** |
+| 軸1 / Phase 2 | MoE Expert 分割パック + 動的 DMA | **完了** |
+| 軸3 / Phase 3 | 超軽量ルーターエージェント + メモリ排他 | **完了** |
 | 軸2 / Phase 4 | `adapter create` 学習器プロトタイプ | **未着手**（CLI 案内のみ） |
 | 長期 / Phase 5+ | 基盤フル学習・数十億 GGUF・SFT/RLHF | **未着手**（下記の実現可能性を参照） |
 | 拡張 / Phase 7 | 自動知識獲得 & ユーザー適応（Web + auto-train） | **未着手**（条件付き可能） |
 | 拡張 / Phase 8 | NVMe 常駐 project-map & 俯瞰記憶 | **未着手**（条件付き可能） |
 
-**いま使えるもの:** `lpc-llm run <model> --adapter <name>`（Hybrid 経路で LoRA サイドパス）。  
-**まだ使えないもの:** `--agent`、MoE Expert ストリーミング、実アダプタ学習（`adapter create`）、基盤フル学習、本格 SFT/RLHF、Web 知識獲得、`user_profile` 自動学習、`--project-map`。
+**いま使えるもの:**  
+`lpc-llm run <model> --adapter <name>`（Hybrid LoRA）、  
+`lpc-llm run <model> --agent`（SmolLM2 ルーター → アダプタ/Expert ヒント自動選択、RAM 排他）、  
+MoE GGUF では `experts.pack` + Top-K Expert DMA（hybrid）。  
+**まだ使えないもの:** 実アダプタ学習（`adapter create`）、基盤フル学習、本格 SFT/RLHF、Web 知識獲得、`user_profile` 自動学習、`--project-map`。
 
 ---
 
@@ -76,24 +79,24 @@
 - [ ] （任意改善）Eager 経路への LoRA 対応
 - [ ] （任意改善）Safetensors / PEFT 形式の読込互換
 
-### Phase 2: MoE パック + Expert ストリーミング — **未着手**
+### Phase 2: MoE パック + Expert ストリーミング — **完了**
 
-- [ ] GGUF MoE テンソル解析（`ffn_gate_exps`, `ffn_down_exps` 等）
-- [ ] 常駐（embeddings / norm / lm_head / router）とオンデマンド Expert の分離
-- [ ] `cache/packs/.../experts.pack`（または同等）への再レイアウト
-- [ ] `layers.pack.json` に Expert index / offset テーブル拡張
-- [ ] Gating Network（ルーター）推論 + Top-K Expert 選抜
-- [ ] 選抜 Expert の io_uring DMA 発行
-- [ ] 2× バッファを Expert 単位の動的リングへ拡張
-- [ ] DeepSeek / Mixtral / Qwen-MoE 等のアーキ分岐
+- [x] GGUF MoE テンソル解析（`ffn_gate_exps`, `ffn_down_exps` / `ffn_gate.N` 等）
+- [x] 常駐（embeddings / norm / lm_head / router）とオンデマンド Expert の分離
+- [x] `cache/packs/.../experts.pack` への再レイアウト
+- [x] `experts.pack.json` に Expert index / offset テーブル（`layers.pack.json` からも参照）
+- [x] Gating Network（ルーター）推論 + Top-K Expert 選抜
+- [x] 選抜 Expert の io_uring DMA 発行
+- [x] 2× バッファを Expert 単位の動的リング（`PrefetchRing`）へ拡張
+- [x] DeepSeek / Mixtral / Qwen-MoE 等のアーキ分岐（`MoeFamily` + 両レイアウト）
 
-### Phase 3: 超軽量ルーターエージェント — **未着手**
+### Phase 3: 超軽量ルーターエージェント — **完了**
 
-- [ ] `lpc-llm run … --agent` CLI
-- [ ] SmolLM2 360M（または分級器）による意図分類プロンプト
-- [ ] 判定結果 → `--adapter` / Expert prefetch の自動選択
-- [ ] ルーター完了後にメインへコンテキスト引き継ぎ（タイムシェア）
-- [ ] `--ram-mib` 内でルーター用 KV とメイン用 KV の排他管理
+- [x] `lpc-llm run … --agent` CLI（`--agent-model` でルーター差し替え可）
+- [x] SmolLM2 360M（既定）による意図分類プロンプト
+- [x] 判定結果 → `--adapter` / Expert prefetch の自動選択（明示 `--adapter` が優先）
+- [x] ルーター完了後にメインへコンテキスト引き継ぎ（タイムシェア）
+- [x] `--ram-mib` 内でルーター用 KV とメイン用 KV の排他管理（ルーター Engine を drop してからメインロード）
 
 ### Phase 4: アダプタ作成器 — **未着手**
 
@@ -201,7 +204,7 @@ Web 知識の非同期獲得と、ユーザー傾向の差分 LoRA 自動更新�
 | `adapters/` | 差分モジュール | **実装済**（ディレクトリ + json/bin） |
 | `adapters/user_profile/` | 自動学習ユーザー LoRA | **未実装**（Phase 7） |
 | `cache/packs/.../layers.pack` | ベース層パック | 既存（名称は `layers.pack`、仕様の `base_layers.pack` 改名は未実施） |
-| `cache/packs/.../experts.pack` | MoE Expert パック | **未実装** |
+| `cache/packs/.../experts.pack` | MoE Expert パック | **実装済** |
 | `cache/knowledge/` | Web 取得ナレッジ | **未実装**（Phase 7） |
 | `cache/user_logs/` | 癖学習用ログ | **未実装**（Phase 7） |
 | `cache/projects/<hash>/map.bin` | プロジェクト構造グラフ | **未実装**（Phase 8） |
@@ -212,7 +215,7 @@ Web 知識の非同期獲得と、ユーザー傾向の差分 LoRA 自動更新�
 | コマンド | 現状 |
 |----------|------|
 | `run … --adapter <name>` | **実装済** |
-| `run … --agent` | **未実装** |
+| `run … --agent` | **実装済**（`--agent-model` 付き） |
 | `run … --project-map` | **未実装**（Phase 8） |
 | `adapter list` | **実装済** |
 | `adapter install-demo` | **実装済**（検証用） |
@@ -227,7 +230,7 @@ Web 知識の非同期獲得と、ユーザー傾向の差分 LoRA 自動更新�
 |------|------|
 | 層単位 pack + ping-pong DMA | 既存 |
 | LoRA サイドパス（計算時アタッチ） | **実装済**（DMA バッファは非破壊） |
-| Expert 単位インデックス / 動的 DMA | **未実装** |
+| Expert 単位インデックス / 動的 DMA | **実装済**（`experts.pack` + `PrefetchRing`） |
 | project-map ノード単位 `io_uring` プレフェッチ | **未実装**（Phase 8） |
 | CQE 時の ΔW マージ（重み書き換え） | 採用せず（サイドパス方針） |
 
@@ -235,13 +238,11 @@ Web 知識の非同期獲得と、ユーザー傾向の差分 LoRA 自動更新�
 
 ## 推奨する次工程
 
-1. **Phase 2** — MoE テンソルマップと `experts.pack`（限定リソースでの大型実行）
-2. **Phase 3** — `--agent` と SmolLM2 タイムシェア
-3. **Phase 4** — `adapter create`（差分による「モデル作成」の最短路；**Phase 7.2 の前提**）
-4. **Phase 5** — 超小型 from-scratch + GGUF 出力 + ローカル SFT/DPO（テーマ内で完結）
-5. **Phase 6** — フル基盤学習 / 数十億 GGUF / 本格 RLHF（外部計算とブリッジ）
-6. **Phase 7** — Web 知識獲得 →（Phase 4 後）`user_profile` 自動学習・自動アタッチ
-7. **Phase 8** — `project-map` 索引 + `io_uring` オンデマンド引出 + `--project-map`（Phase 2 と独立に並行可）
+1. **Phase 4** — `adapter create`（差分による「モデル作成」の最短路；**Phase 7.2 の前提**）
+2. **Phase 5** — 超小型 from-scratch + GGUF 出力 + ローカル SFT/DPO（テーマ内で完結）
+3. **Phase 6** — フル基盤学習 / 数十億 GGUF / 本格 RLHF（外部計算とブリッジ）
+4. **Phase 7** — Web 知識獲得 →（Phase 4 後）`user_profile` 自動学習・自動アタッチ
+5. **Phase 8** — `project-map` 索引 + `io_uring` オンデマンド引出 + `--project-map`（Phase 2 と独立に並行可）
 
 ---
 

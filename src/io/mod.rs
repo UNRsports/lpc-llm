@@ -4,6 +4,7 @@
 pub mod error;
 pub mod gguf_map;
 pub mod hybrid_pipeline;
+pub mod moe;
 pub mod nvme;
 pub mod pack;
 pub mod pipeline;
@@ -13,10 +14,15 @@ pub mod prefetch;
 pub use error::{IoError, Result};
 pub use gguf_map::GgufLayerMap;
 pub use hybrid_pipeline::run_gguf_prefetch_pipeline;
+#[allow(unused_imports)]
+pub use moe::{ExpertDmaPlan, MoeFamily, MoeInfo, MoeLayout};
 pub use nvme::AsyncNvmeReader;
-pub use pack::ensure_packed;
+#[allow(unused_imports)]
+pub use pack::{ensure_experts_packed, ensure_packed, PackedExperts, PackedWeights};
 #[allow(unused_imports)]
 pub use pipeline::{run_pipeline, synthesize_layers, LayerExtent, StepStats};
 #[allow(unused_imports)]
-pub use prefetch::{align_up, PrefetchBuffer, PrefetchBufferManager, DIRECT_ALIGN};
+pub use prefetch::{
+    align_up, PrefetchBuffer, PrefetchBufferManager, PrefetchRing, DIRECT_ALIGN,
+};
 

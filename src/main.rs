@@ -1,6 +1,7 @@
 //! lpc-llm — Ollama-like local LLM CUI (pure Rust) + hybrid NVMe prefetch.
 
 mod adapter;
+mod agent;
 mod catalog;
 mod commands;
 mod engine;
@@ -28,7 +29,8 @@ use commands::io_demo::IoArgs;
                   engine packs under ~/.local/share/lpc-llm/cache (regenerable).\n\
                   Engine upgrades reuse downloaded weights (e.g. gemma2:2b).\n\
                   `run --hybrid` streams layers via io_uring double buffers.\n\
-                  `run --adapter <name>` binds a LoRA side-path (forces hybrid)."
+                  `run --adapter <name>` binds a LoRA side-path (forces hybrid).\n\
+                  `run --agent` classifies intent with SmolLM2 then runs the main model."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -68,6 +70,13 @@ enum Commands {
         /// Bind a LoRA / diff adapter by name (forces hybrid)
         #[arg(long)]
         adapter: Option<String>,
+        /// Run a lightweight router agent first (SmolLM2) to pick adapter / expert hints.
+        /// Router and main model time-share RAM under `--ram-mib` (never co-resident).
+        #[arg(long)]
+        agent: bool,
+        /// Router model for `--agent` (default: smollm2:360m)
+        #[arg(long, default_value = "smollm2:360m")]
+        agent_model: String,
     },
 
     /// Manage diff adapters (LoRA)
@@ -143,7 +152,19 @@ fn main() -> ExitCode {
             ram_mib,
             burst,
             adapter,
-        }) => commands::cmd_run(name, pull, hybrid, hot_layers, ram_mib, burst, adapter),
+            agent,
+            agent_model,
+        }) => commands::cmd_run(
+            name,
+            pull,
+            hybrid,
+            hot_layers,
+            ram_mib,
+            burst,
+            adapter,
+            agent,
+            agent_model,
+        ),
         Some(Commands::Adapter { cmd }) => match cmd {
             AdapterCmd::List => commands::cmd_adapter_list(),
             AdapterCmd::Create { from, out, base } => {

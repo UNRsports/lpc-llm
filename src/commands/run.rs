@@ -2,6 +2,7 @@ use console::style;
 use dialoguer::{Confirm, Select};
 
 use crate::adapter::AdapterSet;
+use crate::agent;
 use crate::catalog;
 use crate::error::{AppError, Result};
 use crate::hybrid::HybridConfig;
@@ -18,6 +19,8 @@ pub struct RunOpts {
     pub ram_mib: usize,
     pub burst: usize,
     pub adapter: Option<String>,
+    pub agent: bool,
+    pub agent_model: String,
 }
 
 pub fn run(opts: RunOpts) -> Result<()> {
@@ -30,52 +33,34 @@ pub fn run(opts: RunOpts) -> Result<()> {
 
     let entry = catalog::find(&name).ok_or_else(|| AppError::UnknownModel(name.clone()))?;
 
-    // Adapters require the hybrid path (side-path LoRA on HybridEngine).
-    let use_hybrid = opts.hybrid || opts.adapter.is_some() || entry.name.starts_with("gemma");
-
-    let adapter_set = if let Some(ref adapter_name) = opts.adapter {
-        let installed = store.resolve_adapter(adapter_name)?.ok_or_else(|| {
-            AppError::msg(format!(
-                "adapter `{adapter_name}` not found — run `lpc-llm adapter list` \
-                 or place files under adapters/{adapter_name}/"
-            ))
+    if opts.agent {
+        let router_mib = agent::router_ram_hint_mib(&opts.agent_model);
+        if router_mib > opts.ram_mib {
+            return Err(AppError::msg(format!(
+                "--agent router `{}` needs ~{router_mib} MiB but --ram-mib is {}",
+                opts.agent_model, opts.ram_mib
+            )));
+        }
+        let router_entry = catalog::find(&opts.agent_model).ok_or_else(|| {
+            AppError::msg(format!("unknown agent model `{}`", opts.agent_model))
         })?;
-        if installed.base_model != entry.name {
-            return Err(AppError::msg(format!(
-                "adapter `{}` is for base `{}`, but run target is `{}`",
-                adapter_name, installed.base_model, entry.name
-            )));
+        if store.resolve(&router_entry)?.is_none() {
+            if !opts.auto_pull {
+                let ok = Confirm::new()
+                    .with_prompt(format!(
+                        "agent router `{}` is not installed. Pull it now ({})?",
+                        opts.agent_model, router_entry.approx_size
+                    ))
+                    .default(true)
+                    .interact()
+                    .map_err(|e| AppError::msg(e.to_string()))?;
+                if !ok {
+                    return Err(AppError::NotInstalled(opts.agent_model.clone()));
+                }
+            }
+            pull::pull_model(&store, &router_entry)?;
         }
-        let set = AdapterSet::load(&installed.path, &Device::Cpu)?;
-        if set.base_model() != entry.name {
-            return Err(AppError::msg(format!(
-                "adapter file base `{}` mismatches run target `{}`",
-                set.base_model(),
-                entry.name
-            )));
-        }
-        eprintln!(
-            "{} adapter `{}` ({:.1} MiB)",
-            style("·").cyan(),
-            style(set.name()).bold(),
-            set.resident_bytes as f64 / (1024.0 * 1024.0)
-        );
-        Some(set)
-    } else {
-        None
-    };
-
-    let adapter_resident_bytes = adapter_set
-        .as_ref()
-        .map(|s| s.resident_bytes)
-        .unwrap_or(0);
-
-    let cfg = HybridConfig {
-        ram_budget_mib: opts.ram_mib,
-        hot_layers: opts.hot_layers,
-        first_burst_tokens: opts.burst,
-        adapter_resident_bytes,
-    };
+    }
 
     // Prefer durable blobs via resolve (no re-download after engine upgrade).
     let installed = match store.resolve(&entry)? {
@@ -105,6 +90,32 @@ pub fn run(opts: RunOpts) -> Result<()> {
     };
 
     let pack_cache = store.pack_cache_dir(&entry.name);
+    let cfg = HybridConfig {
+        ram_budget_mib: opts.ram_mib,
+        hot_layers: opts.hot_layers,
+        first_burst_tokens: opts.burst,
+        adapter_resident_bytes: 0, // filled after adapter resolve
+    };
+
+    if opts.agent {
+        // Time-share: read first user turn → router (exclusive) → drop → main.
+        return ChatSession::run_agent_repl(
+            &store,
+            &installed,
+            entry,
+            cfg,
+            &pack_cache,
+            opts.hybrid,
+            opts.adapter,
+            opts.agent_model,
+        );
+    }
+
+    let use_hybrid =
+        opts.hybrid || opts.adapter.is_some() || entry.name.starts_with("gemma");
+
+    let (adapter_set, cfg) = resolve_adapter(&store, &entry.name, opts.adapter.as_deref(), cfg)?;
+
     let mut session = ChatSession::load_with_config(
         &installed,
         entry,
@@ -115,6 +126,44 @@ pub fn run(opts: RunOpts) -> Result<()> {
     )?;
     session.run_repl()?;
     Ok(())
+}
+
+pub(crate) fn resolve_adapter(
+    store: &LocalStore,
+    base_model: &str,
+    adapter_name: Option<&str>,
+    mut cfg: HybridConfig,
+) -> Result<(Option<AdapterSet>, HybridConfig)> {
+    let Some(name) = adapter_name else {
+        return Ok((None, cfg));
+    };
+    let installed = store.resolve_adapter(name)?.ok_or_else(|| {
+        AppError::msg(format!(
+            "adapter `{name}` not found — run `lpc-llm adapter list` \
+             or place files under adapters/{name}/"
+        ))
+    })?;
+    if installed.base_model != base_model {
+        return Err(AppError::msg(format!(
+            "adapter `{}` is for base `{}`, but run target is `{base_model}`",
+            name, installed.base_model
+        )));
+    }
+    let set = AdapterSet::load(&installed.path, &Device::Cpu)?;
+    if set.base_model() != base_model {
+        return Err(AppError::msg(format!(
+            "adapter file base `{}` mismatches run target `{base_model}`",
+            set.base_model()
+        )));
+    }
+    eprintln!(
+        "{} adapter `{}` ({:.1} MiB)",
+        style("·").cyan(),
+        style(set.name()).bold(),
+        set.resident_bytes as f64 / (1024.0 * 1024.0)
+    );
+    cfg.adapter_resident_bytes = set.resident_bytes;
+    Ok((Some(set), cfg))
 }
 
 fn select_model_name(store: &LocalStore) -> Result<String> {

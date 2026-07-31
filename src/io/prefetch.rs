@@ -180,6 +180,63 @@ impl PrefetchBufferManager {
     }
 }
 
+/// N-slot ring for MoE expert DMA (Top-K streaming). Extends the classic 2×
+/// ping-pong when more than two experts are active per token.
+pub struct PrefetchRing {
+    slots: Vec<PrefetchBuffer>,
+}
+
+impl PrefetchRing {
+    pub fn new(slot_bytes: usize, n_slots: usize) -> Result<Self> {
+        Self::with_lock(slot_bytes, n_slots, true)
+    }
+
+    pub fn new_unlocked(slot_bytes: usize, n_slots: usize) -> Result<Self> {
+        Self::with_lock(slot_bytes, n_slots, false)
+    }
+
+    fn with_lock(slot_bytes: usize, n_slots: usize, lock: bool) -> Result<Self> {
+        let n = n_slots.max(2);
+        let mut slots = Vec::with_capacity(n);
+        for _ in 0..n {
+            slots.push(PrefetchBuffer::allocate(slot_bytes, lock)?);
+        }
+        Ok(Self { slots })
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn slot_capacity(&self) -> usize {
+        self.slots.first().map(|s| s.capacity()).unwrap_or(0)
+    }
+
+    #[inline]
+    pub fn get(&self, index: usize) -> Result<&PrefetchBuffer> {
+        self.slots.get(index).ok_or(IoError::BadSlot(index))
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self, index: usize) -> Result<&mut PrefetchBuffer> {
+        self.slots.get_mut(index).ok_or(IoError::BadSlot(index))
+    }
+
+    #[allow(dead_code)]
+    pub fn total_pinned_bytes(&self) -> usize {
+        self.slots.iter().map(|s| s.capacity()).sum()
+    }
+}
+
 /// Round `n` up to the next multiple of `align` (align must be power of two).
 #[inline]
 pub fn align_up(n: usize, align: usize) -> usize {

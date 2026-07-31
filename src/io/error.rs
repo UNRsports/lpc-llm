@@ -44,7 +44,7 @@ pub enum IoError {
     #[error("I/O size {0} exceeds buffer capacity {1}")]
     BufferTooSmall(usize, usize),
 
-    #[error("invalid buffer slot index {0} (expected 0 or 1)")]
+    #[error("invalid buffer slot index {0}")]
     BadSlot(usize),
 
     #[error(transparent)]

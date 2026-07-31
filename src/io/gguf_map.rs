@@ -14,6 +14,11 @@ use candle_core::quantized::GgmlDType;
 use candle_core::Device;
 
 use super::error::{IoError, Result};
+use super::moe::{
+    build_expert_plans_from_locs, classify_block_suffix, fused_role, is_fused_expert_suffix,
+    is_per_expert_suffix, slice_fused_expert, split_block_name, BlockTensorKind, ExpertDmaPlan,
+    MoeFamily, MoeInfo, MoeLayout,
+};
 use super::prefetch::{align_up, DIRECT_ALIGN};
 
 /// One tensor's location inside a layer DMA window (or hot region).
@@ -68,6 +73,12 @@ pub struct GgufLayerMap {
     pub hot: Vec<TensorLoc>,
     /// Max `read_len` across layers — drives prefetch slot sizing.
     pub max_layer_bytes: usize,
+    /// Present when the GGUF carries MoE expert weights.
+    pub moe: Option<MoeInfo>,
+    /// Per-(layer, expert) DMA plans (empty when `moe` is `None`).
+    pub experts: Vec<ExpertDmaPlan>,
+    /// Max expert window — drives the expert prefetch ring slot size.
+    pub max_expert_bytes: usize,
 }
 
 impl GgufLayerMap {
@@ -76,6 +87,21 @@ impl GgufLayerMap {
             self.architecture.as_str(),
             "gemma" | "gemma2" | "gemma3"
         )
+    }
+
+    #[allow(dead_code)]
+    pub fn is_moe(&self) -> bool {
+        self.moe
+            .as_ref()
+            .map(|m| m.expert_count > 1)
+            .unwrap_or(false)
+    }
+
+    #[allow(dead_code)]
+    pub fn expert_plan(&self, layer: usize, expert: usize) -> Option<&ExpertDmaPlan> {
+        self.experts
+            .iter()
+            .find(|e| e.layer_index == layer && e.expert_id == expert)
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -152,50 +178,182 @@ impl GgufLayerMap {
 
         let tensor_data_offset = content.tensor_data_offset;
 
-        // Group blk.N.* tensors.
-        let mut by_layer: BTreeMap<usize, Vec<(String, TensorInfo)>> = BTreeMap::new();
+        // MoE metadata (may also be inferred from tensor names below).
+        let meta_expert_count = md_u32_arch(&content, &architecture, "expert_count")
+            .or_else(|| md_u32(&content, "llama.expert_count"))
+            .unwrap_or(0) as usize;
+        let meta_expert_used = md_u32_arch(&content, &architecture, "expert_used_count")
+            .or_else(|| md_u32(&content, "llama.expert_used_count"))
+            .unwrap_or(0) as usize;
+
+        // Group blk.N.* tensors into core vs expert.
+        let mut by_layer_core: BTreeMap<usize, Vec<(String, TensorInfo)>> = BTreeMap::new();
+        let mut by_layer_expert: BTreeMap<(usize, usize), Vec<(String, TensorInfo)>> =
+            BTreeMap::new();
+        let mut fused_by_layer: BTreeMap<usize, Vec<(String, TensorInfo)>> = BTreeMap::new();
+        let mut fused_slices: BTreeMap<(usize, usize), Vec<TensorLoc>> = BTreeMap::new();
         let mut hot_infos: Vec<(String, TensorInfo)> = Vec::new();
+        let mut saw_per_expert = false;
+        let mut saw_fused = false;
+        let mut max_expert_id = 0usize;
 
         for (name, info) in &content.tensor_infos {
-            if let Some(rest) = name.strip_prefix("blk.") {
-                let layer_idx: usize = rest
-                    .split_once('.')
-                    .and_then(|(n, _)| n.parse().ok())
-                    .ok_or_else(|| {
-                        IoError::Io(std::io::Error::other(format!(
-                            "bad block tensor name: {name}"
-                        )))
-                    })?;
-                by_layer
-                    .entry(layer_idx)
-                    .or_default()
-                    .push((name.clone(), clone_tensor_info(info)));
+            if let Some((layer_idx, suffix)) = split_block_name(name) {
+                match classify_block_suffix(suffix) {
+                    BlockTensorKind::Expert => {
+                        if is_fused_expert_suffix(suffix) {
+                            saw_fused = true;
+                            fused_by_layer
+                                .entry(layer_idx)
+                                .or_default()
+                                .push((name.clone(), clone_tensor_info(info)));
+                        } else if let Some(eid) = is_per_expert_suffix(suffix) {
+                            saw_per_expert = true;
+                            max_expert_id = max_expert_id.max(eid);
+                            by_layer_expert
+                                .entry((layer_idx, eid))
+                                .or_default()
+                                .push((name.clone(), clone_tensor_info(info)));
+                        }
+                    }
+                    BlockTensorKind::Router | BlockTensorKind::Core => {
+                        by_layer_core
+                            .entry(layer_idx)
+                            .or_default()
+                            .push((name.clone(), clone_tensor_info(info)));
+                    }
+                }
             } else if is_hot_tensor(name) {
                 hot_infos.push((name.clone(), clone_tensor_info(info)));
             }
         }
 
-        if by_layer.is_empty() {
+        if by_layer_core.is_empty() && by_layer_expert.is_empty() && fused_by_layer.is_empty() {
             return Err(IoError::Io(std::io::Error::other(
                 "no blk.N.* tensors found in GGUF",
             )));
         }
 
-        let mut layers = Vec::with_capacity(by_layer.len());
+        let moe = if saw_per_expert || saw_fused || meta_expert_count > 1 {
+            let layout = if saw_fused && !saw_per_expert {
+                MoeLayout::FusedExps
+            } else {
+                MoeLayout::PerExpert
+            };
+            let expert_count = meta_expert_count
+                .max(max_expert_id.saturating_add(1))
+                .max(if saw_fused {
+                    // Infer from first fused tensor's leading dim when metadata missing.
+                    fused_by_layer
+                        .values()
+                        .next()
+                        .and_then(|v| v.first())
+                        .map(|(_, info)| info.shape.dims().first().copied().unwrap_or(0))
+                        .unwrap_or(0)
+                } else {
+                    0
+                });
+            let expert_used = if meta_expert_used > 0 {
+                meta_expert_used
+            } else {
+                2.min(expert_count.max(1))
+            };
+            if expert_count > 1 {
+                Some(MoeInfo {
+                    layout,
+                    expert_count,
+                    expert_used_count: expert_used.min(expert_count),
+                    family: MoeFamily::from_architecture(&architecture),
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Expand fused experts into per-expert logical locs before planning.
+        if let Some(ref info) = moe {
+            if info.layout == MoeLayout::FusedExps {
+                for (layer_idx, fused_tensors) in &fused_by_layer {
+                    for (name, tinfo) in fused_tensors {
+                        let size = tensor_nbytes(tinfo)?;
+                        let abs = tensor_data_offset + tinfo.offset;
+                        let suffix = split_block_name(name)
+                            .map(|(_, s)| s)
+                            .unwrap_or("");
+                        let role = fused_role(suffix).unwrap_or("gate");
+                        let fused_loc = TensorLoc {
+                            name: name.clone(),
+                            abs_offset: abs,
+                            size_bytes: size,
+                            dtype: tinfo.ggml_dtype,
+                            shape: tinfo.shape.dims().to_vec(),
+                            rel_offset: 0,
+                        };
+                        for eid in 0..info.expert_count {
+                            if let Some(slice) = slice_fused_expert(
+                                &fused_loc,
+                                eid,
+                                info.expert_count,
+                                role,
+                                *layer_idx,
+                            ) {
+                                fused_slices
+                                    .entry((*layer_idx, eid))
+                                    .or_default()
+                                    .push(slice);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut layers = Vec::with_capacity(by_layer_core.len());
         let mut max_layer_bytes = 0usize;
 
-        for (index, mut tensors) in by_layer {
+        for (index, mut tensors) in by_layer_core {
             tensors.sort_by_key(|(_, info)| info.offset);
             let plan = build_layer_plan(index, tensor_data_offset, &tensors)?;
             if !plan.sparse {
                 max_layer_bytes = max_layer_bytes.max(plan.read_len);
             } else {
-                // Sparse layers still need a scratch buffer ≥ packed payload.
                 max_layer_bytes = max_layer_bytes.max(align_up(plan.payload_bytes, DIRECT_ALIGN));
             }
             layers.push(plan);
         }
         layers.sort_by_key(|l| l.index);
+
+        let mut experts = Vec::new();
+        let mut max_expert_bytes = 0usize;
+        if moe.is_some() {
+            // Per-expert tensors from GGUF names.
+            for ((layer_idx, expert_id), tensors) in &by_layer_expert {
+                let mut locs = Vec::with_capacity(tensors.len());
+                for (name, info) in tensors {
+                    let size = tensor_nbytes(info)?;
+                    locs.push(TensorLoc {
+                        name: name.clone(),
+                        abs_offset: tensor_data_offset + info.offset,
+                        size_bytes: size,
+                        dtype: info.ggml_dtype,
+                        shape: info.shape.dims().to_vec(),
+                        rel_offset: 0,
+                    });
+                }
+                let plan = build_expert_plans_from_locs(*layer_idx, *expert_id, locs);
+                max_expert_bytes = max_expert_bytes.max(plan.read_len.max(plan.payload_bytes));
+                experts.push(plan);
+            }
+            // Fused → sliced views.
+            for ((layer_idx, expert_id), locs) in fused_slices {
+                let plan = build_expert_plans_from_locs(layer_idx, expert_id, locs);
+                max_expert_bytes = max_expert_bytes.max(plan.read_len.max(plan.payload_bytes));
+                experts.push(plan);
+            }
+            experts.sort_by_key(|e| (e.layer_index, e.expert_id));
+        }
 
         // Hot tensors: absolute locs with rel_offset = 0 (loaded individually).
         let mut hot = Vec::with_capacity(hot_infos.len());
@@ -230,6 +388,9 @@ impl GgufLayerMap {
             layers,
             hot,
             max_layer_bytes,
+            moe,
+            experts,
+            max_expert_bytes,
         })
     }
 }
@@ -382,8 +543,6 @@ pub fn qtensor_from_loc(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn align_math() {
         assert_eq!(0u64 & !(4096u64 - 1), 0);
