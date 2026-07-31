@@ -2,7 +2,7 @@
 
 仕様書「MoE 対応・差分アダプタ駆動・軽量エージェント統合」に対する実装状況。  
 プロジェクトテーマ: **限定的リソース下での LLM 効率化実行とモデル作成**  
-最終更新: 2026-07-30
+最終更新: 2026-07-31
 
 ## 総括
 
@@ -14,9 +14,11 @@
 | 軸3 / Phase 3 | 超軽量ルーターエージェント + メモリ排他 | **未着手** |
 | 軸2 / Phase 4 | `adapter create` 学習器プロトタイプ | **未着手**（CLI 案内のみ） |
 | 長期 / Phase 5+ | 基盤フル学習・数十億 GGUF・SFT/RLHF | **未着手**（下記の実現可能性を参照） |
+| 拡張 / Phase 7 | 自動知識獲得 & ユーザー適応（Web + auto-train） | **未着手**（条件付き可能） |
+| 拡張 / Phase 8 | NVMe 常駐 project-map & 俯瞰記憶 | **未着手**（条件付き可能） |
 
 **いま使えるもの:** `lpc-llm run <model> --adapter <name>`（Hybrid 経路で LoRA サイドパス）。  
-**まだ使えないもの:** `--agent`、MoE Expert ストリーミング、実アダプタ学習（`adapter create`）、基盤フル学習、本格 SFT/RLHF。
+**まだ使えないもの:** `--agent`、MoE Expert ストリーミング、実アダプタ学習（`adapter create`）、基盤フル学習、本格 SFT/RLHF、Web 知識獲得、`user_profile` 自動学習、`--project-map`。
 
 ---
 
@@ -31,6 +33,19 @@
 | 本格的な SFT / RLHF パイプライン全体 | フル RLHF（大規模報酬モデル + PPO 等）は GPU 多枚が前提。テーマとは緊張関係 | **条件付き可能** | ローカル向けに **SFT（LoRA/QLoRA）→ 嗜好最適化の軽量版（DPO/ORPO 等）** までをパイプライン化。「本格 RLHF」は段階的・外部アクセラレータ対応として残す |
 
 **結論:** 3 要件とも「エンジニアリングとして追える」が、**現行マシンだけでフルスケール完遂**はテーマと矛盾する。todo には (A) 限定リソースで完結する中間成果物と (B) フルスケールを見据えた長期ステージの両方を載せる。
+
+### Phase 7 / 8 追加要件の実現可能性
+
+| 要件 | 判定 | 前提・落としどころ |
+|------|------|-------------------|
+| Web 検索 → `cache/knowledge/` 蓄積 | **可能** | DuckDuckGo Instant Answer / HTML スクレイプ / Custom API。対話中は同期・バックグラウンドは非同期ジョブ。知識はチャンク + メタデータ（出典 URL・取得時刻）でローカル保存し、推論時は RAG 的にプロンプトへ注入 |
+| ユーザー癖 → `adapters/user_profile/` 自動 LoRA | **条件付き可能** | **Phase 4（`adapter create`）必須**。修正履歴・プロンプトログを `cache/user_logs/` に蓄積 → アイドル検知（Linux: idle 時間 / D-Bus）で差分学習。常時フル学習は避け、小バッチ・低 rank・時間上限付き |
+| `--adapter user_profile` 自動アタッチ | **可能** | Phase 1 の Hybrid サイドパスを流用。`run` 開始時に存在すれば自動ロード（再起動不要はプロセス内アタッチの意味；デーモン化は任意） |
+| プロジェクト AST/依存グラフ → `map.bin` | **可能** | tree-sitter 等で AST・シンボル・呼び出し辺を抽出。軽量 Embedding（ハッシュ or 小型モデル）をノード属性として付与。全コードを RAM 展開せず NVMe 上の構造化インデックスに保持 |
+| `io_uring` オンデマンド・シンボル引出 | **可能** | 既存の層パック DMA と同型。ノード単位の固定長レコード + オフセット表を `O_DIRECT` でプレフェッチ。ミリ秒差分更新は「変更ファイルの再パース → 影響サブグラフのみ書き換え」 |
+| `--project-map` 俯瞰コンテキスト | **条件付き可能** | 「数十万行を丸ごとプロンプト」は不可。**関連部分グラフの要約・シグネチャ列**を合成する。Cursor 級の IDE 統合は範囲外；CLI でのグラフ RAG が本リポの現実的な到達点 |
+
+**結論:** Phase 7・8 ともエンジニアリングとして追える。Phase 7 の自動学習は Phase 4 完了後、Phase 8 の DMA 引出は既存 io_uring 基盤の延長。いずれも「限定リソース下で完結する中間成果物」を先に置き、理想仕様（完全自動・全量俯瞰）は段階的に近づける。
 
 ---
 
@@ -116,6 +131,64 @@
       - 評価・回帰テスト・成果アダプタ/マージ重みの `adapters/` or `blobs/` への出力  
       - アクセラレータ（CUDA 等）バックエンドの任意接続（Linux 本体の io_uring 推論パスとは分離）
 
+### Phase 7: 自動知識獲得 & ユーザー適応 — **未着手**（条件付き可能）
+
+Web 知識の非同期獲得と、ユーザー傾向の差分 LoRA 自動更新。  
+**依存:** 7.2 / 7.3 の学習本体は **Phase 4（`adapter create`）完了が前提**。7.1 と自動アタッチは Phase 1 だけで着手可。
+
+#### 7.1 Web 検索・ナレッジインジェクション（`search` 連携）
+
+- [ ] 検索バックエンド抽象（DuckDuckGo / Custom HTTP API を差し替え可能に）
+- [ ] 対話中の「知識不足」ヒューリスティック（未知エンティティ・明示的検索指示・低信頼応答）
+- [ ] バックグラウンド検索ジョブ（非同期取得 → パース → 永続化）
+- [ ] `cache/knowledge/` ストア（チャンク本文・出典 URL・取得時刻・タグ）
+- [ ] 推論時のナレッジ注入（関連チャンクをプロンプトへ RAG 的に合成；KV 予算を意識）
+- [ ] CLI: `lpc-llm search <query>` / `lpc-llm knowledge list|purge`（任意）
+
+#### 7.2 ユーザー癖・文脈の自動アダプタ化（`adapter auto-train`）
+
+- [ ] 会話・修正・プロンプト傾向のローカルログ（`cache/user_logs/`；秘匿・ローテーション方針付き）
+- [ ] コーディングスタイル特徴の抽出（インデント・命名・コメント密度など軽量特徴）
+- [ ] Linux アイドル検知（X11/Wayland idle または簡易無操作タイマー）
+- [ ] アイドル時に Phase 4 学習器を呼び、差分 LoRA を `adapters/user_profile/` へ更新
+- [ ] 学習ジョブのガード（時間上限・RAM 上限・最小サンプル数・失敗時ロールバック）
+- [ ] CLI: `lpc-llm adapter auto-train [--once|--daemon]`（任意）
+
+#### 7.3 シームレスな自動アタッチ
+
+- [ ] `run` 開始時に `adapters/user_profile/` が有効なら Hybrid サイドパスへ自動組込
+- [ ] `--no-user-profile` / `--adapter` 明示指定との優先順位ルール
+- [ ] （任意）プロセス内ホットリロード（学習完了後の次回ターンから新重み）
+- [ ] （任意改善）会話途中ホットスワップは Phase 1 任意改善と統合
+
+### Phase 8: NVMe 常駐 project-map & 俯瞰記憶 — **未着手**（条件付き可能）
+
+全コードを 16GB RAM に載せない前提で、NVMe 上の構造化グラフから必要ノードだけを `io_uring` で引く。  
+**依存:** 既存層パックの `io_uring` / `O_DIRECT` パイプライン。Phase 2 とは独立に着手可（バッファリング戦略は共有しうる）。
+
+#### 8.1 NVMe へのプロジェクトグラフマッピング
+
+- [ ] 言語フロントエンド（tree-sitter 等）でファイル AST・シンボル抽出
+- [ ] 関数/クラスの呼び出し・型依存の辺をグラフ化
+- [ ] ノード軽量 Embedding（ハッシュ n-gram または小型埋め込み；フル LLM 埋め込みは任意）
+- [ ] オンディスク形式 `cache/projects/<hash>/map.bin` + オフセット/索引メタ（`map.json` 等）
+- [ ] ファイル更新の監視と **差分インデックス更新**（変更ファイル + 影響辺のみ）
+- [ ] CLI: `lpc-llm project-map build|status|rebuild <path>`
+
+#### 8.2 `io_uring` 経由のオンデマンド・シンボル引き出し
+
+- [ ] ノード/エッジの固定長またはチャンク境界レコード設計（`O_DIRECT` 整列）
+- [ ] クエリ → 関連ノード集合の選定（BM25 / Embedding 近傍 / グラフ近傍の組合せ）
+- [ ] 選定ノードの `io_uring` プレフェッチ → RAM リングバッファ
+- [ ] コンテキスト組立時のトークン予算キャップ（ホット層予算と整合）
+
+#### 8.3 `--project-map` 広域コンテキスト俯瞰
+
+- [ ] `lpc-llm run … --project-map [<path|hash>]` CLI
+- [ ] 呼び出し関係・型依存を **部分グラフ要約**としてプロンプトへ合成（全量貼付はしない）
+- [ ] リファクタ/生成向けの構造的ヒント（依存先シグネチャ列・影響範囲）
+- [ ] 16GB 級 RAM でも数十万行規模を「構造として」扱えることの回帰ベンチ（任意）
+
 ---
 
 ## 仕様書セクション別の対応状況
@@ -126,8 +199,12 @@
 |------|------|------|
 | `blobs/` | ベース GGUF | 既存どおり |
 | `adapters/` | 差分モジュール | **実装済**（ディレクトリ + json/bin） |
+| `adapters/user_profile/` | 自動学習ユーザー LoRA | **未実装**（Phase 7） |
 | `cache/packs/.../layers.pack` | ベース層パック | 既存（名称は `layers.pack`、仕様の `base_layers.pack` 改名は未実施） |
 | `cache/packs/.../experts.pack` | MoE Expert パック | **未実装** |
+| `cache/knowledge/` | Web 取得ナレッジ | **未実装**（Phase 7） |
+| `cache/user_logs/` | 癖学習用ログ | **未実装**（Phase 7） |
+| `cache/projects/<hash>/map.bin` | プロジェクト構造グラフ | **未実装**（Phase 8） |
 | `manifest.json` | models + adapters | **adapters キー追加済** |
 
 ### CLI
@@ -136,9 +213,13 @@
 |----------|------|
 | `run … --adapter <name>` | **実装済** |
 | `run … --agent` | **未実装** |
+| `run … --project-map` | **未実装**（Phase 8） |
 | `adapter list` | **実装済** |
 | `adapter install-demo` | **実装済**（検証用） |
 | `adapter create …` | **スタブ**（未実装案内） |
+| `adapter auto-train` | **未実装**（Phase 7） |
+| `search` / `knowledge …` | **未実装**（Phase 7） |
+| `project-map build|status` | **未実装**（Phase 8） |
 
 ### メモリ・I/O パイプライン
 
@@ -147,6 +228,7 @@
 | 層単位 pack + ping-pong DMA | 既存 |
 | LoRA サイドパス（計算時アタッチ） | **実装済**（DMA バッファは非破壊） |
 | Expert 単位インデックス / 動的 DMA | **未実装** |
+| project-map ノード単位 `io_uring` プレフェッチ | **未実装**（Phase 8） |
 | CQE 時の ΔW マージ（重み書き換え） | 採用せず（サイドパス方針） |
 
 ---
@@ -155,9 +237,11 @@
 
 1. **Phase 2** — MoE テンソルマップと `experts.pack`（限定リソースでの大型実行）
 2. **Phase 3** — `--agent` と SmolLM2 タイムシェア
-3. **Phase 4** — `adapter create`（差分による「モデル作成」の最短路）
+3. **Phase 4** — `adapter create`（差分による「モデル作成」の最短路；**Phase 7.2 の前提**）
 4. **Phase 5** — 超小型 from-scratch + GGUF 出力 + ローカル SFT/DPO（テーマ内で完結）
 5. **Phase 6** — フル基盤学習 / 数十億 GGUF / 本格 RLHF（外部計算とブリッジ）
+6. **Phase 7** — Web 知識獲得 →（Phase 4 後）`user_profile` 自動学習・自動アタッチ
+7. **Phase 8** — `project-map` 索引 + `io_uring` オンデマンド引出 + `--project-map`（Phase 2 と独立に並行可）
 
 ---
 
