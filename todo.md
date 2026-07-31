@@ -1,10 +1,307 @@
-# lpc-llm 拡張ロードマップ（進捗）
+# lpc-llm extension roadmap (progress)
+
+## Contents / 目次
+
+1. [English](#english)
+   1. [Summary](#1-summary)
+   2. [Feasibility of theme add-ons](#2-feasibility-of-theme-add-ons)
+   3. [Engineering checklist](#3-engineering-checklist)
+   4. [Spec section status](#4-spec-section-status)
+   5. [Recommended next steps](#5-recommended-next-steps)
+   6. [Notes (done outside the spec)](#6-notes-done-outside-the-spec)
+2. [日本語](#日本語)
+   1. [総括](#1-総括)
+   2. [テーマ追加要件の実現可能性](#2-テーマ追加要件の実現可能性)
+   3. [工程チェックリスト](#3-工程チェックリスト)
+   4. [仕様書セクション別の対応状況](#4-仕様書セクション別の対応状況)
+   5. [推奨する次工程](#5-推奨する次工程)
+   6. [補足（仕様外だが実施済み）](#6-補足仕様外だが実施済み)
+
+---
+
+# English
+
+Implementation status against the spec “MoE support · delta-adapter driven · lightweight agent integration”.  
+Project theme: **efficient LLM execution and model creation under constrained resources**  
+Last updated: 2026-07-31
+
+## English table of contents
+
+1. [Summary](#1-summary)
+2. [Feasibility of theme add-ons](#2-feasibility-of-theme-add-ons)
+3. [Engineering checklist](#3-engineering-checklist)
+4. [Spec section status](#4-spec-section-status)
+5. [Recommended next steps](#5-recommended-next-steps)
+6. [Notes (done outside the spec)](#6-notes-done-outside-the-spec)
+
+---
+
+## 1. Summary
+
+| Axis | Content | Progress |
+|----|------|------|
+| Foundation (existing) | GGUF layer pack + io_uring double-buffer hybrid | **Done** (prerequisite for this extension) |
+| Axis 2 / Phase 1 | Delta adapter mgmt · side-path LoRA · `--adapter` | **Done** |
+| Axis 1 / Phase 2 | MoE expert split pack + dynamic DMA | **Done** |
+| Axis 3 / Phase 3 | Ultra-light router agent + memory exclusivity | **Done** |
+| Axis 2 / Phase 4 | `adapter create` trainer prototype | **Not started** (CLI guidance only) |
+| Long-term / Phase 5+ | Full base training · multi-billion GGUF · SFT/RLHF | **Not started** (see feasibility below) |
+| Extension / Phase 7 | Auto knowledge acquisition & user adaptation (Web + auto-train) | **Not started** (conditionally feasible) |
+| Extension / Phase 8 | NVMe-resident project-map & overview memory | **Not started** (conditionally feasible) |
+
+**Available now:**  
+`lpc-llm run <model> --adapter <name>` (Hybrid LoRA),  
+`lpc-llm run <model> --agent` (SmolLM2 router → auto adapter/expert hints, exclusive RAM),  
+On MoE GGUF: `experts.pack` + Top-K expert DMA (hybrid).  
+**Not available yet:** real adapter training (`adapter create`), full base training, full SFT/RLHF, Web knowledge acquisition, `user_profile` auto-train, `--project-map`.
+
+---
+
+## 2. Feasibility of theme add-ons
+
+How to treat the following three requirements under the theme “efficient execution and model creation under constrained resources”.
+
+| Requirement | As-is under constrained resources? | Verdict | Realistic landing in this repo |
+|------|---------------------------|------|--------------------------------|
+| Full base-model training from scratch | Full training of multi-billion models on home CPU / low RAM is unrealistic (compute, data, power differ by orders of magnitude) | **Conditionally feasible** | First ship a **tiny (millions–hundreds of M) from-scratch training loop** in pure Rust/Candle. Large scale via external jobs or checkpoint import |
+| Build a new multi-billion-param GGUF from scratch | “Train from scratch then emit multi-billion GGUF” is the same as above. A **GGUF export pipeline as a format** is feasible | **Conditionally feasible** | (1) small training → GGUF write-out (2) quantize/convert existing weights → register in `blobs/`. The multi-billion training body is a separate cluster-oriented stage |
+| Full SFT / RLHF pipeline | Full RLHF (large reward model + PPO etc.) assumes many GPUs; tension with the theme | **Conditionally feasible** | Pipeline locally up to **SFT (LoRA/QLoRA) → light preference opt (DPO/ORPO etc.)**. Keep “full RLHF” as staged / external-accelerator work |
+
+**Conclusion:** All three are “engineerable,” but **finishing full scale on the current machine alone** contradicts the theme. This todo carries both (A) intermediate artifacts that complete under constrained resources and (B) long-term stages aimed at full scale.
+
+### Feasibility of Phase 7 / 8 add-ons
+
+| Requirement | Verdict | Prerequisites / landing |
+|------|------|-------------------|
+| Web search → accumulate in `cache/knowledge/` | **Feasible** | DuckDuckGo Instant Answer / HTML scrape / Custom API. Sync in-chat; async jobs in background. Store chunks + metadata (source URL, fetch time) locally; inject into prompts RAG-style at inference |
+| User habits → auto LoRA in `adapters/user_profile/` | **Conditionally feasible** | **Phase 4 (`adapter create`) required**. Accumulate edits/prompt logs in `cache/user_logs/` → idle detect (Linux: idle time / D-Bus) for delta training. Avoid always-on full train; small batch, low rank, time-capped |
+| Auto-attach `--adapter user_profile` | **Feasible** | Reuse Phase 1 hybrid side-path. Auto-load at `run` if present (no restart = in-process attach; daemon optional) |
+| Project AST/dep graph → `map.bin` | **Feasible** | Extract AST/symbols/call edges with tree-sitter etc. Light embeddings (hash or small model) as node attrs. Keep structured index on NVMe without loading all code into RAM |
+| `io_uring` on-demand symbol fetch | **Feasible** | Same shape as layer-pack DMA. Fixed-length node records + offset table, `O_DIRECT` prefetch. Millisecond delta updates = reparse changed files → rewrite affected subgraph only |
+| `--project-map` overview context | **Conditionally feasible** | Cannot dump hundreds of thousands of lines into the prompt. Synthesize **summaries / signature lists of relevant subgraphs**. Cursor-class IDE integration is out of scope; CLI graph RAG is the realistic endpoint |
+
+**Conclusion:** Phases 7 and 8 are engineerable. Phase 7 auto-train needs Phase 4 done; Phase 8 DMA fetch extends the existing io_uring stack. Put constrained-resource intermediate artifacts first; approach the ideal (fully automatic, full overview) gradually.
+
+---
+
+## 3. Engineering checklist
+
+### 0. Existing foundation (spec prerequisite · already reached)
+
+- [x] Ollama-independent pure Rust (Candle) inference
+- [x] `blobs/` / `cache/packs/` / `manifest.json` separation
+- [x] Layer re-layout via `layers.pack` + `layers.pack.json`
+- [x] io_uring + O_DIRECT double-buffer streaming
+- [x] Hot-layer budget via `--ram-mib` / `--hot-layers`
+- [x] Catalog (`gemma2:2b`, `smollm2:360m`, …) and CUI (list/pull/run/…)
+
+### Phase 1: Delta adapter (LoRA) load foundation — **Done**
+
+- [x] `adapters/` storage management (`LocalStore`)
+- [x] `manifest.json` `adapters` index wiring (discover / reconcile / record)
+- [x] On-disk form `adapters/<name>/{adapter.json,weights.bin}` (FP16 A/B)
+- [x] Side-path LoRA module (`y = Wq(x) + (α/r)·(x@Aᵀ)@Bᵀ`)
+- [x] Dynamic inject into Hybrid `QMatMul` / Attention · MLP (`src/adapter/`, `hybrid.rs`)
+- [x] Deduct adapter resident bytes from hot-layer budget
+- [x] `lpc-llm run <model> --adapter <name>` (forces hybrid when set)
+- [x] `lpc-llm adapter list`
+- [x] Zero fixture for integration: `lpc-llm adapter install-demo`
+- [x] Do not rewrite base `blobs/` / `layers.pack`
+- [ ] (Optional) Mid-conversation adapter hot-swap
+- [ ] (Optional) LoRA on Eager path
+- [ ] (Optional) Safetensors / PEFT load compatibility
+
+### Phase 2: MoE pack + expert streaming — **Done**
+
+- [x] GGUF MoE tensor parse (`ffn_gate_exps`, `ffn_down_exps` / `ffn_gate.N`, etc.)
+- [x] Separate resident (embeddings / norm / lm_head / router) from on-demand experts
+- [x] Re-layout into `cache/packs/.../experts.pack`
+- [x] Expert index / offset table in `experts.pack.json` (also referenced from `layers.pack.json`)
+- [x] Gating network (router) inference + Top-K expert select
+- [x] io_uring DMA for selected experts
+- [x] Extend 2× buffers to expert-unit dynamic ring (`PrefetchRing`)
+- [x] Arch branches for DeepSeek / Mixtral / Qwen-MoE (`MoeFamily` + both layouts)
+
+### Phase 3: Ultra-light router agent — **Done**
+
+- [x] `lpc-llm run … --agent` CLI (`--agent-model` to swap router)
+- [x] Intent-classify prompt with SmolLM2 360M (default)
+- [x] Decision → auto `--adapter` / expert prefetch (explicit `--adapter` wins)
+- [x] Hand context to main after router (time-share)
+- [x] Exclusive router KV vs main KV within `--ram-mib` (drop router Engine before loading main)
+
+### Phase 4: Adapter creator — **Not started**
+
+- [ ] Implement `lpc-llm adapter create --from … --out … --base …`  
+      (currently Phase 4 guidance message only)
+- [ ] Train/save a few-MB delta from small text in minutes
+- [ ] Match output to Phase 1 form (`adapter.json` + `weights.bin`)
+- [ ] (Optional) Separate crate / Safetensors output
+
+### Phase 5: Constrained-resource “model creation” foundation — **Not started** (theme-critical · runnable)
+
+**Front stage** of the three full-scale requirements. Completes on home–workstation scale.
+
+- [ ] Tiny Transformer from-scratch training loop (Candle; CPU / single GPU)
+- [ ] Training checkpoint → GGUF (or intermediate Safetensors) write-out
+- [ ] Register artifacts in `blobs/` + `manifest` and run with `lpc-llm run`
+- [ ] Local SFT pipeline (full fine-tune or LoRA; can merge with Phase 4)
+- [ ] Minimal light preference opt (DPO / ORPO, etc.) — foothold toward “full RLHF”
+- [ ] Memory-aware training design (`--ram-mib` / grad checkpointing, etc.)
+
+### Phase 6: Scale-up bridge — **Not started** (conditional · external resources)
+
+Bridge so “multi-billion” and “full RLHF” can be handled as **extensions of this toolchain**. Single-machine local completion is not required.
+
+- [ ] **Full base-model training from scratch**  
+      - Interfaces to launch / resume remote/distributed jobs and import artifacts  
+      - Declarative dataset / tokenizer / train config  
+      - Wire progress / checkpoints to `cache/` or external store
+- [ ] **Build a new multi-billion-param GGUF from scratch**  
+      - Large checkpoint → quantized GGUF conversion pipeline  
+      - Hybrid pack of conversion results (Phase 2) + catalog registration  
+      - ※ Training compute itself stays on Phase 6 remote/cluster side
+- [ ] **Full SFT / RLHF pipeline**  
+      - Stage defs: SFT → reward model (or preference data) → PPO/similar  
+      - Eval / regression / emit adapters or merged weights to `adapters/` or `blobs/`  
+      - Optional accelerator (CUDA etc.) backend (separated from Linux io_uring inference path)
+
+### Phase 7: Auto knowledge acquisition & user adaptation — **Not started** (conditionally feasible)
+
+Async Web knowledge acquisition and automatic delta-LoRA updates from user tendencies.  
+**Deps:** Training for 7.2 / 7.3 requires **Phase 4 (`adapter create`)**. 7.1 and auto-attach can start with Phase 1 alone.
+
+#### 7.1 Web search · knowledge injection (`search` integration)
+
+- [ ] Search backend abstraction (DuckDuckGo / Custom HTTP API swappable)
+- [ ] In-chat “knowledge gap” heuristics (unknown entities, explicit search, low-confidence answers)
+- [ ] Background search jobs (async fetch → parse → persist)
+- [ ] `cache/knowledge/` store (chunk body · source URL · fetch time · tags)
+- [ ] Knowledge inject at inference (RAG-style related chunks into prompt; respect KV budget)
+- [ ] CLI: `lpc-llm search <query>` / `lpc-llm knowledge list|purge` (optional)
+
+#### 7.2 Auto-adapterize user habits / context (`adapter auto-train`)
+
+- [ ] Local logs of chats / edits / prompt tendencies (`cache/user_logs/`; privacy + rotation policy)
+- [ ] Extract coding-style features (indent · naming · comment density, etc.)
+- [ ] Linux idle detect (X11/Wayland idle or simple idle timer)
+- [ ] On idle, call Phase 4 trainer and update delta LoRA under `adapters/user_profile/`
+- [ ] Job guards (time cap · RAM cap · min samples · rollback on failure)
+- [ ] CLI: `lpc-llm adapter auto-train [--once|--daemon]` (optional)
+
+#### 7.3 Seamless auto-attach
+
+- [ ] At `run` start, if `adapters/user_profile/` is valid, auto-wire into Hybrid side-path
+- [ ] Priority rules vs `--no-user-profile` / explicit `--adapter`
+- [ ] (Optional) In-process hot reload (new weights from next turn after train)
+- [ ] (Optional) Mid-chat hot-swap merges with Phase 1 optional work
+
+### Phase 8: NVMe-resident project-map & overview memory — **Not started** (conditionally feasible)
+
+Without loading all code into 16GB RAM, pull only needed nodes from a structured graph on NVMe via `io_uring`.  
+**Deps:** Existing layer-pack `io_uring` / `O_DIRECT` pipeline. Can start independent of Phase 2 (buffering strategy may be shared).
+
+#### 8.1 Map project graph onto NVMe
+
+- [ ] Language frontends (tree-sitter etc.) for file AST / symbol extract
+- [ ] Graph call / type-dependency edges for functions/classes
+- [ ] Light node embeddings (hash n-gram or small embedder; full LLM embed optional)
+- [ ] On-disk `cache/projects/<hash>/map.bin` + offset/index meta (`map.json`, etc.)
+- [ ] Watch file updates and **delta index updates** (changed files + affected edges only)
+- [ ] CLI: `lpc-llm project-map build|status|rebuild <path>`
+
+#### 8.2 On-demand symbol fetch via `io_uring`
+
+- [ ] Fixed-length or chunk-boundary records for nodes/edges (`O_DIRECT` aligned)
+- [ ] Query → related node set (BM25 / embedding neighborhood / graph neighborhood combo)
+- [ ] `io_uring` prefetch of selected nodes → RAM ring buffer
+- [ ] Token-budget cap when assembling context (aligned with hot-layer budget)
+
+#### 8.3 `--project-map` wide-context overview
+
+- [ ] `lpc-llm run … --project-map [<path|hash>]` CLI
+- [ ] Synthesize call/type deps as **subgraph summaries** into the prompt (no full dump)
+- [ ] Structural hints for refactor/codegen (callee signature lists · impact scope)
+- [ ] Regression bench that tens/hundreds of kLOC can be handled “as structure” on ~16GB RAM (optional)
+
+---
+
+## 4. Spec section status
+
+### Data layout
+
+| Path | Spec | Status |
+|------|------|------|
+| `blobs/` | Base GGUF | As existing |
+| `adapters/` | Delta modules | **Implemented** (dir + json/bin) |
+| `adapters/user_profile/` | Auto-train user LoRA | **Not implemented** (Phase 7) |
+| `cache/packs/.../layers.pack` | Base layer pack | Existing (name is `layers.pack`; rename to spec’s `base_layers.pack` not done) |
+| `cache/packs/.../experts.pack` | MoE expert pack | **Implemented** |
+| `cache/knowledge/` | Web-fetched knowledge | **Not implemented** (Phase 7) |
+| `cache/user_logs/` | Habit-train logs | **Not implemented** (Phase 7) |
+| `cache/projects/<hash>/map.bin` | Project structure graph | **Not implemented** (Phase 8) |
+| `manifest.json` | models + adapters | **`adapters` key added** |
+
+### CLI
+
+| Command | Status |
+|----------|------|
+| `run … --adapter <name>` | **Implemented** |
+| `run … --agent` | **Implemented** (with `--agent-model`) |
+| `run … --project-map` | **Not implemented** (Phase 8) |
+| `adapter list` | **Implemented** |
+| `adapter install-demo` | **Implemented** (for verification) |
+| `adapter create …` | **Stub** (unimplemented guidance) |
+| `adapter auto-train` | **Not implemented** (Phase 7) |
+| `search` / `knowledge …` | **Not implemented** (Phase 7) |
+| `project-map build|status` | **Not implemented** (Phase 8) |
+
+### Memory / I/O pipeline
+
+| Item | Status |
+|------|------|
+| Layer pack + ping-pong DMA | Existing |
+| LoRA side-path (attach at compute) | **Implemented** (DMA buffers non-destructive) |
+| Expert-unit index / dynamic DMA | **Implemented** (`experts.pack` + `PrefetchRing`) |
+| project-map node `io_uring` prefetch | **Not implemented** (Phase 8) |
+| ΔW merge at CQE (weight rewrite) | Not adopted (side-path policy) |
+
+---
+
+## 5. Recommended next steps
+
+1. **Phase 4** — `adapter create` (shortest path to “model creation” via deltas; **prerequisite for Phase 7.2**)
+2. **Phase 5** — Tiny from-scratch + GGUF export + local SFT/DPO (completes within the theme)
+3. **Phase 6** — Full base train / multi-billion GGUF / full RLHF (bridge to external compute)
+4. **Phase 7** — Web knowledge → (after Phase 4) `user_profile` auto-train · auto-attach
+5. **Phase 8** — `project-map` index + `io_uring` on-demand fetch + `--project-map` (can parallel Phase 2 independently)
+
+---
+
+## 6. Notes (done outside the spec)
+
+- [x] Fix Backspace on Japanese input truncating UTF-8 bytes (REPL switched to `rustyline`)
+
+---
+
+# 日本語
 
 仕様書「MoE 対応・差分アダプタ駆動・軽量エージェント統合」に対する実装状況。  
 プロジェクトテーマ: **限定的リソース下での LLM 効率化実行とモデル作成**  
 最終更新: 2026-07-31
 
-## 総括
+## 日本語目次
+
+1. [総括](#1-総括)
+2. [テーマ追加要件の実現可能性](#2-テーマ追加要件の実現可能性)
+3. [工程チェックリスト](#3-工程チェックリスト)
+4. [仕様書セクション別の対応状況](#4-仕様書セクション別の対応状況)
+5. [推奨する次工程](#5-推奨する次工程)
+6. [補足（仕様外だが実施済み）](#6-補足仕様外だが実施済み)
+
+---
+
+## 1. 総括
 
 | 軸 | 内容 | 進捗 |
 |----|------|------|
@@ -25,7 +322,7 @@ MoE GGUF では `experts.pack` + Top-K Expert DMA（hybrid）。
 
 ---
 
-## テーマ追加要件の実現可能性
+## 2. テーマ追加要件の実現可能性
 
 テーマ「効率化による限定リソース下での実行とモデル作成」に対し、次の 3 要件をどう扱うか。
 
@@ -52,7 +349,7 @@ MoE GGUF では `experts.pack` + Top-K Expert DMA（hybrid）。
 
 ---
 
-## 工程チェックリスト
+## 3. 工程チェックリスト
 
 ### 0. 既存基盤（仕様の前提・既到達）
 
@@ -194,7 +491,7 @@ Web 知識の非同期獲得と、ユーザー傾向の差分 LoRA 自動更新�
 
 ---
 
-## 仕様書セクション別の対応状況
+## 4. 仕様書セクション別の対応状況
 
 ### データレイアウト
 
@@ -236,7 +533,7 @@ Web 知識の非同期獲得と、ユーザー傾向の差分 LoRA 自動更新�
 
 ---
 
-## 推奨する次工程
+## 5. 推奨する次工程
 
 1. **Phase 4** — `adapter create`（差分による「モデル作成」の最短路；**Phase 7.2 の前提**）
 2. **Phase 5** — 超小型 from-scratch + GGUF 出力 + ローカル SFT/DPO（テーマ内で完結）
@@ -246,6 +543,6 @@ Web 知識の非同期獲得と、ユーザー傾向の差分 LoRA 自動更新�
 
 ---
 
-## 補足（仕様外だが実施済み）
+## 6. 補足（仕様外だが実施済み）
 
 - [x] 日本語入力時の Backspace が UTF-8 バイト欠けする問題への対処（REPL を `rustyline` 化）

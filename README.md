@@ -1,5 +1,357 @@
 # lpc-llm
 
+## Contents / 目次
+
+1. [English](#english)
+   1. [Current specification](#1-current-specification)
+   2. [Manual (setup → start → stop)](#2-manual-setup--start--stop)
+   3. [Command reference](#3-command-reference)
+   4. [Troubleshooting](#4-troubleshooting)
+   5. [Development notes](#5-development-notes)
+   6. [License](#6-license)
+2. [日本語](#日本語)
+   1. [現状の仕様](#1-現状の仕様)
+   2. [マニュアル（導入〜起動〜停止）](#2-マニュアル導入起動停止)
+   3. [コマンドリファレンス](#3-コマンドリファレンス)
+   4. [トラブルシューティング](#4-トラブルシューティング)
+   5. [開発メモ](#5-開発メモ)
+   6. [ライセンス](#6-ライセンス)
+
+---
+
+# English
+
+Ollama-free **pure-Rust local LLM player**.  
+It runs quantized GGUF with Candle, and on the hybrid path streams weights via per-layer pack layout plus `io_uring` / `O_DIRECT` double buffering.
+
+- **Inference engine**: in-house (Candle + hybrid I/O). No Ollama / llama.cpp binaries
+- **CUI**: Ollama-like `list` / `pull` / `run` / `rm` / `show`
+- **Storage**: model blobs and engine-derived cache are separated. Engine upgrades do not force re-download
+
+## English table of contents
+
+1. [Current specification](#1-current-specification)
+2. [Manual (setup → start → stop)](#2-manual-setup--start--stop)
+3. [Command reference](#3-command-reference)
+4. [Troubleshooting](#4-troubleshooting)
+5. [Development notes](#5-development-notes)
+6. [License](#6-license)
+
+---
+
+## 1. Current specification
+
+### Architecture overview
+
+```text
+┌─ CUI (clap) ─────────────────────────────────────┐
+│  list / pull / run / rm / show / prefetch / io     │
+└───────────────────────────┬───────────────────────┘
+                            │
+        ┌───────────────────┴───────────────────┐
+        ▼                                       ▼
+   Eager path                              Hybrid path
+   (Candle full load)                      (default: gemma*)
+        │                                       │
+        │              ┌────────────────────────┤
+        │              ▼                        ▼
+        │     ensure_packed (engine cache)   hot layers pin
+        │              │                        │
+        │              ▼                        ▼
+        │     io_uring ping-pong DMA      resident RAM
+        │              │                        │
+        └──────────────┴──────────┬─────────────┘
+                                  ▼
+                         forward (arch branch)
+                         Gemma2: post-norm / √emb /
+                         Neox RoPE / softcap / GeLU
+```
+
+### Memory / I/O model (hybrid)
+
+```text
+[ embeddings + norm + lm_head ]     resident (read directly from blobs)
+[ hot layers 0 .. H-1 ]             pinned in RAM (within budget, default max 8)
+[ Prefetch A | Prefetch B ]         2× pack-layer DMA (io_uring)
+[ KV cache ]                        grows with context
+```
+
+Tuning levers (perceived impact):
+
+| Lever | Impact | Implementation |
+|------|------|------|
+| Pack layout + double buffer | High | `{gguf} → cache/.../layers.pack`, 1 DMA per layer |
+| Hot resident ratio | Medium–high | `--ram-mib` / `--hot-layers` |
+| Chunked thinking (short first reply) | Medium | `--burst`, REPL `/more` |
+| Chunk-size micro-tuning | Low | DMA window align at pack time, I/O wait EMA |
+
+### Data layout (module separation)
+
+```text
+~/.local/share/lpc-llm/
+  blobs/                 # model module (durable)
+    <hf-repo--name>/
+      *.gguf
+      tokenizer.json
+  cache/                 # engine module (regenerable)
+    packs/
+      <model_name>/<engine_ver>/
+        layers.pack
+        layers.pack.json
+  manifest.json          # soft index (auto-recovered from blobs)
+```
+
+| Area | Safe to delete? | Notes |
+|------|-------------|------|
+| `blobs/` | Keep by default | Deleting forces re-download |
+| `cache/` | Yes | Regenerated on next hybrid run |
+| `manifest.json` | Yes | Restored by `reconcile` at startup |
+
+`rm` only removes the registry entry; it **does not delete blobs**.
+
+### Catalog models
+
+| Name | Contents | Approx. size | hybrid |
+|------|------|------------|--------|
+| `smollm2:360m` | SmolLM2 360M Instruct Q4_K_M | ~260 MB | enable with `--hybrid` |
+| `gemma2:2b` | Gemma 2 2B Instruct Q4_K_M | ~1.7 GB | **hybrid by default** |
+| `qwen2.5:1.5b` | Qwen2.5 1.5B Instruct Q4_K_M | ~1.1 GB | enable with `--hybrid` |
+| `phi3:mini` | Phi-3 Mini 4K Instruct Q4_K_M | ~2.2 GB | enable with `--hybrid` |
+
+For Gemma2, post-attention / post-ffw norms, embedding √hidden scale, Neox RoPE, attn/final logit softcap, and GeLU are implemented.  
+GGUF RMSNorm weights are already `(1+δ)` after HF→GGUF conversion, so runtime multiplies by `w` as-is (no double application).
+
+### Runtime assumptions
+
+- OS: Linux (`io_uring` / `O_DIRECT`; e.g. Fedora)
+- CPU inference (currently)
+- Rust toolchain (relatively new stable for `edition = "2024"`)
+- Download: system `curl` or `wget` (avoids OpenSSL linking)
+- Optional: `HF_TOKEN` (gated HF repos)
+
+---
+
+## 2. Manual (setup → start → stop)
+
+### 0. Prerequisites
+
+```bash
+rustc --version    # newer stable recommended
+curl --version     # or wget
+```
+
+You already have the repository (e.g. `~/dev/lpc-llm`).
+
+### 1. Build
+
+```bash
+cd ~/dev/lpc-llm
+
+# Cursor / some environments point CARGO_TARGET_DIR elsewhere;
+# unset it if you want artifacts under local ./target
+unset CARGO_TARGET_DIR
+
+cargo build --release
+```
+
+On success you get:
+
+```text
+./target/release/lpc-llm
+```
+
+Linker `warning: linker stderr: ignoring deprecated...` can be ignored.
+
+To put it on PATH:
+
+```bash
+cargo install --path . --force
+# then: lpc-llm ...
+```
+
+### 2. Install a model (pull)
+
+List:
+
+```bash
+./target/release/lpc-llm list
+```
+
+Fetch (skips re-download if blobs already exist):
+
+```bash
+# smoke test (lightweight)
+./target/release/lpc-llm pull smollm2:360m
+
+# Gemma 2 2B
+./target/release/lpc-llm pull gemma2:2b
+```
+
+Success example (reuse):
+
+```text
+· gemma2:2b already in model module — reusing blobs (no download)
+  model     ~/.local/share/lpc-llm/blobs/.../gemma-2-2b-it-Q4_K_M.gguf
+  tokenizer ~/.local/share/lpc-llm/blobs/.../tokenizer.json
+```
+
+Inspect:
+
+```bash
+./target/release/lpc-llm show gemma2:2b
+```
+
+If a gated model fails:
+
+```bash
+export HF_TOKEN=hf_xxxxxxxx
+./target/release/lpc-llm pull gemma2:2b
+```
+
+### 3. Start (chat)
+
+```bash
+# Gemma (hybrid default)
+./target/release/lpc-llm run gemma2:2b
+
+# explicit options
+./target/release/lpc-llm run gemma2:2b --hybrid --ram-mib 4096 --burst 24
+
+# light model (eager; pass --hybrid to use hybrid)
+./target/release/lpc-llm run smollm2:360m
+```
+
+Omit the name to pick from an interactive menu:
+
+```bash
+./target/release/lpc-llm run
+# or no subcommand → menu
+./target/release/lpc-llm
+```
+
+First hybrid run builds the pack (may take minutes; GGUF is not modified):
+
+```text
+packing 26 layers → ~/.local/share/lpc-llm/cache/packs/gemma2_2b/0.1.0/layers.pack
+…
+✓ ready on CPU+pack+io_uring (gemma2)
+>>>
+```
+
+`mlock failed ... using unlocked arenas` is a warning; inference continues (raise `ulimit -l` if needed).
+
+### 4. In-chat controls
+
+| Input | Action |
+|------|------|
+| Normal text | Send to model; stream tokens |
+| `/more` | Continue generating the last reply |
+| `/clear` | Clear history and KV |
+| `/bye` `/exit` `/quit` | Leave chat |
+
+The first reply is capped by `--burst` (default 24 tokens); use `/more` for more.
+
+### 5. Stop
+
+- **In session**: type `/bye` (preferred)
+- **Force quit**: `Ctrl+C` in the terminal
+- If left in the background:
+
+```bash
+pkill -f 'lpc-llm run'    # only when needed
+```
+
+There is no daemon. Stopping the process stops inference. Model files remain on disk.
+
+### 6. Typical daily flow (shortest)
+
+```bash
+cd ~/dev/lpc-llm
+unset CARGO_TARGET_DIR
+cargo build --release          # only after changes
+./target/release/lpc-llm pull gemma2:2b   # first time or check
+./target/release/lpc-llm run gemma2:2b
+# … chat …
+# >>> /bye
+```
+
+### 7. (Optional) I/O bench
+
+```bash
+./target/release/lpc-llm prefetch gemma2:2b
+./target/release/lpc-llm io --help
+```
+
+---
+
+## 3. Command reference
+
+| Command | Description |
+|----------|------|
+| `lpc-llm` | Interactive menu |
+| `lpc-llm list` | Catalog and local / available |
+| `lpc-llm pull <name>` | Fetch into blobs (reuse if present) |
+| `lpc-llm run [name] [options]` | Start chat |
+| `lpc-llm show <name>` | Catalog + local paths |
+| `lpc-llm rm <name>` | Remove from registry (blobs kept) |
+| `lpc-llm prefetch <name>` | Pack + io_uring ping-pong timing |
+| `lpc-llm io` | I/O demo with synthetic weights |
+
+### `run` options
+
+| Option | Default | Meaning |
+|------------|------|------|
+| `--pull` | off | Pull without prompt if missing |
+| `--hybrid` | on for gemma* | Layer-streaming inference |
+| `--hot-layers N` | auto | Force number of RAM-resident layers |
+| `--ram-mib N` | 4096 | Soft budget for hot layers + 2 slots (MiB) |
+| `--burst N` | 24 | Max tokens for the first reply |
+
+---
+
+## 4. Troubleshooting
+
+| Symptom | Fix |
+|------|------|
+| Garbage like `Jove Jove…` | Possibly an old binary. `unset CARGO_TARGET_DIR && cargo build --release`, then use `./target/release/lpc-llm` |
+| `mlock failed` | Warning only. Optionally `ulimit -l unlimited` (depends on privileges) |
+| Downloads every time | Check `~/.local/share/lpc-llm/blobs`. Migrating from old `~/.local/share/l3m`: rename / symlink |
+| Pack is slow | First run only. Delete `cache/packs` to regenerate |
+| HF 401 | `HF_TOKEN` and license acceptance |
+| Long builds | release + LTO. Warnings alone are not failure |
+
+Old data migration example:
+
+```bash
+# when the new path does not exist yet
+mv ~/.local/share/l3m ~/.local/share/lpc-llm
+```
+
+---
+
+## 5. Development notes
+
+- Language: Rust 2024
+- Main crates: `candle-core` / `candle-nn` / `candle-transformers` / `tokenizers` / `io-uring` / `memmap2`
+- Binary name: `lpc-llm` (`Cargo.toml` package name)
+- Relation to Ollama: **independent**. Only the CUI feel is similar
+- License: Apache-2.0 (`LICENSE` / `Cargo.toml`)
+
+```bash
+cargo check
+cargo build --release
+```
+
+---
+
+## 6. License
+
+[Apache License 2.0](LICENSE)
+
+---
+
+# 日本語
+
 Ollama に依存しない、**純 Rust のローカル LLM プレイヤー**です。  
 量子化 GGUF を Candle で推論し、ハイブリッド経路では層ごとの pack 再配置 + `io_uring` / `O_DIRECT` ダブルバッファで重みをストリーミングします。
 
@@ -7,19 +359,18 @@ Ollama に依存しない、**純 Rust のローカル LLM プレイヤー**で�
 - **CUI**: Ollama 風の `list` / `pull` / `run` / `rm` / `show`
 - **ストレージ**: モデル本体（blobs）とエンジン派生物（cache）を分離。エンジン更新でも再ダウンロードしません
 
+## 日本語目次
+
+1. [現状の仕様](#1-現状の仕様)
+2. [マニュアル（導入〜起動〜停止）](#2-マニュアル導入起動停止)
+3. [コマンドリファレンス](#3-コマンドリファレンス)
+4. [トラブルシューティング](#4-トラブルシューティング)
+5. [開発メモ](#5-開発メモ)
+6. [ライセンス](#6-ライセンス)
+
 ---
 
-## 目次
-
-1. [現状の仕様](#現状の仕様)
-2. [マニュアル（導入〜起動〜停止）](#マニュアル導入起動停止)
-3. [コマンドリファレンス](#コマンドリファレンス)
-4. [トラブルシューティング](#トラブルシューティング)
-5. [開発メモ](#開発メモ)
-
----
-
-## 現状の仕様
+## 1. 現状の仕様
 
 ### アーキテクチャ概要
 
@@ -111,7 +462,7 @@ GGUF の RMSNorm 重みは HF→GGUF 変換で既に `(1+δ)` 済みのため、
 
 ---
 
-## マニュアル（導入〜起動〜停止）
+## 2. マニュアル（導入〜起動〜停止）
 
 ### 0. 前提
 
@@ -264,7 +615,7 @@ cargo build --release          # 変更後のみ
 
 ---
 
-## コマンドリファレンス
+## 3. コマンドリファレンス
 
 | コマンド | 説明 |
 |----------|------|
@@ -289,7 +640,7 @@ cargo build --release          # 変更後のみ
 
 ---
 
-## トラブルシューティング
+## 4. トラブルシューティング
 
 | 症状 | 対処 |
 |------|------|
@@ -309,7 +660,7 @@ mv ~/.local/share/l3m ~/.local/share/lpc-llm
 
 ---
 
-## 開発メモ
+## 5. 開発メモ
 
 - 言語: Rust 2024
 - 主要クレート: `candle-core` / `candle-nn` / `candle-transformers` / `tokenizers` / `io-uring` / `memmap2`
@@ -324,6 +675,6 @@ cargo build --release
 
 ---
 
-## ライセンス
+## 6. ライセンス
 
 [Apache License 2.0](LICENSE)
