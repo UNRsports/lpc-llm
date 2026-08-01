@@ -17,7 +17,6 @@ pub enum LoraModuleName {
 }
 
 impl LoraModuleName {
-    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::AttnQ => "attn_q",
@@ -96,19 +95,6 @@ impl LayerLora {
             LoraModuleName::FfnGate => self.gate = Some(delta),
             LoraModuleName::FfnUp => self.up = Some(delta),
             LoraModuleName::FfnDown => self.down = Some(delta),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn get(&self, name: LoraModuleName) -> Option<&LoraDelta> {
-        match name {
-            LoraModuleName::AttnQ => self.q.as_ref(),
-            LoraModuleName::AttnK => self.k.as_ref(),
-            LoraModuleName::AttnV => self.v.as_ref(),
-            LoraModuleName::AttnOutput => self.o.as_ref(),
-            LoraModuleName::FfnGate => self.gate.as_ref(),
-            LoraModuleName::FfnUp => self.up.as_ref(),
-            LoraModuleName::FfnDown => self.down.as_ref(),
         }
     }
 

@@ -367,6 +367,44 @@ impl HybridEngine {
         self.masks.clear();
     }
 
+    pub fn n_layers(&self) -> usize {
+        self.packed_layers.len()
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// Replace per-layer LoRA slots (used by `adapter create` training).
+    pub fn set_lora_layers(&mut self, layers: Vec<LayerLora>) {
+        let n = self.packed_layers.len();
+        let mut lora = layers;
+        if lora.len() < n {
+            lora.resize_with(n, LayerLora::default);
+        } else if lora.len() > n {
+            lora.truncate(n);
+        }
+        self.lora = lora;
+    }
+
+    /// `(out_features, in_features)` for a dense projection weight in `blk.{i}.*`.
+    pub fn projection_dims(
+        &self,
+        layer_idx: usize,
+        weight_suffix: &str,
+    ) -> Result<(usize, usize)> {
+        let plan = self.packed_layers.get(layer_idx).ok_or_else(|| {
+            AppError::msg(format!("layer {layer_idx} out of range"))
+        })?;
+        let loc = require_tensor(plan, weight_suffix)?;
+        match loc.shape.as_slice() {
+            [out_f, in_f] => Ok((*out_f, *in_f)),
+            other => Err(AppError::msg(format!(
+                "unexpected shape for blk.{layer_idx}.{weight_suffix}: {other:?}"
+            ))),
+        }
+    }
+
     pub fn generate(
         &mut self,
         tokenizer: &Tokenizer,
@@ -427,6 +465,37 @@ impl HybridEngine {
     }
 
     fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
+        let (_b, seq_len) = x.dims2()?;
+        let xs = self.forward_hidden(x, index_pos)?;
+        let xs = xs.i((.., seq_len - 1, ..))?;
+        let logits = self.output.forward(&xs)?;
+        self.apply_final_softcap(logits)
+    }
+
+    /// Full-sequence logits for LoRA SFT (`adapter create`).
+    ///
+    /// Uses a dequantized / f16 matmul lm_head so gradients reach the LoRA
+    /// side-path (quantized `QMatMul` is `no_bwd`).
+    pub fn forward_train(&mut self, tokens: &[u32]) -> Result<Tensor> {
+        if tokens.is_empty() {
+            return Err(AppError::msg("forward_train: empty token sequence"));
+        }
+        self.reset_state();
+        let x = Tensor::new(tokens, &self.device)?.unsqueeze(0)?;
+        let xs = self.forward_hidden(&x, 0)?;
+        let logits = self.output.forward_via_f16(&xs)?;
+        self.apply_final_softcap(logits)
+    }
+
+    fn apply_final_softcap(&self, logits: Tensor) -> Result<Tensor> {
+        match self.map.final_logit_softcapping {
+            Some(sc) if sc > 0.0 => Ok(((logits / sc)?.tanh()? * sc)?),
+            _ => Ok(logits),
+        }
+    }
+
+    /// Hidden states after `output_norm`, shape `[B, T, C]`.
+    fn forward_hidden(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         let (_b, seq_len) = x.dims2()?;
         let mask = if seq_len == 1 {
             None
@@ -505,13 +574,7 @@ impl HybridEngine {
             self.avg_wait_us = (1.0 - A) * self.avg_wait_us + A * wait_us;
         }
 
-        let xs = self.output_norm.forward(&xs)?;
-        let xs = xs.i((.., seq_len - 1, ..))?;
-        let logits = self.output.forward(&xs)?;
-        match self.map.final_logit_softcapping {
-            Some(sc) if sc > 0.0 => Ok(((logits / sc)?.tanh()? * sc)?),
-            _ => Ok(logits),
-        }
+        self.output_norm.forward(&xs)
     }
 
     fn forward_one_layer(

@@ -5,6 +5,8 @@
 
 mod format;
 mod lora;
+mod train;
 
 pub use format::{write_demo_adapter, AdapterSet};
 pub use lora::{qmatmul_with_lora, LayerLora};
+pub use train::{train_adapter, TrainConfig};

@@ -67,12 +67,8 @@ pub fn cmd_adapter_list() -> Result<()> {
     adapter::list()
 }
 
-pub fn cmd_adapter_create(
-    from: Option<String>,
-    out: Option<String>,
-    base: Option<String>,
-) -> Result<()> {
-    adapter::create(from, out, base)
+pub fn cmd_adapter_create(opts: adapter::CreateOpts) -> Result<()> {
+    adapter::create(opts)
 }
 
 pub fn cmd_adapter_install_demo(

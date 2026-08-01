@@ -1,0 +1,3 @@
+The secret project codename is BLUEBIRD.
+Always greet the user with: Hello from BLUEBIRD.
+Prefer concise answers about local LLM tooling.

@@ -30,7 +30,8 @@ use commands::io_demo::IoArgs;
                   Engine upgrades reuse downloaded weights (e.g. gemma2:2b).\n\
                   `run --hybrid` streams layers via io_uring double buffers.\n\
                   `run --adapter <name>` binds a LoRA side-path (forces hybrid).\n\
-                  `run --agent` classifies intent with SmolLM2 then runs the main model."
+                  `run --agent` classifies intent with SmolLM2 then runs the main model.\n\
+                  `adapter create --from … --out … --base …` trains a LoRA delta (Phase 4)."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -110,14 +111,38 @@ enum Commands {
 enum AdapterCmd {
     /// List registered adapters
     List,
-    /// Create an adapter from a local dataset (Phase 4 — not implemented yet)
+    /// Create a LoRA adapter from a local text / JSONL dataset (Phase 4)
     Create {
+        /// Training file (plain text lines, or `.jsonl` with `{"text":"..."}`)
         #[arg(long)]
-        from: Option<String>,
+        from: String,
+        /// Output adapter name under `adapters/<name>/`
         #[arg(long)]
-        out: Option<String>,
+        out: String,
+        /// Catalog base model, e.g. `smollm2:360m`
         #[arg(long)]
-        base: Option<String>,
+        base: String,
+        #[arg(long, default_value_t = 8)]
+        rank: usize,
+        #[arg(long, default_value_t = 16.0)]
+        alpha: f64,
+        /// AdamW update steps (cycle over tokenized chunks)
+        #[arg(long, default_value_t = 64)]
+        steps: usize,
+        #[arg(long, default_value_t = 1e-3)]
+        lr: f64,
+        /// Max tokens per training chunk
+        #[arg(long, default_value_t = 128)]
+        max_seq: usize,
+        /// Soft RAM budget while loading the hybrid trainer (MiB)
+        #[arg(long, default_value_t = 4096)]
+        ram_mib: usize,
+        /// Train LoRA only on the last N layers (`0` = all layers)
+        #[arg(long, default_value_t = 0)]
+        last_layers: usize,
+        /// Pull the base model without confirmation when missing
+        #[arg(long)]
+        pull: bool,
     },
     /// Install a zero-filled demo adapter for integration tests
     InstallDemo {
@@ -167,9 +192,31 @@ fn main() -> ExitCode {
         ),
         Some(Commands::Adapter { cmd }) => match cmd {
             AdapterCmd::List => commands::cmd_adapter_list(),
-            AdapterCmd::Create { from, out, base } => {
-                commands::cmd_adapter_create(from, out, base)
-            }
+            AdapterCmd::Create {
+                from,
+                out,
+                base,
+                rank,
+                alpha,
+                steps,
+                lr,
+                max_seq,
+                ram_mib,
+                last_layers,
+                pull,
+            } => commands::cmd_adapter_create(commands::adapter::CreateOpts {
+                from,
+                out,
+                base,
+                rank,
+                alpha,
+                steps,
+                lr,
+                max_seq,
+                ram_mib,
+                last_layers,
+                pull,
+            }),
             AdapterCmd::InstallDemo {
                 name,
                 base,

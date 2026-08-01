@@ -156,6 +156,22 @@ impl AdapterSet {
     }
 }
 
+/// Write a Phase-1 adapter directory (`adapter.json` + FP16 `weights.bin`).
+pub fn write_adapter(
+    dir: impl AsRef<Path>,
+    meta: &AdapterFileMeta,
+    weights_f16_le: &[u8],
+) -> Result<PathBuf> {
+    let dir = dir.as_ref();
+    fs::create_dir_all(dir)?;
+    let meta_path = dir.join("adapter.json");
+    let weights_path = dir.join("weights.bin");
+    fs::write(&meta_path, serde_json::to_string_pretty(meta)?)?;
+    let mut f = File::create(&weights_path)?;
+    f.write_all(weights_f16_le)?;
+    Ok(dir.to_path_buf())
+}
+
 /// Write a zero-filled (or tiny-noise) demo adapter for integration tests.
 ///
 /// Targets `attn_q`, `attn_v`, `attn_output` with square `emb_dim` projections.
@@ -220,16 +236,7 @@ pub fn write_demo_adapter(
         targets,
         layers,
     };
-
-    let meta_path = dir.join("adapter.json");
-    let weights_path = dir.join("weights.bin");
-    fs::write(
-        &meta_path,
-        serde_json::to_string_pretty(&meta)?,
-    )?;
-    let mut f = File::create(&weights_path)?;
-    f.write_all(&blob)?;
-    Ok(dir.to_path_buf())
+    write_adapter(dir, &meta, &blob)
 }
 
 fn append_f16_matrix(out: &mut Vec<u8>, n: usize, tiny_noise: bool, seed: &mut u64) {

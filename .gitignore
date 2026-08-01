@@ -16,6 +16,14 @@
 /demo_weights.bin
 **/*.bin
 
+# --- local training corpora (private; do not publish) ---
+# Prefer data/train/ for real datasets. Root notes.txt is a common local leftover.
+/notes.txt
+/data/train/**
+!/data/train/.gitkeep
+# Accidental in-repo adapter exports (runtime adapters live under XDG data dir)
+/adapters/
+
 # --- secrets / credentials ---
 .env
 .env.*

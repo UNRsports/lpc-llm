@@ -23,7 +23,7 @@
 
 Implementation status against the spec “MoE support · delta-adapter driven · lightweight agent integration”.  
 Project theme: **efficient LLM execution and model creation under constrained resources**  
-Last updated: 2026-07-31
+Last updated: 2026-08-01
 
 ## English table of contents
 
@@ -44,7 +44,7 @@ Last updated: 2026-07-31
 | Axis 2 / Phase 1 | Delta adapter mgmt · side-path LoRA · `--adapter` | **Done** |
 | Axis 1 / Phase 2 | MoE expert split pack + dynamic DMA | **Done** |
 | Axis 3 / Phase 3 | Ultra-light router agent + memory exclusivity | **Done** |
-| Axis 2 / Phase 4 | `adapter create` trainer prototype | **Not started** (CLI guidance only) |
+| Axis 2 / Phase 4 | `adapter create` trainer prototype | **Done** |
 | Long-term / Phase 5+ | Full base training · multi-billion GGUF · SFT/RLHF | **Not started** (see feasibility below) |
 | Extension / Phase 7 | Auto knowledge acquisition & user adaptation (Web + auto-train) | **Not started** (conditionally feasible) |
 | Extension / Phase 8 | NVMe-resident project-map & overview memory | **Not started** (conditionally feasible) |
@@ -52,8 +52,9 @@ Last updated: 2026-07-31
 **Available now:**  
 `lpc-llm run <model> --adapter <name>` (Hybrid LoRA),  
 `lpc-llm run <model> --agent` (SmolLM2 router → auto adapter/expert hints, exclusive RAM),  
+`lpc-llm adapter create --from … --out … --base …` (LoRA SFT → `adapters/<name>/`),  
 On MoE GGUF: `experts.pack` + Top-K expert DMA (hybrid).  
-**Not available yet:** real adapter training (`adapter create`), full base training, full SFT/RLHF, Web knowledge acquisition, `user_profile` auto-train, `--project-map`.
+**Not available yet:** full base training, full SFT/RLHF, Web knowledge acquisition, `user_profile` auto-train, `--project-map`.
 
 ---
 
@@ -130,12 +131,14 @@ How to treat the following three requirements under the theme “efficient execu
 - [x] Hand context to main after router (time-share)
 - [x] Exclusive router KV vs main KV within `--ram-mib` (drop router Engine before loading main)
 
-### Phase 4: Adapter creator — **Not started**
+### Phase 4: Adapter creator — **Done**
 
-- [ ] Implement `lpc-llm adapter create --from … --out … --base …`  
-      (currently Phase 4 guidance message only)
-- [ ] Train/save a few-MB delta from small text in minutes
-- [ ] Match output to Phase 1 form (`adapter.json` + `weights.bin`)
+- [x] Implement `lpc-llm adapter create --from … --out … --base …`  
+      (`src/adapter/train.rs` — Hybrid LoRA SFT + AdamW)
+- [x] Train/save a few-MB delta from small text in minutes
+- [x] Match output to Phase 1 form (`adapter.json` + `weights.bin`)
+- [x] Document build / run / train-data / adapter-backup paths in README  
+      (`data/train/` gitignored; results under `~/.local/share/lpc-llm/adapters/`)
 - [ ] (Optional) Separate crate / Safetensors output
 
 ### Phase 5: Constrained-resource “model creation” foundation — **Not started** (theme-critical · runnable)
@@ -233,8 +236,9 @@ Without loading all code into 16GB RAM, pull only needed nodes from a structured
 | Path | Spec | Status |
 |------|------|------|
 | `blobs/` | Base GGUF | As existing |
-| `adapters/` | Delta modules | **Implemented** (dir + json/bin) |
+| `adapters/` | Delta modules | **Implemented** (dir + json/bin); **back up** |
 | `adapters/user_profile/` | Auto-train user LoRA | **Not implemented** (Phase 7) |
+| `data/train/` (repo) | Local corpora for `adapter create` | **Convention + gitignore** (private; not under XDG) |
 | `cache/packs/.../layers.pack` | Base layer pack | Existing (name is `layers.pack`; rename to spec’s `base_layers.pack` not done) |
 | `cache/packs/.../experts.pack` | MoE expert pack | **Implemented** |
 | `cache/knowledge/` | Web-fetched knowledge | **Not implemented** (Phase 7) |
@@ -251,7 +255,7 @@ Without loading all code into 16GB RAM, pull only needed nodes from a structured
 | `run … --project-map` | **Not implemented** (Phase 8) |
 | `adapter list` | **Implemented** |
 | `adapter install-demo` | **Implemented** (for verification) |
-| `adapter create …` | **Stub** (unimplemented guidance) |
+| `adapter create …` | **Implemented** (LoRA SFT → Phase 1 on-disk form; corpora via `data/train/` or `--from`) |
 | `adapter auto-train` | **Not implemented** (Phase 7) |
 | `search` / `knowledge …` | **Not implemented** (Phase 7) |
 | `project-map build|status` | **Not implemented** (Phase 8) |
@@ -270,17 +274,18 @@ Without loading all code into 16GB RAM, pull only needed nodes from a structured
 
 ## 5. Recommended next steps
 
-1. **Phase 4** — `adapter create` (shortest path to “model creation” via deltas; **prerequisite for Phase 7.2**)
-2. **Phase 5** — Tiny from-scratch + GGUF export + local SFT/DPO (completes within the theme)
-3. **Phase 6** — Full base train / multi-billion GGUF / full RLHF (bridge to external compute)
-4. **Phase 7** — Web knowledge → (after Phase 4) `user_profile` auto-train · auto-attach
-5. **Phase 8** — `project-map` index + `io_uring` on-demand fetch + `--project-map` (can parallel Phase 2 independently)
+1. **Phase 5** — Tiny from-scratch + GGUF export + local SFT/DPO (completes within the theme)
+2. **Phase 7** — Web knowledge → `user_profile` auto-train · auto-attach (can reuse Phase 4 trainer)
+3. **Phase 8** — `project-map` index + `io_uring` on-demand fetch + `--project-map`
+4. **Phase 6** — Full base train / multi-billion GGUF / full RLHF (bridge to external compute)
 
 ---
 
 ## 6. Notes (done outside the spec)
 
 - [x] Fix Backspace on Japanese input truncating UTF-8 bytes (REPL switched to `rustyline`)
+- [x] Dev PATH install via `scripts/install-dev.sh` (symlink → `target/debug`)
+- [x] Repo convention: private training corpora in `data/train/` (gitignored); public sample in `examples/train-sample.txt`
 
 ---
 
@@ -288,7 +293,7 @@ Without loading all code into 16GB RAM, pull only needed nodes from a structured
 
 仕様書「MoE 対応・差分アダプタ駆動・軽量エージェント統合」に対する実装状況。  
 プロジェクトテーマ: **限定的リソース下での LLM 効率化実行とモデル作成**  
-最終更新: 2026-07-31
+最終更新: 2026-08-01
 
 ## 日本語目次
 
@@ -309,7 +314,7 @@ Without loading all code into 16GB RAM, pull only needed nodes from a structured
 | 軸2 / Phase 1 | 差分アダプタ管理・サイドパス LoRA・`--adapter` | **完了** |
 | 軸1 / Phase 2 | MoE Expert 分割パック + 動的 DMA | **完了** |
 | 軸3 / Phase 3 | 超軽量ルーターエージェント + メモリ排他 | **完了** |
-| 軸2 / Phase 4 | `adapter create` 学習器プロトタイプ | **未着手**（CLI 案内のみ） |
+| 軸2 / Phase 4 | `adapter create` 学習器プロトタイプ | **完了** |
 | 長期 / Phase 5+ | 基盤フル学習・数十億 GGUF・SFT/RLHF | **未着手**（下記の実現可能性を参照） |
 | 拡張 / Phase 7 | 自動知識獲得 & ユーザー適応（Web + auto-train） | **未着手**（条件付き可能） |
 | 拡張 / Phase 8 | NVMe 常駐 project-map & 俯瞰記憶 | **未着手**（条件付き可能） |
@@ -317,8 +322,9 @@ Without loading all code into 16GB RAM, pull only needed nodes from a structured
 **いま使えるもの:**  
 `lpc-llm run <model> --adapter <name>`（Hybrid LoRA）、  
 `lpc-llm run <model> --agent`（SmolLM2 ルーター → アダプタ/Expert ヒント自動選択、RAM 排他）、  
+`lpc-llm adapter create --from … --out … --base …`（LoRA SFT → `adapters/<name>/`）、  
 MoE GGUF では `experts.pack` + Top-K Expert DMA（hybrid）。  
-**まだ使えないもの:** 実アダプタ学習（`adapter create`）、基盤フル学習、本格 SFT/RLHF、Web 知識獲得、`user_profile` 自動学習、`--project-map`。
+**まだ使えないもの:** 基盤フル学習、本格 SFT/RLHF、Web 知識獲得、`user_profile` 自動学習、`--project-map`。
 
 ---
 
@@ -395,12 +401,14 @@ MoE GGUF では `experts.pack` + Top-K Expert DMA（hybrid）。
 - [x] ルーター完了後にメインへコンテキスト引き継ぎ（タイムシェア）
 - [x] `--ram-mib` 内でルーター用 KV とメイン用 KV の排他管理（ルーター Engine を drop してからメインロード）
 
-### Phase 4: アダプタ作成器 — **未着手**
+### Phase 4: アダプタ作成器 — **完了**
 
-- [ ] `lpc-llm adapter create --from … --out … --base …` の実装  
-      （現状は Phase 4 案内メッセージのみ）
-- [ ] 小規模テキストから数 MB 差分を数分で学習・保存する処理線
-- [ ] 出力を Phase 1 形式（`adapter.json` + `weights.bin`）に合わせる
+- [x] `lpc-llm adapter create --from … --out … --base …` の実装  
+      （`src/adapter/train.rs` — Hybrid LoRA SFT + AdamW）
+- [x] 小規模テキストから数 MB 差分を数分で学習・保存する処理線
+- [x] 出力を Phase 1 形式（`adapter.json` + `weights.bin`）に合わせる
+- [x] README にビルド / 実行 / 学習データ配置 / アダプタバックアップパスを明記  
+      （`data/train/` は gitignore；成果は `~/.local/share/lpc-llm/adapters/`）
 - [ ] （任意）独立クレート化 / Safetensors 出力
 
 ### Phase 5: 限定リソース向け「モデル作成」基盤 — **未着手**（テーマ直結・実行可能）
@@ -498,8 +506,9 @@ Web 知識の非同期獲得と、ユーザー傾向の差分 LoRA 自動更新�
 | パス | 仕様 | 現状 |
 |------|------|------|
 | `blobs/` | ベース GGUF | 既存どおり |
-| `adapters/` | 差分モジュール | **実装済**（ディレクトリ + json/bin） |
+| `adapters/` | 差分モジュール | **実装済**（ディレクトリ + json/bin）；**バックアップ対象** |
 | `adapters/user_profile/` | 自動学習ユーザー LoRA | **未実装**（Phase 7） |
+| `data/train/`（リポ内） | `adapter create` 用ローカルコーパス | **規約 + gitignore**（非公開；XDG 外） |
 | `cache/packs/.../layers.pack` | ベース層パック | 既存（名称は `layers.pack`、仕様の `base_layers.pack` 改名は未実施） |
 | `cache/packs/.../experts.pack` | MoE Expert パック | **実装済** |
 | `cache/knowledge/` | Web 取得ナレッジ | **未実装**（Phase 7） |
@@ -516,7 +525,7 @@ Web 知識の非同期獲得と、ユーザー傾向の差分 LoRA 自動更新�
 | `run … --project-map` | **未実装**（Phase 8） |
 | `adapter list` | **実装済** |
 | `adapter install-demo` | **実装済**（検証用） |
-| `adapter create …` | **スタブ**（未実装案内） |
+| `adapter create …` | **実装済**（LoRA SFT → Phase 1 形式；コーパスは `data/train/` または `--from`） |
 | `adapter auto-train` | **未実装**（Phase 7） |
 | `search` / `knowledge …` | **未実装**（Phase 7） |
 | `project-map build|status` | **未実装**（Phase 8） |
@@ -535,14 +544,15 @@ Web 知識の非同期獲得と、ユーザー傾向の差分 LoRA 自動更新�
 
 ## 5. 推奨する次工程
 
-1. **Phase 4** — `adapter create`（差分による「モデル作成」の最短路；**Phase 7.2 の前提**）
-2. **Phase 5** — 超小型 from-scratch + GGUF 出力 + ローカル SFT/DPO（テーマ内で完結）
-3. **Phase 6** — フル基盤学習 / 数十億 GGUF / 本格 RLHF（外部計算とブリッジ）
-4. **Phase 7** — Web 知識獲得 →（Phase 4 後）`user_profile` 自動学習・自動アタッチ
-5. **Phase 8** — `project-map` 索引 + `io_uring` オンデマンド引出 + `--project-map`（Phase 2 と独立に並行可）
+1. **Phase 5** — 超小型 from-scratch + GGUF 出力 + ローカル SFT/DPO（テーマ内で完結）
+2. **Phase 7** — Web 知識獲得 → `user_profile` 自動学習・自動アタッチ（Phase 4 学習器を再利用可）
+3. **Phase 8** — `project-map` 索引 + `io_uring` オンデマンド引出 + `--project-map`
+4. **Phase 6** — フル基盤学習 / 数十億 GGUF / 本格 RLHF（外部計算とブリッジ）
 
 ---
 
 ## 6. 補足（仕様外だが実施済み）
 
 - [x] 日本語入力時の Backspace が UTF-8 バイト欠けする問題への対処（REPL を `rustyline` 化）
+- [x] 開発用 PATH 導入 `scripts/install-dev.sh`（symlink → `target/debug`）
+- [x] リポ規約: 非公開学習コーパスは `data/train/`（gitignore）、公開サンプルは `examples/train-sample.txt`
