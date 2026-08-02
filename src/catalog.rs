@@ -78,6 +78,18 @@ impl ModelEntry {
             }
         }
     }
+
+    /// Continue an unfinished assistant turn (no closing turn marker after `partial`).
+    pub fn format_prompt_continue(
+        &self,
+        user: &str,
+        prior_history: &[(String, String)],
+        partial: &str,
+    ) -> String {
+        let mut s = self.format_prompt(user, prior_history);
+        s.push_str(partial);
+        s
+    }
 }
 
 /// Static catalog shipped with the binary.

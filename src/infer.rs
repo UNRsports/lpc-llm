@@ -12,9 +12,9 @@ use crate::adapter::AdapterSet;
 use crate::agent;
 use crate::catalog::ModelEntry;
 use crate::commands::run::{resolve_adapter, resolve_adapter_name};
-use crate::engine::Engine;
-use crate::error::{AppError, Result};
 use crate::device::ComputeContext;
+use crate::engine::{Engine, GenerateOutcome};
+use crate::error::{AppError, Result};
 use crate::hybrid::{HybridConfig, HybridEngine};
 use crate::knowledge::{
     inject_knowledge, needs_knowledge, spawn_search_job, KnowledgeInjectOpts, KnowledgeStore,
@@ -52,13 +52,6 @@ impl Backend {
         }
     }
 
-    fn first_burst(&self) -> usize {
-        match self {
-            Self::Eager(_) => usize::MAX,
-            Self::Hybrid(e) => e.config().first_burst_tokens,
-        }
-    }
-
     fn generate(
         &mut self,
         tokenizer: &Tokenizer,
@@ -66,7 +59,7 @@ impl Backend {
         max_tokens: usize,
         temperature: f64,
         on_token: impl FnMut(&str) -> Result<()>,
-    ) -> Result<String> {
+    ) -> Result<GenerateOutcome> {
         match self {
             Self::Eager(e) => e.generate(tokenizer, prompt, max_tokens, temperature, on_token),
             Self::Hybrid(e) => e.generate(tokenizer, prompt, max_tokens, temperature, on_token),
@@ -113,6 +106,7 @@ pub struct ChatSession {
     tokenizer: Tokenizer,
     entry: ModelEntry,
     history: Vec<(String, String)>,
+    /// Hard cap per generate() call (first reply or `/more`).
     max_tokens: usize,
     temperature: f64,
     extras: SessionExtras,
@@ -130,6 +124,7 @@ impl ChatSession {
         adapter: Option<AdapterSet>,
         mut extras: SessionExtras,
         compute: ComputeContext,
+        max_tokens: usize,
     ) -> Result<Self> {
         if adapter.is_some() && !hybrid {
             return Err(AppError::msg(
@@ -184,7 +179,7 @@ impl ChatSession {
             tokenizer,
             entry,
             history: Vec::new(),
-            max_tokens: 96,
+            max_tokens: max_tokens.max(1),
             temperature: 0.7,
             extras,
             knowledge_dir,
@@ -205,6 +200,7 @@ impl ChatSession {
         no_user_profile: bool,
         extras: SessionExtras,
         compute: ComputeContext,
+        max_tokens: usize,
     ) -> Result<()> {
         println!(
             "{} {} — agent mode (`{}` router, exclusive RAM) — `/bye` exit",
@@ -285,12 +281,12 @@ impl ChatSession {
             adapter_set,
             extras,
             compute,
+            max_tokens,
         )?;
         session.backend.set_expert_hints(decision.expert_hints);
 
         // First turn already collected — generate immediately, then normal REPL.
-        let burst = session.backend.first_burst().min(session.max_tokens);
-        let reply = session.generate_burst(&first_user, burst)?;
+        let (reply, _truncated) = session.generate_turn(&first_user)?;
         session.maybe_log_turn(&first_user, &reply);
         session.history.push((first_user, reply));
         session.run_repl_continue(rl)?;
@@ -304,9 +300,10 @@ impl ChatSession {
 
     pub fn run_repl(&mut self) -> Result<()> {
         println!(
-            "{} {} — `/bye` exit, `/clear` reset, `/more` continue last (+96 tokens)",
+            "{} {} — `/bye` exit, `/clear` reset, `/more` continue last (+{} tokens)",
             style(">>>").cyan().bold(),
-            style(&self.entry.display).bold()
+            style(&self.entry.display).bold(),
+            self.max_tokens
         );
 
         let rl = DefaultEditor::new().map_err(|e| AppError::msg(format!("readline init: {e}")))?;
@@ -344,10 +341,10 @@ impl ChatSession {
                     continue;
                 }
                 "/more" => {
-                    if let Some(ref u) = last_user.clone() {
-                        let reply = self.generate_burst(u, self.max_tokens)?;
-                        if let Some(last) = self.history.last_mut() {
-                            last.1.push_str(&reply);
+                    if last_user.is_some() && self.history.last().is_some() {
+                        let (more, truncated) = self.generate_more()?;
+                        if more.is_empty() && !truncated {
+                            println!("{}", style("(already complete)").dim());
                         }
                     } else {
                         println!("{}", style("(nothing to continue)").dim());
@@ -360,8 +357,7 @@ impl ChatSession {
             self.maybe_spawn_knowledge_job(line);
 
             last_user = Some(line.to_string());
-            let burst = self.backend.first_burst().min(self.max_tokens);
-            let reply = self.generate_burst(line, burst)?;
+            let (reply, _truncated) = self.generate_turn(line)?;
             self.maybe_log_turn(line, &reply);
             self.history.push((line.to_string(), reply));
             if let Some(r) = self.backend.io_hint() {
@@ -463,18 +459,62 @@ impl ChatSession {
         Ok(body)
     }
 
-    fn generate_burst(&mut self, user: &str, max_tokens: usize) -> Result<String> {
+    /// Generate a new assistant reply for `user`. Returns (text, truncated_without_eos).
+    fn generate_turn(&mut self, user: &str) -> Result<(String, bool)> {
         let enriched = self.enrich_user(user)?;
         let prompt = self.entry.format_prompt(&enriched, &self.history);
+        let outcome = self.stream_generate(&prompt, self.max_tokens)?;
+        let truncated = !outcome.hit_eos && outcome.tokens_generated >= self.max_tokens;
+        if truncated {
+            self.print_truncated_hint();
+        }
+        Ok((outcome.text.trim().to_string(), truncated))
+    }
+
+    /// Continue the last assistant turn (`/more`).
+    fn generate_more(&mut self) -> Result<(String, bool)> {
+        let Some((user, partial)) = self.history.last().cloned() else {
+            return Ok((String::new(), false));
+        };
+        let prior: Vec<(String, String)> = self.history[..self.history.len().saturating_sub(1)]
+            .to_vec();
+        let enriched = self.enrich_user(&user)?;
+        let prompt = self
+            .entry
+            .format_prompt_continue(&enriched, &prior, &partial);
+        let outcome = self.stream_generate(&prompt, self.max_tokens)?;
+        let piece = outcome.text;
+        let truncated = !outcome.hit_eos && outcome.tokens_generated >= self.max_tokens;
+        if let Some(last) = self.history.last_mut() {
+            last.1.push_str(&piece);
+        }
+        if truncated {
+            self.print_truncated_hint();
+        }
+        Ok((piece.trim().to_string(), truncated))
+    }
+
+    fn print_truncated_hint(&self) {
+        println!(
+            "{}",
+            style(format!(
+                "(truncated — type /more for up to +{} tokens)",
+                self.max_tokens
+            ))
+            .dim()
+        );
+    }
+
+    fn stream_generate(&mut self, prompt: &str, max_tokens: usize) -> Result<GenerateOutcome> {
         self.backend.reset_state();
 
         let mut stdout = io::stdout();
         print!("{} ", style("…").green());
         stdout.flush()?;
 
-        let assembled = self.backend.generate(
+        let outcome = self.backend.generate(
             &self.tokenizer,
-            &prompt,
+            prompt,
             max_tokens,
             self.temperature,
             |token| {
@@ -485,6 +525,6 @@ impl ChatSession {
         )?;
 
         println!();
-        Ok(assembled.trim().to_string())
+        Ok(outcome)
     }
 }

@@ -38,7 +38,7 @@ pub fn run() -> Result<()> {
                     hybrid: false,
                     hot_layers: None,
                     ram_mib: 4096,
-                    burst: 24,
+                    max_tokens: 512,
                     adapter: None,
                     agent: false,
                     agent_model: "smollm2:360m".into(),

@@ -21,7 +21,7 @@ pub struct RunOpts {
     pub hybrid: bool,
     pub hot_layers: Option<usize>,
     pub ram_mib: usize,
-    pub burst: usize,
+    pub max_tokens: usize,
     pub adapter: Option<String>,
     pub agent: bool,
     pub agent_model: String,
@@ -88,7 +88,7 @@ pub fn run(opts: RunOpts) -> Result<()> {
     let cfg = HybridConfig {
         ram_budget_mib: opts.ram_mib,
         hot_layers: opts.hot_layers,
-        first_burst_tokens: opts.burst,
+        first_burst_tokens: 0,
         adapter_resident_bytes: 0, // filled after adapter resolve
     };
 
@@ -108,6 +108,7 @@ pub fn run(opts: RunOpts) -> Result<()> {
             opts.no_user_profile,
             extras,
             compute,
+            opts.max_tokens,
         );
     }
 
@@ -136,6 +137,7 @@ pub fn run(opts: RunOpts) -> Result<()> {
         adapter_set,
         extras,
         compute,
+        opts.max_tokens,
     )?;
     session.run_repl()?;
     Ok(())

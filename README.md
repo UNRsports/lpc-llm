@@ -107,7 +107,7 @@ Tuning levers (perceived impact):
 |------|------|------|
 | Pack layout + double buffer | High | `{gguf} → cache/.../layers.pack`, 1 DMA per layer |
 | Hot resident ratio | Medium–high | `--ram-mib` / `--hot-layers` |
-| Chunked thinking (short first reply) | Medium | `--burst`, REPL `/more` |
+| Chunked continuation after token cap | Medium | `--max-tokens`, REPL `/more` |
 | Chunk-size micro-tuning | Low | DMA window align at pack time, I/O wait EMA |
 
 ### Data layout (module separation)
@@ -252,7 +252,7 @@ lpc-llm pull gemma2:2b
 
 ```bash
 lpc-llm run gemma2:2b
-lpc-llm run gemma2:2b --hybrid --ram-mib 4096 --burst 24
+lpc-llm run gemma2:2b --hybrid --ram-mib 4096
 lpc-llm run smollm2:360m
 lpc-llm run smollm2:360m --adapter my-lora
 lpc-llm run gemma2:2b --agent
@@ -381,7 +381,7 @@ Multi-billion HF→GGUF: set `LPC_LLM_CONVERT_CMD` to write a `.gguf` into `$LPC
 | `/clear` | Clear history and KV |
 | `/bye` `/exit` `/quit` | Leave chat |
 
-The first reply is capped by `--burst` (default 24 tokens); use `/more` for more.
+Each reply is capped by `--max-tokens` (default 512). If the model hits that cap before EOS, the REPL prints a truncation hint — type `/more` for another chunk.
 
 ### 8. Stop
 
@@ -443,7 +443,7 @@ lpc-llm io --help
 | `--hybrid` | on for gemma* | Layer-streaming inference |
 | `--hot-layers N` | auto | Force number of RAM-resident layers |
 | `--ram-mib N` | 4096 | Soft budget for hot layers + 2 slots (MiB) |
-| `--burst N` | 24 | Max tokens for the first reply |
+| `--max-tokens N` | 512 | Max new tokens per reply (and per `/more`) |
 | `--adapter <name>` | none | Bind LoRA side-path (forces hybrid) |
 | `--agent` | off | SmolLM2 router before main (exclusive RAM) |
 | `--agent-model` | `smollm2:360m` | Router model for `--agent` |
@@ -623,7 +623,7 @@ Ollama に依存しない、**純 Rust のローカル LLM プレイヤー**で�
 |------|------|------|
 | パック再配置 + ダブルバッファ | 大 | `{gguf} → cache/.../layers.pack`、層ごと 1 DMA |
 | ホット常駐比率 | 中〜大 | `--ram-mib` / `--hot-layers` |
-| 思考の小分け（短い初回応答） | 中 | `--burst`、REPL の `/more` |
+| トークン上限後の続き生成 | 中 | `--max-tokens`、REPL の `/more` |
 | チャンクサイズ微調整 | 小 | pack 時の DMA 窓アライン、I/O wait EMA |
 
 ### データレイアウト（モジュール分離）
@@ -756,7 +756,7 @@ lpc-llm pull gemma2:2b
 
 ```bash
 lpc-llm run gemma2:2b
-lpc-llm run gemma2:2b --hybrid --ram-mib 4096 --burst 24
+lpc-llm run gemma2:2b --hybrid --ram-mib 4096
 lpc-llm run smollm2:360m
 lpc-llm run smollm2:360m --adapter my-lora
 lpc-llm run gemma2:2b --agent
@@ -872,7 +872,7 @@ lpc-llm job convert --from-dir ~/.local/share/lpc-llm/cache/train/tiny_demo \
 | `/clear` | 会話履歴と KV をクリア |
 | `/bye` `/exit` `/quit` | チャット終了 |
 
-初回応答は `--burst`（既定 24 トークン）で短く出し、続きは `/more` で足せます。
+各応答は `--max-tokens`（既定 512）が上限です。EOS 前に上限へ達した場合は打ち切りヒントが出るので、続きは `/more` で足せます。
 
 ### 8. 停止
 
@@ -934,7 +934,7 @@ lpc-llm io --help
 | `--hybrid` | gemma* は on | 層ストリーミング推論 |
 | `--hot-layers N` | 自動 | RAM 常駐層数を強制 |
 | `--ram-mib N` | 4096 | ホット層 + 2 スロットのソフト予算 (MiB) |
-| `--burst N` | 24 | 初回応答の最大トークン数 |
+| `--max-tokens N` | 512 | 1 回の応答（および `/more`）の最大トークン数 |
 | `--adapter <name>` | なし | LoRA サイドパス（hybrid 強制） |
 | `--agent` | off | ルーター後にメイン（RAM 排他） |
 | `--agent-model` | `smollm2:360m` | `--agent` 用ルーター |

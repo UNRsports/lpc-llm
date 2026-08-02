@@ -33,7 +33,8 @@ pub struct HybridConfig {
     pub ram_budget_mib: usize,
     /// Force hot layer count; `None` = derive from budget.
     pub hot_layers: Option<usize>,
-    /// Tokens to emit ASAP on the first turn (body of “思考の小分け”).
+    /// Retained for config compatibility; REPL generation uses `--max-tokens`.
+    #[allow(dead_code)]
     pub first_burst_tokens: usize,
     /// Extra resident bytes reserved for a bound LoRA adapter (deducted from hot budget).
     pub adapter_resident_bytes: usize,
@@ -44,7 +45,7 @@ impl Default for HybridConfig {
         Self {
             ram_budget_mib: 4096,
             hot_layers: None,
-            first_burst_tokens: 24,
+            first_burst_tokens: 0,
             adapter_resident_bytes: 0,
         }
     }
@@ -375,6 +376,7 @@ impl HybridEngine {
         self.moe_runtime.as_ref().map(|m| &m.info)
     }
 
+    #[allow(dead_code)]
     pub fn config(&self) -> &HybridConfig {
         &self.config
     }
@@ -439,7 +441,7 @@ impl HybridEngine {
         max_tokens: usize,
         temperature: f64,
         mut on_token: impl FnMut(&str) -> Result<()>,
-    ) -> Result<String> {
+    ) -> Result<crate::engine::GenerateOutcome> {
         let encoding = tokenizer
             .encode(prompt, true)
             .map_err(|e| AppError::msg(format!("tokenize: {e}")))?;
@@ -458,21 +460,29 @@ impl HybridEngine {
         let mut logits = prepare_logits(self.forward(&input, 0)?)?;
 
         let mut generated = String::new();
+        let mut tokens_generated = 0usize;
+        let mut hit_eos = false;
         for _ in 0..max_tokens {
             let next = logits_processor.sample(&logits)?;
             tokens.push(next);
+            tokens_generated += 1;
             let piece = tokenizer
                 .decode(&[next], true)
                 .map_err(|e| AppError::msg(format!("decode: {e}")))?;
             on_token(&piece)?;
             generated.push_str(&piece);
             if eos.contains(&next) {
+                hit_eos = true;
                 break;
             }
             let input = Tensor::new(&[next], &self.device)?.unsqueeze(0)?;
             logits = prepare_logits(self.forward(&input, tokens.len() - 1)?)?;
         }
-        Ok(generated)
+        Ok(crate::engine::GenerateOutcome {
+            text: generated,
+            hit_eos,
+            tokens_generated,
+        })
     }
 
     fn warm_first_stream_layer(&mut self) -> Result<()> {

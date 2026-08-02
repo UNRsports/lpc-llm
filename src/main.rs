@@ -75,9 +75,12 @@ enum Commands {
         /// Soft RAM budget for hot layers + 2 prefetch slots (MiB)
         #[arg(long, default_value_t = 4096)]
         ram_mib: usize,
-        /// Tokens to stream on the first reply burst (TTFT / 思考の小分け)
-        #[arg(long, default_value_t = 24)]
-        burst: usize,
+        /// Max new tokens per reply (and per `/more` continuation)
+        #[arg(long, default_value_t = 512)]
+        max_tokens: usize,
+        /// Deprecated (ignored). Use `--max-tokens` instead.
+        #[arg(long)]
+        burst: Option<usize>,
         /// Bind a LoRA / diff adapter by name (forces hybrid)
         #[arg(long)]
         adapter: Option<String>,
@@ -452,6 +455,7 @@ fn main() -> ExitCode {
             hybrid,
             hot_layers,
             ram_mib,
+            max_tokens,
             burst,
             adapter,
             agent,
@@ -460,21 +464,28 @@ fn main() -> ExitCode {
             project_map,
             knowledge,
             device,
-        }) => commands::cmd_run(commands::run::RunOpts {
-            name,
-            auto_pull: pull,
-            hybrid,
-            hot_layers,
-            ram_mib,
-            burst,
-            adapter,
-            agent,
-            agent_model,
-            no_user_profile,
-            project_map,
-            knowledge,
-            device,
-        }),
+        }) => {
+            if burst.is_some() {
+                eprintln!(
+                    "warning: --burst is deprecated and ignored; use --max-tokens (default {max_tokens})"
+                );
+            }
+            commands::cmd_run(commands::run::RunOpts {
+                name,
+                auto_pull: pull,
+                hybrid,
+                hot_layers,
+                ram_mib,
+                max_tokens,
+                adapter,
+                agent,
+                agent_model,
+                no_user_profile,
+                project_map,
+                knowledge,
+                device,
+            })
+        }
         Some(Commands::Setup) => commands::cmd_setup(),
         Some(Commands::Search { query }) => commands::cmd_search(&query),
         Some(Commands::Knowledge { cmd }) => match cmd {

@@ -67,10 +67,11 @@ pub fn classify_intent(
         .map_err(|e| AppError::msg(format!("router tokenizer: {e}")))?;
 
     let mut acc = String::new();
-    let raw = engine.generate(&tokenizer, &classify_prompt, 48, 0.1, |piece| {
+    let outcome = engine.generate(&tokenizer, &classify_prompt, 48, 0.1, |piece| {
         acc.push_str(piece);
         Ok(())
     })?;
+    let raw = outcome.text;
 
     // Explicitly drop router weights + any internal KV before returning.
     drop(engine);

@@ -125,7 +125,7 @@ impl Engine {
         max_tokens: usize,
         temperature: f64,
         mut on_token: impl FnMut(&str) -> Result<()>,
-    ) -> Result<String> {
+    ) -> Result<GenerateOutcome> {
         let encoding = tokenizer
             .encode(prompt, true)
             .map_err(|e| AppError::msg(format!("tokenize: {e}")))?;
@@ -142,9 +142,12 @@ impl Engine {
         let mut logits = prepare_logits(self.weights.forward(&input, 0)?)?;
 
         let mut generated = String::new();
+        let mut tokens_generated = 0usize;
+        let mut hit_eos = false;
         for _ in 0..max_tokens {
             let next = logits_processor.sample(&logits)?;
             tokens.push(next);
+            tokens_generated += 1;
 
             let piece = tokenizer
                 .decode(&[next], true)
@@ -153,6 +156,7 @@ impl Engine {
             generated.push_str(&piece);
 
             if eos.contains(&next) {
+                hit_eos = true;
                 break;
             }
 
@@ -160,8 +164,20 @@ impl Engine {
             logits = prepare_logits(self.weights.forward(&input, tokens.len() - 1)?)?;
         }
 
-        Ok(generated)
+        Ok(GenerateOutcome {
+            text: generated,
+            hit_eos,
+            tokens_generated,
+        })
     }
+}
+
+/// Result of a single generate() call.
+#[derive(Debug, Clone)]
+pub struct GenerateOutcome {
+    pub text: String,
+    pub hit_eos: bool,
+    pub tokens_generated: usize,
 }
 
 fn prepare_logits(logits: Tensor) -> Result<Tensor> {
