@@ -47,8 +47,8 @@ Last updated: 2026-08-02
 | Axis 2 / Phase 4 | `adapter create` trainer prototype | **Done** |
 | Axis 2 / Phase 5 | Tiny from-scratch · GGUF export · local SFT/DPO | **Done** |
 | Long-term / Phase 6 | Scale-up bridge (remote jobs · convert · RLHF stages) | **Done** (bridge; full cluster PPO external) |
-| Extension / Phase 7 | Auto knowledge acquisition & user adaptation (Web + auto-train) | **Not started** (conditionally feasible) |
-| Extension / Phase 8 | NVMe-resident project-map & overview memory | **Not started** (conditionally feasible) |
+| Extension / Phase 7 | Auto knowledge acquisition & user adaptation (Web + auto-train) | **Done** (conditionally feasible) |
+| Extension / Phase 8 | NVMe-resident project-map & overview memory | **Done** (conditionally feasible) |
 
 **Available now:**  
 `lpc-llm run <model> --adapter <name>` (Hybrid LoRA),  
@@ -57,8 +57,10 @@ Last updated: 2026-08-02
 `lpc-llm train scratch|sft|dpo|export` (tiny from-scratch → GGUF → `run`),  
 `lpc-llm job init|run|import|convert` (declarative stages / remote bridge / RLHF stubs),  
 `lpc-llm config show|init|get` (`config_lpcllm`: bin_dir + per-user data/train),  
+`lpc-llm search` / `knowledge list|purge` / `adapter auto-train` (Phase 7),  
+`lpc-llm project-map build|status|rebuild` / `run --project-map` / `--knowledge` / `--no-user-profile` (Phase 7–8),  
 On MoE GGUF: `experts.pack` + Top-K expert DMA (hybrid).  
-**Not available yet:** multi-GPU PPO in-process, Web knowledge acquisition, `user_profile` auto-train, `--project-map`.
+**Not available yet:** multi-GPU PPO in-process; optional hot-swap / inotify watch / 16GB regression bench.
 
 ---
 
@@ -187,62 +189,62 @@ Bridge so “multi-billion” and “full RLHF” can be handled as **extensions
       - Eval / emit to `adapters/` or `blobs/` via export/import stages  
       - Accelerator left to external `remote.launch` / convert cmd (io_uring inference path unchanged)
 
-### Phase 7: Auto knowledge acquisition & user adaptation — **Not started** (conditionally feasible)
+### Phase 7: Auto knowledge acquisition & user adaptation — **Done** (conditionally feasible)
 
 Async Web knowledge acquisition and automatic delta-LoRA updates from user tendencies.  
 **Deps:** Training for 7.2 / 7.3 requires **Phase 4 (`adapter create`)**. 7.1 and auto-attach can start with Phase 1 alone.
 
 #### 7.1 Web search · knowledge injection (`search` integration)
 
-- [ ] Search backend abstraction (DuckDuckGo / Custom HTTP API swappable)
-- [ ] In-chat “knowledge gap” heuristics (unknown entities, explicit search, low-confidence answers)
-- [ ] Background search jobs (async fetch → parse → persist)
-- [ ] `cache/knowledge/` store (chunk body · source URL · fetch time · tags)
-- [ ] Knowledge inject at inference (RAG-style related chunks into prompt; respect KV budget)
-- [ ] CLI: `lpc-llm search <query>` / `lpc-llm knowledge list|purge` (optional)
+- [x] Search backend abstraction (DuckDuckGo / Custom HTTP via `LPC_LLM_SEARCH_*`; `curl` transport)
+- [x] In-chat “knowledge gap” heuristics (unknown entities, explicit search, low-confidence cues)
+- [x] Background search jobs (thread fetch → parse → persist)
+- [x] `cache/knowledge/` store (chunk body · source URL · fetch time · tags)
+- [x] Knowledge inject at inference (`--knowledge`; RAG-style chunks; char budget)
+- [x] CLI: `lpc-llm search <query>` / `lpc-llm knowledge list|purge`
 
 #### 7.2 Auto-adapterize user habits / context (`adapter auto-train`)
 
-- [ ] Local logs of chats / edits / prompt tendencies (`cache/user_logs/`; privacy + rotation policy)
-- [ ] Extract coding-style features (indent · naming · comment density, etc.)
-- [ ] Linux idle detect (X11/Wayland idle or simple idle timer)
-- [ ] On idle, call Phase 4 trainer and update delta LoRA under `adapters/user_profile/`
-- [ ] Job guards (time cap · RAM cap · min samples · rollback on failure)
-- [ ] CLI: `lpc-llm adapter auto-train [--once|--daemon]` (optional)
+- [x] Local logs of chats / edits / prompt tendencies (`cache/user_logs/`; privacy + rotation)
+- [x] Extract coding-style features (indent · naming · comment density, etc.)
+- [x] Linux idle detect (xprintidle / GNOME IdleMonitor / wall-clock fallback)
+- [x] On idle, call Phase 4 trainer and update delta LoRA under `adapters/user_profile/`
+- [x] Job guards (time cap · RAM cap · min samples · rollback on failure)
+- [x] CLI: `lpc-llm adapter auto-train [--once|--daemon]`
 
 #### 7.3 Seamless auto-attach
 
-- [ ] At `run` start, if `adapters/user_profile/` is valid, auto-wire into Hybrid side-path
-- [ ] Priority rules vs `--no-user-profile` / explicit `--adapter`
+- [x] At `run` start, if `adapters/user_profile/` is valid, auto-wire into Hybrid side-path
+- [x] Priority rules vs `--no-user-profile` / explicit `--adapter` (explicit > agent > user_profile)
 - [ ] (Optional) In-process hot reload (new weights from next turn after train)
 - [ ] (Optional) Mid-chat hot-swap merges with Phase 1 optional work
 
-### Phase 8: NVMe-resident project-map & overview memory — **Not started** (conditionally feasible)
+### Phase 8: NVMe-resident project-map & overview memory — **Done** (conditionally feasible)
 
 Without loading all code into 16GB RAM, pull only needed nodes from a structured graph on NVMe via `io_uring`.  
 **Deps:** Existing layer-pack `io_uring` / `O_DIRECT` pipeline. Can start independent of Phase 2 (buffering strategy may be shared).
 
 #### 8.1 Map project graph onto NVMe
 
-- [ ] Language frontends (tree-sitter etc.) for file AST / symbol extract
-- [ ] Graph call / type-dependency edges for functions/classes
-- [ ] Light node embeddings (hash n-gram or small embedder; full LLM embed optional)
-- [ ] On-disk `cache/projects/<hash>/map.bin` + offset/index meta (`map.json`, etc.)
-- [ ] Watch file updates and **delta index updates** (changed files + affected edges only)
-- [ ] CLI: `lpc-llm project-map build|status|rebuild <path>`
+- [x] Language frontends (pure-Rust heuristics for Rust/Python/JS/TS/Go/C-family; no tree-sitter/C)
+- [x] Graph call / type-dependency edges for functions/classes
+- [x] Light node embeddings (hashed n-gram; full LLM embed optional)
+- [x] On-disk `cache/projects/<hash>/map.bin` + offset/index meta (`map.json`)
+- [x] File mtime fingerprints in `map.json`; `rebuild` for clean refresh (full re-walk for cross-file edges)
+- [x] CLI: `lpc-llm project-map build|status|rebuild <path>`
 
 #### 8.2 On-demand symbol fetch via `io_uring`
 
-- [ ] Fixed-length or chunk-boundary records for nodes/edges (`O_DIRECT` aligned)
-- [ ] Query → related node set (BM25 / embedding neighborhood / graph neighborhood combo)
-- [ ] `io_uring` prefetch of selected nodes → RAM ring buffer
-- [ ] Token-budget cap when assembling context (aligned with hot-layer budget)
+- [x] Fixed-length / chunk-boundary records for nodes (`O_DIRECT` aligned; buffered fallback)
+- [x] Query → related node set (BM25-ish / embedding neighborhood / graph neighborhood)
+- [x] `io_uring` prefetch of selected nodes → RAM ring (`PrefetchRing`; buffered fallback)
+- [x] Token/char-budget cap when assembling context
 
 #### 8.3 `--project-map` wide-context overview
 
-- [ ] `lpc-llm run … --project-map [<path|hash>]` CLI
-- [ ] Synthesize call/type deps as **subgraph summaries** into the prompt (no full dump)
-- [ ] Structural hints for refactor/codegen (callee signature lists · impact scope)
+- [x] `lpc-llm run … --project-map [<path|hash>]` CLI
+- [x] Synthesize call/type deps as **subgraph summaries** into the prompt (no full dump)
+- [x] Structural hints for refactor/codegen (callee signature lists · impact scope)
 - [ ] Regression bench that tens/hundreds of kLOC can be handled “as structure” on ~16GB RAM (optional)
 
 ---
@@ -255,14 +257,14 @@ Without loading all code into 16GB RAM, pull only needed nodes from a structured
 |------|------|------|
 | `blobs/` | Base GGUF | As existing |
 | `adapters/` | Delta modules | **Implemented** (dir + json/bin); **back up** |
-| `adapters/user_profile/` | Auto-train user LoRA | **Not implemented** (Phase 7) |
+| `adapters/user_profile/` | Auto-train user LoRA | **Implemented** (Phase 7 `adapter auto-train` + auto-attach) |
 | `paths.train_dir` (home) | Private corpora for `adapter create` / `train` | **Implemented** (default `<data_dir>/train`; via `config_lpcllm`) |
 | `data/train/` (repo) | Dev leftover only | **gitignore safety net** — do not store private data here |
 | `cache/packs/.../layers.pack` | Base layer pack | Existing (name is `layers.pack`; rename to spec’s `base_layers.pack` not done) |
 | `cache/packs/.../experts.pack` | MoE expert pack | **Implemented** |
-| `cache/knowledge/` | Web-fetched knowledge | **Not implemented** (Phase 7) |
-| `cache/user_logs/` | Habit-train logs | **Not implemented** (Phase 7) |
-| `cache/projects/<hash>/map.bin` | Project structure graph | **Not implemented** (Phase 8) |
+| `cache/knowledge/` | Web-fetched knowledge | **Implemented** (Phase 7) |
+| `cache/user_logs/` | Habit-train logs | **Implemented** (Phase 7) |
+| `cache/projects/<hash>/map.bin` | Project structure graph | **Implemented** (Phase 8) |
 | `manifest.json` | models + adapters | **`adapters` key added** |
 
 ### CLI
@@ -271,16 +273,17 @@ Without loading all code into 16GB RAM, pull only needed nodes from a structured
 |----------|------|
 | `run … --adapter <name>` | **Implemented** |
 | `run … --agent` | **Implemented** (with `--agent-model`) |
-| `run … --project-map` | **Not implemented** (Phase 8) |
+| `run … --project-map` | **Implemented** (Phase 8; path or hash) |
+| `run … --knowledge` / `--no-user-profile` | **Implemented** (Phase 7) |
 | `adapter list` | **Implemented** |
 | `adapter install-demo` | **Implemented** (for verification) |
 | `config show\|init\|get\|example` | **Implemented** (`config_lpcllm` path / install layout) |
 | `adapter create …` | **Implemented** (LoRA SFT → Phase 1 on-disk form; `--from` via `train_dir`) |
 | `train scratch|sft|dpo|export` | **Implemented** (Phase 5 tiny train → GGUF → `run`) |
 | `job init|run|status|import|convert` | **Implemented** (Phase 6 bridge) |
-| `adapter auto-train` | **Not implemented** (Phase 7) |
-| `search` / `knowledge …` | **Not implemented** (Phase 7) |
-| `project-map build|status` | **Not implemented** (Phase 8) |
+| `adapter auto-train` | **Implemented** (Phase 7) |
+| `search` / `knowledge …` | **Implemented** (Phase 7) |
+| `project-map build|status|rebuild` | **Implemented** (Phase 8) |
 
 ### Memory / I/O pipeline
 
@@ -289,17 +292,17 @@ Without loading all code into 16GB RAM, pull only needed nodes from a structured
 | Layer pack + ping-pong DMA | Existing |
 | LoRA side-path (attach at compute) | **Implemented** (DMA buffers non-destructive) |
 | Expert-unit index / dynamic DMA | **Implemented** (`experts.pack` + `PrefetchRing`) |
-| project-map node `io_uring` prefetch | **Not implemented** (Phase 8) |
+| project-map node `io_uring` prefetch | **Implemented** (`map.bin` + `PrefetchRing`; buffered fallback) |
 | ΔW merge at CQE (weight rewrite) | Not adopted (side-path policy) |
 
 ---
 
 ## 5. Recommended next steps
 
-1. **Phase 7** — Web knowledge → `user_profile` auto-train · auto-attach (can reuse Phase 4 trainer); keep logs under user `cache/` only
-2. **Phase 8** — `project-map` index + `io_uring` on-demand fetch + `--project-map`
-3. **Phase 6 follow-ups** — Wire real cluster launchers / CUDA backends into `job.remote` and `$LPC_LLM_CONVERT_CMD`
-4. **(Optional)** Distro / package install that ships system `config_lpcllm` with `install.mode = "system"`
+1. **Phase 6 follow-ups** — Wire real cluster launchers / CUDA backends into `job.remote` and `$LPC_LLM_CONVERT_CMD`
+2. **(Optional)** In-process adapter hot-reload / mid-chat hot-swap (Phase 1 + 7.3 leftovers)
+3. **(Optional)** Distro / package install that ships system `config_lpcllm` with `install.mode = "system"`
+4. **(Optional)** project-map 16GB-scale regression bench / inotify incremental watch
 
 ---
 
@@ -340,8 +343,8 @@ Without loading all code into 16GB RAM, pull only needed nodes from a structured
 | 軸2 / Phase 4 | `adapter create` 学習器プロトタイプ | **完了** |
 | 軸2 / Phase 5 | 超小型 from-scratch · GGUF 出力 · ローカル SFT/DPO | **完了** |
 | 長期 / Phase 6 | 大規模化ブリッジ（リモートジョブ · 変換 · RLHF ステージ） | **完了**（ブリッジ；クラスタ PPO は外部） |
-| 拡張 / Phase 7 | 自動知識獲得 & ユーザー適応（Web + auto-train） | **未着手**（条件付き可能） |
-| 拡張 / Phase 8 | NVMe 常駐 project-map & 俯瞰記憶 | **未着手**（条件付き可能） |
+| 拡張 / Phase 7 | 自動知識獲得 & ユーザー適応（Web + auto-train） | **完了**（条件付き可能） |
+| 拡張 / Phase 8 | NVMe 常駐 project-map & 俯瞰記憶 | **完了**（条件付き可能） |
 
 **いま使えるもの:**  
 `lpc-llm run <model> --adapter <name>`（Hybrid LoRA）、  
@@ -350,8 +353,10 @@ Without loading all code into 16GB RAM, pull only needed nodes from a structured
 `lpc-llm train scratch|sft|dpo|export`（超小型 from-scratch → GGUF → `run`）、  
 `lpc-llm job init|run|import|convert`（宣言的ステージ / リモートブリッジ / RLHF スタブ）、  
 `lpc-llm config show|init|get`（`config_lpcllm`: bin_dir + ユーザごとの data/train）、  
+`lpc-llm search` / `knowledge` / `adapter auto-train`（Phase 7）、  
+`lpc-llm project-map` / `run --project-map` / `--knowledge` / `--no-user-profile`（Phase 7–8）、  
 MoE GGUF では `experts.pack` + Top-K Expert DMA（hybrid）。  
-**まだ使えないもの:** プロセス内マルチ GPU PPO、Web 知識獲得、`user_profile` 自動学習、`--project-map`。
+**まだ使えないもの:** プロセス内マルチ GPU PPO；任意のホットスワップ / inotify 監視 / 16GB 回帰ベンチ。
 
 ---
 
@@ -480,62 +485,62 @@ MoE GGUF では `experts.pack` + Top-K Expert DMA（hybrid）。
       - 評価・成果の `adapters/` / `blobs/` 出力ステージ  
       - アクセラレータは `remote.launch` / convert cmd 側（io_uring 推論パスは不変）
 
-### Phase 7: 自動知識獲得 & ユーザー適応 — **未着手**（条件付き可能）
+### Phase 7: 自動知識獲得 & ユーザー適応 — **完了**（条件付き可能）
 
 Web 知識の非同期獲得と、ユーザー傾向の差分 LoRA 自動更新。  
 **依存:** 7.2 / 7.3 の学習本体は **Phase 4（`adapter create`）完了が前提**。7.1 と自動アタッチは Phase 1 だけで着手可。
 
 #### 7.1 Web 検索・ナレッジインジェクション（`search` 連携）
 
-- [ ] 検索バックエンド抽象（DuckDuckGo / Custom HTTP API を差し替え可能に）
-- [ ] 対話中の「知識不足」ヒューリスティック（未知エンティティ・明示的検索指示・低信頼応答）
-- [ ] バックグラウンド検索ジョブ（非同期取得 → パース → 永続化）
-- [ ] `cache/knowledge/` ストア（チャンク本文・出典 URL・取得時刻・タグ）
-- [ ] 推論時のナレッジ注入（関連チャンクをプロンプトへ RAG 的に合成；KV 予算を意識）
-- [ ] CLI: `lpc-llm search <query>` / `lpc-llm knowledge list|purge`（任意）
+- [x] 検索バックエンド抽象（DuckDuckGo / Custom HTTP；`LPC_LLM_SEARCH_*`、`curl` 転送）
+- [x] 対話中の「知識不足」ヒューリスティック（未知エンティティ・明示的検索指示・低信頼キュー）
+- [x] バックグラウンド検索ジョブ（スレッド取得 → パース → 永続化）
+- [x] `cache/knowledge/` ストア（チャンク本文・出典 URL・取得時刻・タグ）
+- [x] 推論時のナレッジ注入（`--knowledge`；RAG 的合成；文字数予算）
+- [x] CLI: `lpc-llm search <query>` / `lpc-llm knowledge list|purge`
 
 #### 7.2 ユーザー癖・文脈の自動アダプタ化（`adapter auto-train`）
 
-- [ ] 会話・修正・プロンプト傾向のローカルログ（`cache/user_logs/`；秘匿・ローテーション方針付き）
-- [ ] コーディングスタイル特徴の抽出（インデント・命名・コメント密度など軽量特徴）
-- [ ] Linux アイドル検知（X11/Wayland idle または簡易無操作タイマー）
-- [ ] アイドル時に Phase 4 学習器を呼び、差分 LoRA を `adapters/user_profile/` へ更新
-- [ ] 学習ジョブのガード（時間上限・RAM 上限・最小サンプル数・失敗時ロールバック）
-- [ ] CLI: `lpc-llm adapter auto-train [--once|--daemon]`（任意）
+- [x] 会話・修正・プロンプト傾向のローカルログ（`cache/user_logs/`；秘匿・ローテーション）
+- [x] コーディングスタイル特徴の抽出（インデント・命名・コメント密度など軽量特徴）
+- [x] Linux アイドル検知（xprintidle / GNOME IdleMonitor / 壁時計フォールバック）
+- [x] アイドル時に Phase 4 学習器を呼び、差分 LoRA を `adapters/user_profile/` へ更新
+- [x] 学習ジョブのガード（時間上限・RAM 上限・最小サンプル数・失敗時ロールバック）
+- [x] CLI: `lpc-llm adapter auto-train [--once|--daemon]`
 
 #### 7.3 シームレスな自動アタッチ
 
-- [ ] `run` 開始時に `adapters/user_profile/` が有効なら Hybrid サイドパスへ自動組込
-- [ ] `--no-user-profile` / `--adapter` 明示指定との優先順位ルール
+- [x] `run` 開始時に `adapters/user_profile/` が有効なら Hybrid サイドパスへ自動組込
+- [x] `--no-user-profile` / `--adapter` 明示指定との優先順位（明示 > agent > user_profile）
 - [ ] （任意）プロセス内ホットリロード（学習完了後の次回ターンから新重み）
 - [ ] （任意改善）会話途中ホットスワップは Phase 1 任意改善と統合
 
-### Phase 8: NVMe 常駐 project-map & 俯瞰記憶 — **未着手**（条件付き可能）
+### Phase 8: NVMe 常駐 project-map & 俯瞰記憶 — **完了**（条件付き可能）
 
 全コードを 16GB RAM に載せない前提で、NVMe 上の構造化グラフから必要ノードだけを `io_uring` で引く。  
 **依存:** 既存層パックの `io_uring` / `O_DIRECT` パイプライン。Phase 2 とは独立に着手可（バッファリング戦略は共有しうる）。
 
 #### 8.1 NVMe へのプロジェクトグラフマッピング
 
-- [ ] 言語フロントエンド（tree-sitter 等）でファイル AST・シンボル抽出
-- [ ] 関数/クラスの呼び出し・型依存の辺をグラフ化
-- [ ] ノード軽量 Embedding（ハッシュ n-gram または小型埋め込み；フル LLM 埋め込みは任意）
-- [ ] オンディスク形式 `cache/projects/<hash>/map.bin` + オフセット/索引メタ（`map.json` 等）
-- [ ] ファイル更新の監視と **差分インデックス更新**（変更ファイル + 影響辺のみ）
-- [ ] CLI: `lpc-llm project-map build|status|rebuild <path>`
+- [x] 言語フロントエンド（純 Rust ヒューリスティック；Rust/Python/JS/TS/Go/C 系。tree-sitter/C なし）
+- [x] 関数/クラスの呼び出し・型依存の辺をグラフ化
+- [x] ノード軽量 Embedding（ハッシュ n-gram；フル LLM 埋め込みは任意）
+- [x] オンディスク形式 `cache/projects/<hash>/map.bin` + オフセット/索引メタ（`map.json`）
+- [x] ファイル mtime フィンガープリント；`rebuild` でクリーン再構築（クロファイル辺のため再走査）
+- [x] CLI: `lpc-llm project-map build|status|rebuild <path>`
 
 #### 8.2 `io_uring` 経由のオンデマンド・シンボル引き出し
 
-- [ ] ノード/エッジの固定長またはチャンク境界レコード設計（`O_DIRECT` 整列）
-- [ ] クエリ → 関連ノード集合の選定（BM25 / Embedding 近傍 / グラフ近傍の組合せ）
-- [ ] 選定ノードの `io_uring` プレフェッチ → RAM リングバッファ
-- [ ] コンテキスト組立時のトークン予算キャップ（ホット層予算と整合）
+- [x] ノードの固定長/チャンク境界レコード（`O_DIRECT` 整列；バッファドフォールバック）
+- [x] クエリ → 関連ノード集合（BM25 風 / Embedding 近傍 / グラフ近傍）
+- [x] 選定ノードの `io_uring` プレフェッチ → RAM リング（`PrefetchRing`；バッファド可）
+- [x] コンテキスト組立時のトークン/文字数予算キャップ
 
 #### 8.3 `--project-map` 広域コンテキスト俯瞰
 
-- [ ] `lpc-llm run … --project-map [<path|hash>]` CLI
-- [ ] 呼び出し関係・型依存を **部分グラフ要約**としてプロンプトへ合成（全量貼付はしない）
-- [ ] リファクタ/生成向けの構造的ヒント（依存先シグネチャ列・影響範囲）
+- [x] `lpc-llm run … --project-map [<path|hash>]` CLI
+- [x] 呼び出し関係・型依存を **部分グラフ要約**としてプロンプトへ合成（全量貼付はしない）
+- [x] リファクタ/生成向けの構造的ヒント（依存先シグネチャ列・影響範囲）
 - [ ] 16GB 級 RAM でも数十万行規模を「構造として」扱えることの回帰ベンチ（任意）
 
 ---
@@ -548,14 +553,14 @@ Web 知識の非同期獲得と、ユーザー傾向の差分 LoRA 自動更新�
 |------|------|------|
 | `blobs/` | ベース GGUF | 既存どおり |
 | `adapters/` | 差分モジュール | **実装済**（ディレクトリ + json/bin）；**バックアップ対象** |
-| `adapters/user_profile/` | 自動学習ユーザー LoRA | **未実装**（Phase 7） |
+| `adapters/user_profile/` | 自動学習ユーザー LoRA | **実装済**（Phase 7 `adapter auto-train` + 自動アタッチ） |
 | `paths.train_dir`（ホーム） | `adapter create` / `train` 用非公開コーパス | **実装済**（既定 `<data_dir>/train`；`config_lpcllm`） |
 | `data/train/`（リポ内） | 開発用の残り場所のみ | **gitignore 保険** — 非公開データを置かない |
 | `cache/packs/.../layers.pack` | ベース層パック | 既存（名称は `layers.pack`、仕様の `base_layers.pack` 改名は未実施） |
 | `cache/packs/.../experts.pack` | MoE Expert パック | **実装済** |
-| `cache/knowledge/` | Web 取得ナレッジ | **未実装**（Phase 7） |
-| `cache/user_logs/` | 癖学習用ログ | **未実装**（Phase 7） |
-| `cache/projects/<hash>/map.bin` | プロジェクト構造グラフ | **未実装**（Phase 8） |
+| `cache/knowledge/` | Web 取得ナレッジ | **実装済**（Phase 7） |
+| `cache/user_logs/` | 癖学習用ログ | **実装済**（Phase 7） |
+| `cache/projects/<hash>/map.bin` | プロジェクト構造グラフ | **実装済**（Phase 8） |
 | `manifest.json` | models + adapters | **adapters キー追加済** |
 
 ### CLI
@@ -564,16 +569,17 @@ Web 知識の非同期獲得と、ユーザー傾向の差分 LoRA 自動更新�
 |----------|------|
 | `run … --adapter <name>` | **実装済** |
 | `run … --agent` | **実装済**（`--agent-model` 付き） |
-| `run … --project-map` | **未実装**（Phase 8） |
+| `run … --project-map` | **実装済**（Phase 8；path または hash） |
+| `run … --knowledge` / `--no-user-profile` | **実装済**（Phase 7） |
 | `adapter list` | **実装済** |
 | `adapter install-demo` | **実装済**（検証用） |
 | `config show\|init\|get\|example` | **実装済**（`config_lpcllm` のパス / 導入レイアウト） |
 | `adapter create …` | **実装済**（LoRA SFT → Phase 1 形式；`--from` は `train_dir` 解決） |
 | `train scratch|sft|dpo|export` | **実装済**（Phase 5 超小型学習 → GGUF → `run`） |
 | `job init|run|status|import|convert` | **実装済**（Phase 6 ブリッジ） |
-| `adapter auto-train` | **未実装**（Phase 7） |
-| `search` / `knowledge …` | **未実装**（Phase 7） |
-| `project-map build|status` | **未実装**（Phase 8） |
+| `adapter auto-train` | **実装済**（Phase 7） |
+| `search` / `knowledge …` | **実装済**（Phase 7） |
+| `project-map build|status|rebuild` | **実装済**（Phase 8） |
 
 ### メモリ・I/O パイプライン
 
@@ -582,17 +588,17 @@ Web 知識の非同期獲得と、ユーザー傾向の差分 LoRA 自動更新�
 | 層単位 pack + ping-pong DMA | 既存 |
 | LoRA サイドパス（計算時アタッチ） | **実装済**（DMA バッファは非破壊） |
 | Expert 単位インデックス / 動的 DMA | **実装済**（`experts.pack` + `PrefetchRing`） |
-| project-map ノード単位 `io_uring` プレフェッチ | **未実装**（Phase 8） |
+| project-map ノード単位 `io_uring` プレフェッチ | **実装済**（`map.bin` + `PrefetchRing`；バッファド可） |
 | CQE 時の ΔW マージ（重み書き換え） | 採用せず（サイドパス方針） |
 
 ---
 
 ## 5. 推奨する次工程
 
-1. **Phase 7** — Web 知識獲得 → `user_profile` 自動学習・自動アタッチ（ログはユーザ `cache/` のみ）
-2. **Phase 8** — `project-map` 索引 + `io_uring` オンデマンド引出 + `--project-map`
-3. **Phase 6 フォロー** — `job.remote` / `$LPC_LLM_CONVERT_CMD` に実クラスタ・CUDA 変換を接続
-4. **（任意）** `install.mode = "system"` の `/etc/lpc-llm/config_lpcllm` を同梱するパッケージ化
+1. **Phase 6 フォロー** — `job.remote` / `$LPC_LLM_CONVERT_CMD` に実クラスタ・CUDA 変換を接続
+2. **（任意）** プロセス内アダプタホットリロード / 会話途中ホットスワップ（Phase 1 + 7.3 残り）
+3. **（任意）** `install.mode = "system"` の `/etc/lpc-llm/config_lpcllm` を同梱するパッケージ化
+4. **（任意）** project-map 16GB 級回帰ベンチ / inotify 差分監視
 
 ---
 

@@ -1,6 +1,7 @@
 //! Interactive chat REPL (eager Candle load or hybrid io_uring prefetch).
 
 use std::io::{self, Write};
+use std::path::PathBuf;
 
 use console::style;
 use rustyline::error::ReadlineError;
@@ -10,11 +11,16 @@ use tokenizers::Tokenizer;
 use crate::adapter::AdapterSet;
 use crate::agent;
 use crate::catalog::ModelEntry;
-use crate::commands::run::resolve_adapter;
+use crate::commands::run::{resolve_adapter, resolve_adapter_name};
 use crate::engine::Engine;
 use crate::error::{AppError, Result};
 use crate::hybrid::{HybridConfig, HybridEngine};
+use crate::knowledge::{
+    inject_knowledge, needs_knowledge, spawn_search_job, KnowledgeInjectOpts, KnowledgeStore,
+};
+use crate::project_map::{synthesize_context, ProjectContextOpts, ProjectMapReader};
 use crate::store::{InstalledModel, LocalStore};
+use crate::user_adapt::append_turn;
 
 enum Backend {
     Eager(Engine),
@@ -80,6 +86,27 @@ impl Backend {
     }
 }
 
+/// Optional Phase 7 / 8 session context (knowledge, project-map, logging).
+pub struct SessionExtras {
+    pub knowledge: Option<KnowledgeStore>,
+    pub inject_knowledge: bool,
+    pub project_map: Option<ProjectMapReader>,
+    pub log_turns: bool,
+    pub model_name: String,
+}
+
+impl Default for SessionExtras {
+    fn default() -> Self {
+        Self {
+            knowledge: None,
+            inject_knowledge: false,
+            project_map: None,
+            log_turns: true,
+            model_name: String::new(),
+        }
+    }
+}
+
 pub struct ChatSession {
     backend: Backend,
     tokenizer: Tokenizer,
@@ -87,6 +114,9 @@ pub struct ChatSession {
     history: Vec<(String, String)>,
     max_tokens: usize,
     temperature: f64,
+    extras: SessionExtras,
+    knowledge_dir: Option<PathBuf>,
+    pending_search: Option<crate::knowledge::SearchJobHandle>,
 }
 
 impl ChatSession {
@@ -97,6 +127,7 @@ impl ChatSession {
         cfg: HybridConfig,
         pack_cache: &std::path::Path,
         adapter: Option<AdapterSet>,
+        mut extras: SessionExtras,
     ) -> Result<Self> {
         if adapter.is_some() && !hybrid {
             return Err(AppError::msg(
@@ -142,6 +173,9 @@ impl ChatSession {
             backend.architecture()
         );
 
+        extras.model_name = entry.name.clone();
+        let knowledge_dir = extras.knowledge.as_ref().map(|k| k.dir().to_path_buf());
+
         Ok(Self {
             backend,
             tokenizer,
@@ -149,6 +183,9 @@ impl ChatSession {
             history: Vec::new(),
             max_tokens: 96,
             temperature: 0.7,
+            extras,
+            knowledge_dir,
+            pending_search: None,
         })
     }
 
@@ -162,6 +199,8 @@ impl ChatSession {
         _force_hybrid: bool,
         explicit_adapter: Option<String>,
         agent_model: String,
+        no_user_profile: bool,
+        extras: SessionExtras,
     ) -> Result<()> {
         println!(
             "{} {} — agent mode (`{}` router, exclusive RAM) — `/bye` exit",
@@ -211,11 +250,8 @@ impl ChatSession {
         // Router occupies RAM alone; classify_intent drops it before return.
         let decision = agent::classify_intent(store, &first_user, &adapters_for_base, &agent_model)?;
 
-        let adapter_name = explicit_adapter
-            .as_deref()
-            .or(decision.adapter.as_deref());
         if explicit_adapter.is_none() {
-            if let Some(a) = adapter_name {
+            if let Some(a) = decision.adapter.as_deref() {
                 eprintln!(
                     "{} agent selected adapter `{a}` (intent={})",
                     style("·").cyan(),
@@ -224,17 +260,26 @@ impl ChatSession {
             }
         }
 
-        let (adapter_set, cfg) = resolve_adapter(store, &entry.name, adapter_name, cfg)?;
+        let adapter_name = resolve_adapter_name(
+            store,
+            &entry.name,
+            explicit_adapter.as_deref(),
+            decision.adapter.as_deref(),
+            no_user_profile,
+        )?;
+
+        let (adapter_set, cfg) = resolve_adapter(store, &entry.name, adapter_name.as_deref(), cfg)?;
         // Agent always prefers hybrid so LoRA + MoE expert hints apply.
         let use_hybrid = true;
 
         let mut session =
-            Self::load_with_config(installed, entry, use_hybrid, cfg, pack_cache, adapter_set)?;
+            Self::load_with_config(installed, entry, use_hybrid, cfg, pack_cache, adapter_set, extras)?;
         session.backend.set_expert_hints(decision.expert_hints);
 
         // First turn already collected — generate immediately, then normal REPL.
         let burst = session.backend.first_burst().min(session.max_tokens);
         let reply = session.generate_burst(&first_user, burst)?;
+        session.maybe_log_turn(&first_user, &reply);
         session.history.push((first_user, reply));
         session.run_repl_continue(rl)?;
         Ok(())
@@ -300,9 +345,12 @@ impl ChatSession {
                 _ => {}
             }
 
+            self.maybe_spawn_knowledge_job(line);
+
             last_user = Some(line.to_string());
             let burst = self.backend.first_burst().min(self.max_tokens);
             let reply = self.generate_burst(line, burst)?;
+            self.maybe_log_turn(line, &reply);
             self.history.push((line.to_string(), reply));
             if let Some(r) = self.backend.io_hint() {
                 if r > 1.5 {
@@ -319,8 +367,72 @@ impl ChatSession {
         Ok(())
     }
 
+    fn maybe_spawn_knowledge_job(&mut self, user: &str) {
+        let Some((gap, query)) = needs_knowledge(user) else {
+            return;
+        };
+        let Some(dir) = self.knowledge_dir.clone() else {
+            return;
+        };
+        // Avoid stacking jobs.
+        if let Some(ref h) = self.pending_search {
+            if !h.status().done {
+                return;
+            }
+        }
+        eprintln!(
+            "{} knowledge gap ({gap:?}) — background search: {query}",
+            style("·").cyan()
+        );
+        self.pending_search = Some(spawn_search_job(dir, query, vec!["auto".into()]));
+    }
+
+    fn maybe_log_turn(&self, user: &str, assistant: &str) {
+        if !self.extras.log_turns {
+            return;
+        }
+        if let Ok(store) = LocalStore::open() {
+            let _ = append_turn(&store, &self.extras.model_name, user, assistant, None);
+        }
+    }
+
+    fn enrich_user(&mut self, user: &str) -> Result<String> {
+        let mut body = user.to_string();
+
+        if self.extras.inject_knowledge {
+            if let Some(ref kstore) = self.extras.knowledge {
+                let (enriched, chunks) =
+                    inject_knowledge(kstore, &body, &KnowledgeInjectOpts::default())?;
+                if !chunks.is_empty() {
+                    eprintln!(
+                        "{} injected {} knowledge chunk(s)",
+                        style("·").cyan(),
+                        chunks.len()
+                    );
+                    body = enriched;
+                }
+            }
+        }
+
+        if let Some(ref mut pm) = self.extras.project_map {
+            let ctx = synthesize_context(pm, user, &ProjectContextOpts::default())?;
+            if !ctx.is_empty() {
+                eprintln!("{} injected project-map overview", style("·").cyan());
+                let mut enriched = String::new();
+                enriched.push_str("[Project structure]\n");
+                enriched.push_str(&ctx);
+                enriched.push_str("\n\n[User]\n");
+                enriched.push_str(&body);
+                body = enriched;
+            }
+        }
+
+        Ok(body)
+    }
+
     fn generate_burst(&mut self, user: &str, max_tokens: usize) -> Result<String> {
-        let prompt = self.entry.format_prompt(user, &self.history);
+        let enriched = self.enrich_user(user)?;
+        let prompt = self.entry.format_prompt(&enriched, &self.history);
         self.backend.reset_state();
 
         let mut stdout = io::stdout();

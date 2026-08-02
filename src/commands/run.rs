@@ -6,7 +6,9 @@ use crate::agent;
 use crate::catalog;
 use crate::error::{AppError, Result};
 use crate::hybrid::HybridConfig;
-use crate::infer::ChatSession;
+use crate::infer::{ChatSession, SessionExtras};
+use crate::knowledge::KnowledgeStore;
+use crate::project_map::{resolve_map_dir, ProjectMapReader};
 use crate::pull;
 use crate::store::LocalStore;
 use candle_core::Device;
@@ -21,13 +23,19 @@ pub struct RunOpts {
     pub adapter: Option<String>,
     pub agent: bool,
     pub agent_model: String,
+    /// Disable automatic `adapters/user_profile/` attach.
+    pub no_user_profile: bool,
+    /// Path or hash for project-map overview context.
+    pub project_map: Option<String>,
+    /// Inject retrieved knowledge into prompts.
+    pub knowledge: bool,
 }
 
 pub fn run(opts: RunOpts) -> Result<()> {
     let store = LocalStore::open()?;
 
-    let name = match opts.name {
-        Some(n) => n,
+    let name = match opts.name.as_deref() {
+        Some(n) => n.to_string(),
         None => select_model_name(&store)?,
     };
 
@@ -70,6 +78,8 @@ pub fn run(opts: RunOpts) -> Result<()> {
         adapter_resident_bytes: 0, // filled after adapter resolve
     };
 
+    let extras = build_extras(&store, &opts)?;
+
     if opts.agent {
         // Time-share: read first user turn → router (exclusive) → drop → main.
         return ChatSession::run_agent_repl(
@@ -81,13 +91,26 @@ pub fn run(opts: RunOpts) -> Result<()> {
             opts.hybrid,
             opts.adapter,
             opts.agent_model,
+            opts.no_user_profile,
+            extras,
         );
     }
 
-    let use_hybrid =
-        opts.hybrid || opts.adapter.is_some() || entry.name.starts_with("gemma");
+    let adapter_name = resolve_adapter_name(
+        &store,
+        &entry.name,
+        opts.adapter.as_deref(),
+        None,
+        opts.no_user_profile,
+    )?;
 
-    let (adapter_set, cfg) = resolve_adapter(&store, &entry.name, opts.adapter.as_deref(), cfg)?;
+    let use_hybrid = opts.hybrid
+        || adapter_name.is_some()
+        || opts.project_map.is_some()
+        || entry.name.starts_with("gemma");
+
+    let (adapter_set, cfg) =
+        resolve_adapter(&store, &entry.name, adapter_name.as_deref(), cfg)?;
 
     let mut session = ChatSession::load_with_config(
         &installed,
@@ -96,9 +119,72 @@ pub fn run(opts: RunOpts) -> Result<()> {
         cfg,
         &pack_cache,
         adapter_set,
+        extras,
     )?;
     session.run_repl()?;
     Ok(())
+}
+
+fn build_extras(store: &LocalStore, opts: &RunOpts) -> Result<SessionExtras> {
+    let knowledge = if opts.knowledge {
+        Some(KnowledgeStore::open(store)?)
+    } else {
+        // Still open for gap-triggered background jobs; injection optional.
+        Some(KnowledgeStore::open(store)?)
+    };
+    let project_map = if let Some(ref spec) = opts.project_map {
+        let (_hash, dir) = resolve_map_dir(store, spec)?;
+        eprintln!(
+            "{} project-map {}",
+            style("·").cyan(),
+            style(dir.display()).bold()
+        );
+        Some(ProjectMapReader::open(&dir)?)
+    } else {
+        None
+    };
+    Ok(SessionExtras {
+        knowledge,
+        inject_knowledge: opts.knowledge,
+        project_map,
+        log_turns: true,
+        model_name: String::new(), // filled in load_with_config
+    })
+}
+
+/// Priority: explicit `--adapter` > agent choice > `user_profile` (if present) > none.
+pub(crate) fn resolve_adapter_name(
+    store: &LocalStore,
+    base_model: &str,
+    explicit: Option<&str>,
+    agent_choice: Option<&str>,
+    no_user_profile: bool,
+) -> Result<Option<String>> {
+    if let Some(name) = explicit {
+        return Ok(Some(name.to_string()));
+    }
+    if let Some(name) = agent_choice {
+        return Ok(Some(name.to_string()));
+    }
+    if no_user_profile {
+        return Ok(None);
+    }
+    // Auto-attach user_profile when present and base matches.
+    if let Some(a) = store.resolve_adapter("user_profile")? {
+        if a.base_model == base_model {
+            eprintln!(
+                "{} auto-attaching adapter `user_profile`",
+                style("·").cyan()
+            );
+            return Ok(Some("user_profile".into()));
+        }
+        eprintln!(
+            "{} user_profile base `{}` ≠ run target `{base_model}` — skip",
+            style("·").dim(),
+            a.base_model
+        );
+    }
+    Ok(None)
 }
 
 pub(crate) fn resolve_adapter(

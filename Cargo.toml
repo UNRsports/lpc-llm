@@ -25,6 +25,8 @@ rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# Phase 7/8: content hashing (pure Rust). HTTP uses system `curl` (no rustls/ring).
+sha2 = "0.10"
 
 # Existing I/O demo
 io-uring = "0.7"

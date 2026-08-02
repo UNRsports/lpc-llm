@@ -72,6 +72,9 @@ impl LocalStore {
         fs::create_dir_all(root.join("blobs"))?;
         fs::create_dir_all(root.join("adapters"))?;
         fs::create_dir_all(root.join("cache").join("packs"))?;
+        fs::create_dir_all(root.join("cache").join("knowledge"))?;
+        fs::create_dir_all(root.join("cache").join("user_logs"))?;
+        fs::create_dir_all(root.join("cache").join("projects"))?;
         fs::create_dir_all(&train_dir)?;
         // legacy empty dir from earlier layouts
         fs::create_dir_all(root.join("models"))?;
@@ -110,6 +113,32 @@ impl LocalStore {
     /// Regenerable engine artifacts (layer packs, etc.).
     pub fn cache_dir(&self) -> PathBuf {
         self.root.join("cache")
+    }
+
+    /// Web-fetched knowledge chunks (`cache/knowledge/`).
+    pub fn knowledge_dir(&self) -> PathBuf {
+        self.cache_dir().join("knowledge")
+    }
+
+    /// Conversation / edit logs for user-profile auto-train (`cache/user_logs/`).
+    pub fn user_logs_dir(&self) -> PathBuf {
+        self.cache_dir().join("user_logs")
+    }
+
+    /// Project structure graphs (`cache/projects/<hash>/`).
+    pub fn projects_dir(&self) -> PathBuf {
+        self.cache_dir().join("projects")
+    }
+
+    /// One project-map directory under `cache/projects/<hash>/`.
+    pub fn project_map_dir(&self, hash: &str) -> PathBuf {
+        let safe = hash.replace([':', '/', '\\'], "_");
+        self.projects_dir().join(safe)
+    }
+
+    /// Canonical user-profile adapter directory (`adapters/user_profile/`).
+    pub fn user_profile_adapter_path(&self) -> PathBuf {
+        self.adapter_path("user_profile")
     }
 
     /// Pack cache for one catalog model, versioned by engine so layout can change

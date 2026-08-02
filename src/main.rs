@@ -11,9 +11,12 @@ mod hybrid;
 mod infer;
 mod io;
 mod job;
+mod knowledge;
+mod project_map;
 mod pull;
 mod store;
 mod train;
+mod user_adapt;
 
 use std::process::ExitCode;
 
@@ -33,7 +36,9 @@ use commands::io_demo::IoArgs;
                   Shared install ships the binary only; each user's data stays in their home.\n\
                   `adapter create --from …` resolves files under train_dir when needed.\n\
                   `train scratch|sft|dpo` creates tiny models / preference opts (Phase 5).\n\
-                  `job init|run|import|convert` bridges scale-up / RLHF stages (Phase 6)."
+                  `job init|run|import|convert` bridges scale-up / RLHF stages (Phase 6).\n\
+                  `search` / `knowledge` / `adapter auto-train` — Phase 7 knowledge & user profile.\n\
+                  `project-map` / `run --project-map` — Phase 8 NVMe project overview."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -80,12 +85,40 @@ enum Commands {
         /// Router model for `--agent` (default: smollm2:360m)
         #[arg(long, default_value = "smollm2:360m")]
         agent_model: String,
+        /// Do not auto-attach `adapters/user_profile/`
+        #[arg(long)]
+        no_user_profile: bool,
+        /// Inject project-map overview (path or cache hash)
+        #[arg(long)]
+        project_map: Option<String>,
+        /// Inject retrieved chunks from `cache/knowledge/` into prompts
+        #[arg(long)]
+        knowledge: bool,
     },
 
     /// Manage diff adapters (LoRA)
     Adapter {
         #[command(subcommand)]
         cmd: AdapterCmd,
+    },
+
+    /// Web search → persist chunks under `cache/knowledge/`
+    Search {
+        /// Query string
+        query: String,
+    },
+
+    /// List / purge local knowledge store
+    Knowledge {
+        #[command(subcommand)]
+        cmd: KnowledgeCmd,
+    },
+
+    /// Build / inspect NVMe-resident project structure maps
+    #[command(name = "project-map")]
+    ProjectMap {
+        #[command(subcommand)]
+        cmd: ProjectMapCmd,
     },
 
     /// Phase 5: tiny from-scratch / full SFT / DPO / GGUF export
@@ -180,6 +213,65 @@ enum AdapterCmd {
         emb_dim: usize,
         #[arg(long, default_value_t = 8)]
         rank: usize,
+    },
+    /// Idle-time LoRA update into `adapters/user_profile/` (Phase 7.2)
+    AutoTrain {
+        /// Catalog base model the profile LoRA is trained against
+        #[arg(long)]
+        base: String,
+        /// Run a single training cycle (default)
+        #[arg(long, default_value_t = true)]
+        once: bool,
+        /// Loop: wait for idle, train, cool-down, repeat
+        #[arg(long, default_value_t = false)]
+        daemon: bool,
+        #[arg(long, default_value_t = 8)]
+        min_samples: usize,
+        #[arg(long, default_value_t = 4096)]
+        ram_mib: usize,
+        #[arg(long, default_value_t = 32)]
+        steps: usize,
+        #[arg(long, default_value_t = 4)]
+        rank: usize,
+        #[arg(long, default_value_t = 8.0)]
+        alpha: f64,
+        #[arg(long, default_value_t = 128)]
+        max_seq: usize,
+        #[arg(long, default_value_t = 4)]
+        last_layers: usize,
+        /// Seconds of system idle required before training (`0` = skip wait)
+        #[arg(long, default_value_t = 120)]
+        idle_secs: u64,
+        #[arg(long, default_value_t = 600)]
+        max_train_secs: u64,
+        #[arg(long)]
+        pull: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum KnowledgeCmd {
+    /// List stored knowledge chunks
+    List,
+    /// Delete all knowledge chunks
+    Purge,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProjectMapCmd {
+    /// Index a project tree into `cache/projects/<hash>/`
+    Build {
+        /// Project root directory
+        path: String,
+    },
+    /// Show status for a path or hash
+    Status {
+        /// Project path or map hash
+        path_or_hash: String,
+    },
+    /// Wipe and rebuild a project map
+    Rebuild {
+        path: String,
     },
 }
 
@@ -352,9 +444,12 @@ fn main() -> ExitCode {
             adapter,
             agent,
             agent_model,
-        }) => commands::cmd_run(
+            no_user_profile,
+            project_map,
+            knowledge,
+        }) => commands::cmd_run(commands::run::RunOpts {
             name,
-            pull,
+            auto_pull: pull,
             hybrid,
             hot_layers,
             ram_mib,
@@ -362,7 +457,22 @@ fn main() -> ExitCode {
             adapter,
             agent,
             agent_model,
-        ),
+            no_user_profile,
+            project_map,
+            knowledge,
+        }),
+        Some(Commands::Search { query }) => commands::cmd_search(&query),
+        Some(Commands::Knowledge { cmd }) => match cmd {
+            KnowledgeCmd::List => commands::cmd_knowledge_list(),
+            KnowledgeCmd::Purge => commands::cmd_knowledge_purge(),
+        },
+        Some(Commands::ProjectMap { cmd }) => match cmd {
+            ProjectMapCmd::Build { path } => commands::cmd_project_map_build(path),
+            ProjectMapCmd::Status { path_or_hash } => {
+                commands::cmd_project_map_status(path_or_hash)
+            }
+            ProjectMapCmd::Rebuild { path } => commands::cmd_project_map_rebuild(path),
+        },
         Some(Commands::Adapter { cmd }) => match cmd {
             AdapterCmd::List => commands::cmd_adapter_list(),
             AdapterCmd::Create {
@@ -397,6 +507,35 @@ fn main() -> ExitCode {
                 emb_dim,
                 rank,
             } => commands::cmd_adapter_install_demo(name, base, layers, emb_dim, rank),
+            AdapterCmd::AutoTrain {
+                base,
+                once,
+                daemon,
+                min_samples,
+                ram_mib,
+                steps,
+                rank,
+                alpha,
+                max_seq,
+                last_layers,
+                idle_secs,
+                max_train_secs,
+                pull,
+            } => commands::cmd_adapter_auto_train(crate::user_adapt::AutoTrainOpts {
+                base,
+                once: once || !daemon,
+                daemon,
+                min_samples,
+                ram_mib,
+                steps,
+                rank,
+                alpha,
+                max_seq,
+                last_layers,
+                idle_secs,
+                max_train_secs,
+                pull,
+            }),
         },
         Some(Commands::Train { cmd }) => match cmd {
             TrainCmd::Scratch {

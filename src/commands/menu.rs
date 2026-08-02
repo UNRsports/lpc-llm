@@ -32,17 +32,20 @@ pub fn run() -> Result<()> {
 
         match action {
             0 => {
-                commands::cmd_run(
-                    None,
-                    false,
-                    false,
-                    None,
-                    4096,
-                    24,
-                    None,
-                    false,
-                    "smollm2:360m".into(),
-                )?;
+                commands::cmd_run(commands::run::RunOpts {
+                    name: None,
+                    auto_pull: false,
+                    hybrid: false,
+                    hot_layers: None,
+                    ram_mib: 4096,
+                    burst: 24,
+                    adapter: None,
+                    agent: false,
+                    agent_model: "smollm2:360m".into(),
+                    no_user_profile: false,
+                    project_map: None,
+                    knowledge: false,
+                })?;
                 return Ok(());
             }
             1 => commands::cmd_list()?,

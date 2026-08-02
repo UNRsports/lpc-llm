@@ -163,3 +163,8 @@ pub fn install_demo(
     );
     Ok(())
 }
+
+/// Phase 7.2: idle-time LoRA update into `adapters/user_profile/`.
+pub fn auto_train(opts: crate::user_adapt::AutoTrainOpts) -> Result<()> {
+    crate::user_adapt::run_auto_train(opts)
+}

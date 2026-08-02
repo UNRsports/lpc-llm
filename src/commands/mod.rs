@@ -5,8 +5,10 @@ pub mod job;
 pub mod list;
 pub mod menu;
 pub mod prefetch;
+pub mod project_map_cmd;
 pub mod rm;
 pub mod run;
+pub mod search;
 pub mod show;
 pub mod train;
 
@@ -34,28 +36,8 @@ pub fn cmd_rm(name: &str) -> Result<()> {
     rm::run(name)
 }
 
-pub fn cmd_run(
-    name: Option<String>,
-    auto_pull: bool,
-    hybrid: bool,
-    hot_layers: Option<usize>,
-    ram_mib: usize,
-    burst: usize,
-    adapter: Option<String>,
-    agent: bool,
-    agent_model: String,
-) -> Result<()> {
-    run::run(run::RunOpts {
-        name,
-        auto_pull,
-        hybrid,
-        hot_layers,
-        ram_mib,
-        burst,
-        adapter,
-        agent,
-        agent_model,
-    })
+pub fn cmd_run(opts: run::RunOpts) -> Result<()> {
+    run::run(opts)
 }
 
 pub fn cmd_prefetch(name: &str, auto_pull: bool) -> Result<()> {
@@ -82,6 +64,10 @@ pub fn cmd_adapter_install_demo(
     rank: usize,
 ) -> Result<()> {
     adapter::install_demo(name, base, layers, emb_dim, rank)
+}
+
+pub fn cmd_adapter_auto_train(opts: crate::user_adapt::AutoTrainOpts) -> Result<()> {
+    adapter::auto_train(opts)
 }
 
 pub fn cmd_train_scratch(opts: train::ScratchOpts) -> Result<()> {
@@ -134,4 +120,28 @@ pub fn cmd_config_get(key: &str) -> Result<()> {
 
 pub fn cmd_config_example() -> Result<()> {
     config_cmd::print_example()
+}
+
+pub fn cmd_search(query: &str) -> Result<()> {
+    search::search(query)
+}
+
+pub fn cmd_knowledge_list() -> Result<()> {
+    search::knowledge_list()
+}
+
+pub fn cmd_knowledge_purge() -> Result<()> {
+    search::knowledge_purge()
+}
+
+pub fn cmd_project_map_build(path: String) -> Result<()> {
+    project_map_cmd::build(path)
+}
+
+pub fn cmd_project_map_status(path_or_hash: String) -> Result<()> {
+    project_map_cmd::status(path_or_hash)
+}
+
+pub fn cmd_project_map_rebuild(path: String) -> Result<()> {
+    project_map_cmd::rebuild(path)
 }
