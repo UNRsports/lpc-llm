@@ -9,6 +9,7 @@ pub mod project_map_cmd;
 pub mod rm;
 pub mod run;
 pub mod search;
+pub mod setup;
 pub mod show;
 pub mod train;
 
@@ -110,8 +111,12 @@ pub fn cmd_config_show() -> Result<()> {
     config_cmd::show()
 }
 
-pub fn cmd_config_init(force: bool) -> Result<()> {
-    config_cmd::init(force)
+pub fn cmd_config_init(force: bool, interactive: bool) -> Result<()> {
+    config_cmd::init(force, interactive)
+}
+
+pub fn cmd_setup() -> Result<()> {
+    setup::run()
 }
 
 pub fn cmd_config_get(key: &str) -> Result<()> {

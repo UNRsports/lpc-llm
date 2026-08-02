@@ -1,11 +1,12 @@
-//! Path / install layout from `config_lpcllm`.
+//! Path / install / UI / runtime layout from `config_lpcllm`.
 //!
 //! Load order (later wins):
 //! 1. Built-in defaults (XDG user data + user bin)
 //! 2. System file `/etc/lpc-llm/config_lpcllm` (shared binary hints only when present)
 //! 3. User file `$XDG_CONFIG_HOME/lpc-llm/config_lpcllm`
 //! 4. Explicit `$LPC_LLM_CONFIG` (replaces 2–3 when set; still layered on defaults)
-//! 5. Env overrides: `LPC_LLM_DATA_DIR`, `LPC_LLM_TRAIN_DIR`, `LPC_LLM_BIN_DIR`
+//! 5. Env overrides: `LPC_LLM_DATA_DIR`, `LPC_LLM_TRAIN_DIR`, `LPC_LLM_BIN_DIR`,
+//!    `LPC_LLM_LANGUAGE`, `LPC_LLM_DEVICE`
 //!
 //! Privacy rule: private corpora and runtime state live under the user data tree
 //! (or an explicit `train_dir`). The git repo must not hold private datasets.
@@ -37,6 +38,64 @@ pub enum InstallMode {
     System,
 }
 
+/// UI language for interactive prompts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum UiLanguage {
+    #[default]
+    En,
+    Ja,
+}
+
+impl UiLanguage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::En => "en",
+            Self::Ja => "ja",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "en" | "english" => Some(Self::En),
+            "ja" | "jp" | "japanese" | "日本語" => Some(Self::Ja),
+            _ => None,
+        }
+    }
+}
+
+/// Preferred compute backend (Phase 9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ComputeDevicePref {
+    #[default]
+    Auto,
+    Cpu,
+    Cuda,
+    Vulkan,
+}
+
+impl ComputeDevicePref {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Cpu => "cpu",
+            Self::Cuda => "cuda",
+            Self::Vulkan => "vulkan",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "cpu" => Some(Self::Cpu),
+            "cuda" => Some(Self::Cuda),
+            "vulkan" | "vk" => Some(Self::Vulkan),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PathsSection {
     /// Root for blobs / adapters / cache / manifest.
@@ -57,11 +116,27 @@ pub struct InstallSection {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UiSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<UiLanguage>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RuntimeSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<ComputeDevicePref>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConfigFile {
     #[serde(default)]
     pub paths: PathsSection,
     #[serde(default)]
     pub install: InstallSection,
+    #[serde(default)]
+    pub ui: UiSection,
+    #[serde(default)]
+    pub runtime: RuntimeSection,
 }
 
 /// Resolved runtime configuration (absolute paths).
@@ -71,6 +146,10 @@ pub struct AppConfig {
     pub train_dir: PathBuf,
     pub bin_dir: PathBuf,
     pub install_mode: InstallMode,
+    pub ui_language: UiLanguage,
+    pub compute_device: ComputeDevicePref,
+    /// True when `[runtime].device` was set in a config file (before env).
+    pub runtime_device_configured: bool,
     /// Config files that contributed settings (for `config show`).
     pub loaded_from: Vec<PathBuf>,
 }
@@ -110,7 +189,7 @@ impl AppConfig {
     /// Default TOML text for `config init` / example file.
     pub fn default_toml() -> String {
         format!(
-            r#"# config_lpcllm — lpc-llm path and install layout
+            r#"# config_lpcllm — lpc-llm path, UI, and compute layout
 #
 # Privacy:
 #   - Private training corpora and runtime state belong under paths below
@@ -120,7 +199,9 @@ impl AppConfig {
 #
 # Search order: /etc/lpc-llm/config_lpcllm → ~/.config/lpc-llm/config_lpcllm
 #               → $LPC_LLM_CONFIG (exclusive overlay on defaults when set)
-# Env overrides: LPC_LLM_DATA_DIR, LPC_LLM_TRAIN_DIR, LPC_LLM_BIN_DIR
+# Env overrides: LPC_LLM_DATA_DIR, LPC_LLM_TRAIN_DIR, LPC_LLM_BIN_DIR,
+#                LPC_LLM_LANGUAGE, LPC_LLM_DEVICE
+# Interactive:   lpc-llm setup   /   lpc-llm config init --interactive
 
 [paths]
 # User data root (blobs, adapters, cache, manifest).
@@ -141,6 +222,15 @@ mode = "user"
 # For system-wide binary install:
 # mode = "system"
 # bin_dir = "{DEFAULT_SYSTEM_BIN_DIR}"
+
+[ui]
+# Interactive UI language: "en" | "ja"
+# language = "en"
+
+[runtime]
+# Compute backend: "auto" | "cpu" | "cuda" | "vulkan"
+# auto → Vulkan if available, else CUDA (feature-built), else CPU
+# device = "auto"
 "#
         )
     }
@@ -159,9 +249,47 @@ mode = "user"
         fs::write(&path, Self::default_toml())?;
         Ok(path)
     }
+
+    /// Merge `patch` into the existing user config (or defaults) and write it back.
+    pub fn save_user_merged(patch: &ConfigFile) -> Result<PathBuf> {
+        let path = user_config_path()?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = if path.is_file() {
+            let text = fs::read_to_string(&path)?;
+            toml::from_str(&text).map_err(|e| {
+                AppError::msg(format!("invalid config {}: {e}", path.display()))
+            })?
+        } else {
+            ConfigFile::default()
+        };
+        merge_overlay(&mut file, patch);
+        let text = toml::to_string_pretty(&file).map_err(|e| {
+            AppError::msg(format!("serialize config: {e}"))
+        })?;
+        let header = "# Written by lpc-llm (setup / config). Edit freely.\n\
+                      # See `lpc-llm config example` for documented defaults.\n\n";
+        fs::write(&path, format!("{header}{text}"))?;
+        Ok(path)
+    }
+
+    /// True when the user should be offered first-run setup.
+    pub fn needs_setup() -> Result<bool> {
+        let user = user_config_path()?;
+        if !user.is_file() {
+            return Ok(true);
+        }
+        let text = fs::read_to_string(&user)?;
+        let file: ConfigFile = toml::from_str(&text).map_err(|e| {
+            AppError::msg(format!("invalid config {}: {e}", user.display()))
+        })?;
+        Ok(file.runtime.device.is_none())
+    }
 }
 
 fn resolve(file: ConfigFile, loaded_from: Vec<PathBuf>) -> Result<AppConfig> {
+    let runtime_device_configured = file.runtime.device.is_some();
     let default_data = default_data_dir()?;
     let data_dir = env::var("LPC_LLM_DATA_DIR")
         .ok()
@@ -186,13 +314,40 @@ fn resolve(file: ConfigFile, loaded_from: Vec<PathBuf>) -> Result<AppConfig> {
         .or_else(|| file.install.bin_dir.as_ref().map(|s| expand_path(s)))
         .unwrap_or(default_bin);
 
+    let ui_language = env::var("LPC_LLM_LANGUAGE")
+        .ok()
+        .and_then(|s| UiLanguage::parse(&s))
+        .or(file.ui.language)
+        .unwrap_or_else(detect_locale_from_env);
+
+    let compute_device = env::var("LPC_LLM_DEVICE")
+        .ok()
+        .and_then(|s| ComputeDevicePref::parse(&s))
+        .or(file.runtime.device)
+        .unwrap_or(ComputeDevicePref::Auto);
+
     Ok(AppConfig {
         data_dir,
         train_dir,
         bin_dir,
         install_mode,
+        ui_language,
+        compute_device,
+        runtime_device_configured,
         loaded_from,
     })
+}
+
+fn detect_locale_from_env() -> UiLanguage {
+    for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+        if let Ok(v) = env::var(key) {
+            let lower = v.to_ascii_lowercase();
+            if lower.starts_with("ja") {
+                return UiLanguage::Ja;
+            }
+        }
+    }
+    UiLanguage::En
 }
 
 fn merge_file(into: &mut ConfigFile, path: &Path) -> Result<()> {
@@ -203,19 +358,29 @@ fn merge_file(into: &mut ConfigFile, path: &Path) -> Result<()> {
             path.display()
         ))
     })?;
+    merge_overlay(into, &overlay);
+    Ok(())
+}
+
+fn merge_overlay(into: &mut ConfigFile, overlay: &ConfigFile) {
     if overlay.paths.data_dir.is_some() {
-        into.paths.data_dir = overlay.paths.data_dir;
+        into.paths.data_dir = overlay.paths.data_dir.clone();
     }
     if overlay.paths.train_dir.is_some() {
-        into.paths.train_dir = overlay.paths.train_dir;
+        into.paths.train_dir = overlay.paths.train_dir.clone();
     }
     if overlay.install.mode.is_some() {
         into.install.mode = overlay.install.mode;
     }
     if overlay.install.bin_dir.is_some() {
-        into.install.bin_dir = overlay.install.bin_dir;
+        into.install.bin_dir = overlay.install.bin_dir.clone();
     }
-    Ok(())
+    if overlay.ui.language.is_some() {
+        into.ui.language = overlay.ui.language;
+    }
+    if overlay.runtime.device.is_some() {
+        into.runtime.device = overlay.runtime.device;
+    }
 }
 
 pub fn user_config_path() -> Result<PathBuf> {
@@ -308,5 +473,11 @@ mod tests {
         let file = ConfigFile::default();
         let cfg = resolve(file, Vec::new()).expect("resolve");
         assert_eq!(cfg.train_dir, cfg.data_dir.join("train"));
+    }
+
+    #[test]
+    fn parse_device_pref() {
+        assert_eq!(ComputeDevicePref::parse("vulkan"), Some(ComputeDevicePref::Vulkan));
+        assert_eq!(UiLanguage::parse("ja"), Some(UiLanguage::Ja));
     }
 }

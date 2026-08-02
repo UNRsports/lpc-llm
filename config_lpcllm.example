@@ -1,9 +1,10 @@
-# config_lpcllm — lpc-llm path and install layout
+# config_lpcllm — lpc-llm path, UI, and compute layout
 #
 # Copy to:
 #   ~/.config/lpc-llm/config_lpcllm     (per-user; preferred)
 #   /etc/lpc-llm/config_lpcllm          (machine defaults: binary path only)
 # Or: lpc-llm config init
+# Interactive: lpc-llm setup   /   lpc-llm config init --interactive
 #
 # Privacy:
 #   - Private training corpora and runtime state belong under paths below
@@ -13,7 +14,8 @@
 #
 # Search order: /etc/lpc-llm/config_lpcllm → ~/.config/lpc-llm/config_lpcllm
 #               → $LPC_LLM_CONFIG (exclusive overlay on defaults when set)
-# Env overrides: LPC_LLM_DATA_DIR, LPC_LLM_TRAIN_DIR, LPC_LLM_BIN_DIR
+# Env overrides: LPC_LLM_DATA_DIR, LPC_LLM_TRAIN_DIR, LPC_LLM_BIN_DIR,
+#                LPC_LLM_LANGUAGE, LPC_LLM_DEVICE
 
 [paths]
 # User data root (blobs, adapters, cache, manifest).
@@ -34,3 +36,12 @@ mode = "user"
 # For system-wide binary install:
 # mode = "system"
 # bin_dir = "/usr/local/bin"
+
+[ui]
+# Interactive UI language: "en" | "ja"
+# language = "en"
+
+[runtime]
+# Compute backend: "auto" | "cpu" | "cuda" | "vulkan"
+# auto → Vulkan if available, else CUDA (feature-built), else CPU
+# device = "auto"

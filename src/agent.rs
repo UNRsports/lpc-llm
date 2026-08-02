@@ -61,7 +61,8 @@ pub fn classify_intent(
     let adapter_names: Vec<&str> = available_adapters.iter().map(|a| a.name.as_str()).collect();
     let classify_prompt = build_classify_prompt(user_prompt, &adapter_names, &entry);
 
-    let mut engine = Engine::load(&installed.model_path)?;
+    let compute = crate::device::ComputeContext::from_pref(crate::config::ComputeDevicePref::Cpu)?;
+    let mut engine = Engine::load(&installed.model_path, compute)?;
     let tokenizer = Tokenizer::from_file(&installed.tokenizer_path)
         .map_err(|e| AppError::msg(format!("router tokenizer: {e}")))?;
 

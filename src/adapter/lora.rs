@@ -110,7 +110,8 @@ impl LayerLora {
     }
 }
 
-/// Apply `Wq(x)` then optional LoRA delta.
+/// Apply `Wq(x)` then optional LoRA delta (CPU Candle path helper).
+#[allow(dead_code)]
 pub fn qmatmul_with_lora(
     w: &candle_core::quantized::QMatMul,
     lora: Option<&LoraDelta>,

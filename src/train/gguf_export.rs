@@ -255,7 +255,9 @@ mod tests {
         );
         assert!(content.tensor_infos.contains_key("token_embd.weight"));
         // Engine path should accept the file.
-        let eng = crate::engine::Engine::load(&path).unwrap();
+        let compute = crate::device::ComputeContext::from_pref(crate::config::ComputeDevicePref::Cpu)
+            .unwrap();
+        let eng = crate::engine::Engine::load(&path, compute).unwrap();
         assert_eq!(eng.architecture(), "llama");
         let _ = fs::remove_dir_all(&dir);
     }

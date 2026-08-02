@@ -4,6 +4,8 @@ use dialoguer::{Confirm, Select};
 use crate::adapter::AdapterSet;
 use crate::agent;
 use crate::catalog;
+use crate::config::{AppConfig, ComputeDevicePref};
+use crate::device::ComputeContext;
 use crate::error::{AppError, Result};
 use crate::hybrid::HybridConfig;
 use crate::infer::{ChatSession, SessionExtras};
@@ -29,9 +31,21 @@ pub struct RunOpts {
     pub project_map: Option<String>,
     /// Inject retrieved knowledge into prompts.
     pub knowledge: bool,
+    /// Optional CLI override for `[runtime].device`.
+    pub device: Option<ComputeDevicePref>,
 }
 
 pub fn run(opts: RunOpts) -> Result<()> {
+    let mut session_override = opts.device;
+    if session_override.is_none() {
+        if let Some(skip_cpu) = crate::commands::setup::maybe_gate()? {
+            session_override = Some(skip_cpu);
+        }
+    }
+    let app_cfg = AppConfig::load()?;
+    let pref = session_override.unwrap_or(app_cfg.compute_device);
+    let compute = ComputeContext::from_pref(pref)?;
+
     let store = LocalStore::open()?;
 
     let name = match opts.name.as_deref() {
@@ -93,6 +107,7 @@ pub fn run(opts: RunOpts) -> Result<()> {
             opts.agent_model,
             opts.no_user_profile,
             extras,
+            compute,
         );
     }
 
@@ -120,6 +135,7 @@ pub fn run(opts: RunOpts) -> Result<()> {
         &pack_cache,
         adapter_set,
         extras,
+        compute,
     )?;
     session.run_repl()?;
     Ok(())

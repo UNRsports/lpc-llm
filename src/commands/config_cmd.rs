@@ -9,7 +9,7 @@ use crate::error::{AppError, Result};
 
 pub fn show() -> Result<()> {
     let cfg = AppConfig::load()?;
-    println!("{}", style("lpc-llm paths (resolved)").bold());
+    println!("{}", style("lpc-llm config (resolved)").bold());
     println!("  data_dir:      {}", cfg.data_dir.display());
     println!("  train_dir:     {}", cfg.train_dir.display());
     println!("  bin_dir:       {}", cfg.bin_dir.display());
@@ -18,6 +18,16 @@ pub fn show() -> Result<()> {
         match cfg.install_mode {
             InstallMode::User => "user",
             InstallMode::System => "system",
+        }
+    );
+    println!("  ui.language:   {}", cfg.ui_language.as_str());
+    println!(
+        "  runtime.device:{} ({})",
+        cfg.compute_device.as_str(),
+        if cfg.runtime_device_configured {
+            "configured"
+        } else {
+            "default/auto"
         }
     );
     println!();
@@ -42,10 +52,17 @@ pub fn show() -> Result<()> {
         ))
         .dim()
     );
+    println!(
+        "{}",
+        style("First-run / device: `lpc-llm setup` or `lpc-llm config init --interactive`").dim()
+    );
     Ok(())
 }
 
-pub fn init(force: bool) -> Result<()> {
+pub fn init(force: bool, interactive: bool) -> Result<()> {
+    if interactive {
+        return crate::commands::setup::run();
+    }
     let path = AppConfig::write_user_default(force)?;
     println!(
         "{} wrote {}",
@@ -54,7 +71,7 @@ pub fn init(force: bool) -> Result<()> {
     );
     println!(
         "{}",
-        style("Edit paths.data_dir / paths.train_dir / install.bin_dir as needed.")
+        style("Edit paths / [ui] / [runtime], or run `lpc-llm setup` for Q&A.")
             .dim()
     );
     Ok(())
@@ -70,12 +87,14 @@ pub fn get(key: &str) -> Result<()> {
             InstallMode::User => "user".into(),
             InstallMode::System => "system".into(),
         },
+        "language" | "ui.language" => cfg.ui_language.as_str().into(),
+        "device" | "runtime.device" => cfg.compute_device.as_str().into(),
         "user_config" => user_config_path()?.display().to_string(),
         "system_config" => system_config_path().display().to_string(),
         "config_file_name" => CONFIG_FILE_NAME.into(),
         other => {
             return Err(AppError::msg(format!(
-                "unknown key `{other}` — try data_dir, train_dir, bin_dir, install.mode, user_config"
+                "unknown key `{other}` — try data_dir, train_dir, bin_dir, install.mode, ui.language, runtime.device, user_config"
             )));
         }
     };

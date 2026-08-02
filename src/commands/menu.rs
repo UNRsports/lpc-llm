@@ -45,6 +45,7 @@ pub fn run() -> Result<()> {
                     no_user_profile: false,
                     project_map: None,
                     knowledge: false,
+                    device: None,
                 })?;
                 return Ok(());
             }

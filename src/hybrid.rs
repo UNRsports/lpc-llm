@@ -15,7 +15,8 @@ use candle_nn::{ops, Embedding};
 use candle_transformers::generation::LogitsProcessor;
 use tokenizers::Tokenizer;
 
-use crate::adapter::{qmatmul_with_lora, AdapterSet, LayerLora};
+use crate::adapter::{AdapterSet, LayerLora, LoraDelta};
+use crate::device::ComputeContext;
 use crate::error::{AppError, Result};
 use crate::io::gguf_map::{qtensor_from_loc, GgufLayerMap, LayerDmaPlan, TensorLoc};
 use crate::io::moe::{ExpertDmaPlan, MoeInfo};
@@ -58,16 +59,34 @@ struct Mlp {
 }
 
 impl Mlp {
-    fn forward(&self, xs: &Tensor, lora: Option<&LayerLora>) -> Result<Tensor> {
-        let gate = qmatmul_with_lora(&self.gate, lora.and_then(|l| l.gate.as_ref()), xs)?;
+    fn forward(
+        &self,
+        compute: &ComputeContext,
+        xs: &Tensor,
+        lora: Option<&LayerLora>,
+    ) -> Result<Tensor> {
+        let gate = qmm(compute, &self.gate, lora.and_then(|l| l.gate.as_ref()), xs)?;
         let lhs = if self.use_gelu {
             gate.gelu()?
         } else {
             candle_nn::ops::silu(&gate)?
         };
-        let rhs = qmatmul_with_lora(&self.up, lora.and_then(|l| l.up.as_ref()), xs)?;
+        let rhs = qmm(compute, &self.up, lora.and_then(|l| l.up.as_ref()), xs)?;
         let mid = (lhs * rhs)?;
-        qmatmul_with_lora(&self.down, lora.and_then(|l| l.down.as_ref()), &mid)
+        qmm(compute, &self.down, lora.and_then(|l| l.down.as_ref()), &mid)
+    }
+}
+
+fn qmm(
+    compute: &ComputeContext,
+    w: &QMatMul,
+    lora: Option<&LoraDelta>,
+    x: &Tensor,
+) -> Result<Tensor> {
+    let y = compute.qmatmul(w, x)?;
+    match lora {
+        None => Ok(y),
+        Some(d) => Ok((y + d.forward(x)?)?),
     }
 }
 
@@ -142,6 +161,9 @@ pub struct HybridEngine {
     /// Rolling average wait / compute micros (chunk-size feedback).
     avg_wait_us: f64,
     avg_compute_us: f64,
+    /// Phase 9 compute backend (CPU / CUDA / Vulkan QMatMul offload).
+    compute: ComputeContext,
+    device_label: String,
 }
 
 /// Expert streaming state: packed plans + dedicated io_uring reader + ring.
@@ -160,11 +182,14 @@ impl HybridEngine {
         config: HybridConfig,
         pack_cache: impl AsRef<std::path::Path>,
         adapter: Option<AdapterSet>,
+        compute: ComputeContext,
     ) -> Result<Self> {
         let path = path.as_ref();
         let pack_cache = pack_cache.as_ref();
         let mut map = GgufLayerMap::open(path).map_err(|e| AppError::msg(e.to_string()))?;
-        let device = Device::Cpu;
+        let device = compute.device().clone();
+        let device_label = format!("{}+pack+io_uring", compute.label());
+        eprintln!("compute backend: {}", compute.label());
 
         if map.embedding_length == 0 || map.head_count == 0 {
             return Err(AppError::msg(format!(
@@ -335,6 +360,8 @@ impl HybridEngine {
             expert_prefetch_hints: Vec::new(),
             avg_wait_us: 0.0,
             avg_compute_us: 0.0,
+            compute,
+            device_label,
         })
     }
 
@@ -357,7 +384,7 @@ impl HybridEngine {
     }
 
     pub fn device_name(&self) -> &str {
-        "CPU+pack+io_uring"
+        &self.device_label
     }
 
     pub fn reset_state(&mut self) {
@@ -468,7 +495,7 @@ impl HybridEngine {
         let (_b, seq_len) = x.dims2()?;
         let xs = self.forward_hidden(x, index_pos)?;
         let xs = xs.i((.., seq_len - 1, ..))?;
-        let logits = self.output.forward(&xs)?;
+        let logits = self.compute.qmatmul(&self.output, &xs)?;
         self.apply_final_softcap(logits)
     }
 
@@ -599,7 +626,7 @@ impl HybridEngine {
         let x = {
             let lora = self.lora.get(layer_idx);
             match &layer.ff {
-                FeedForward::Dense(mlp) => mlp.forward(&x, lora)?,
+                FeedForward::Dense(mlp) => mlp.forward(&self.compute, &x, lora)?,
                 FeedForward::MoE {
                     router,
                     n_expert_used,
@@ -631,7 +658,7 @@ impl HybridEngine {
     ) -> Result<Tensor> {
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
         let xs_flat = xs.reshape(((), hidden_dim))?;
-        let router_logits = router.forward(&xs_flat)?;
+        let router_logits = self.compute.qmatmul(router, &xs_flat)?;
         let routing = ops::softmax_last_dim(&router_logits)?;
         let routing_vec = routing.to_vec2::<f32>()?;
 
@@ -700,7 +727,7 @@ impl HybridEngine {
             }
             let index = Tensor::new(row_ids.as_slice(), &self.device)?;
             let indexed = xs_flat.index_select(&index, 0)?;
-            let out = mlp.forward(&indexed, None)?;
+            let out = mlp.forward(&self.compute, &indexed, None)?;
             let rw = Tensor::new(selected_rws[expert_id].as_slice(), &self.device)?
                 .reshape((row_ids.len(), 1))?;
             let weighted = out.broadcast_mul(&rw)?;
@@ -771,9 +798,9 @@ impl HybridEngine {
 
         let (q, k, v) = {
             let lora = self.lora.get(layer_idx);
-            let q = qmatmul_with_lora(&layer.wq, lora.and_then(|l| l.q.as_ref()), x)?;
-            let k = qmatmul_with_lora(&layer.wk, lora.and_then(|l| l.k.as_ref()), x)?;
-            let v = qmatmul_with_lora(&layer.wv, lora.and_then(|l| l.v.as_ref()), x)?;
+            let q = qmm(&self.compute, &layer.wq, lora.and_then(|l| l.q.as_ref()), x)?;
+            let k = qmm(&self.compute, &layer.wk, lora.and_then(|l| l.k.as_ref()), x)?;
+            let v = qmm(&self.compute, &layer.wv, lora.and_then(|l| l.v.as_ref()), x)?;
             (q, k, v)
         };
 
@@ -837,7 +864,7 @@ impl HybridEngine {
             .transpose(1, 2)?
             .reshape(&[b_sz, seq_len, n_head * head_dim])?;
         let lora = self.lora.get(layer_idx);
-        qmatmul_with_lora(&layer.wo, lora.and_then(|l| l.o.as_ref()), &y)
+        qmm(&self.compute, &layer.wo, lora.and_then(|l| l.o.as_ref()), &y)
     }
 
     fn mask(&mut self, t: usize) -> Result<Tensor> {

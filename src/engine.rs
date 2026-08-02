@@ -13,6 +13,7 @@ use candle_transformers::models::quantized_phi3::ModelWeights as Phi3Weights;
 use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2Weights;
 use tokenizers::Tokenizer;
 
+use crate::device::ComputeContext;
 use crate::error::{AppError, Result};
 
 enum Weights {
@@ -36,12 +37,25 @@ pub struct Engine {
     device: Device,
     architecture: String,
     model_path: PathBuf,
+    device_label: String,
+    compute: ComputeContext,
 }
 
 impl Engine {
-    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn load(path: impl AsRef<Path>, compute: ComputeContext) -> Result<Self> {
         let path = path.as_ref();
-        let device = Device::Cpu;
+        let device = compute.device().clone();
+        let device_label = compute.label().to_string();
+        if matches!(
+            compute.backend,
+            crate::device::ResolvedBackend::Vulkan
+        ) {
+            eprintln!(
+                "compute backend: Vulkan (eager path uses Candle CPU/CUDA tensors; hybrid preferred for Vulkan GEMM)"
+            );
+        } else {
+            eprintln!("compute backend: {}", compute.label());
+        }
         let mut file = std::fs::File::open(path)?;
         let content = gguf_file::Content::read(&mut file)
             .map_err(|e| AppError::msg(format!("GGUF read: {e}")))?;
@@ -82,6 +96,8 @@ impl Engine {
             device,
             architecture,
             model_path: path.to_path_buf(),
+            device_label,
+            compute,
         })
     }
 
@@ -90,14 +106,15 @@ impl Engine {
     }
 
     pub fn device_name(&self) -> &str {
-        "CPU"
+        &self.device_label
     }
 
     /// Reload weights to clear KV cache between turns.
     pub fn reset_state(&mut self) -> Result<()> {
-        let reloaded = Self::load(&self.model_path)?;
+        let reloaded = Self::load(&self.model_path, self.compute.clone())?;
         self.weights = reloaded.weights;
         self.architecture = reloaded.architecture;
+        self.device_label = reloaded.device_label;
         Ok(())
     }
 

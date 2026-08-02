@@ -49,6 +49,7 @@ Last updated: 2026-08-02
 | Long-term / Phase 6 | Scale-up bridge (remote jobs · convert · RLHF stages) | **Done** (bridge; full cluster PPO external) |
 | Extension / Phase 7 | Auto knowledge acquisition & user adaptation (Web + auto-train) | **Done** (conditionally feasible) |
 | Extension / Phase 8 | NVMe-resident project-map & overview memory | **Done** (conditionally feasible) |
+| Extension / Phase 9 | Compute device selection + Candle-stack Vulkan offload | **Done** (first landing) |
 
 **Available now:**  
 `lpc-llm run <model> --adapter <name>` (Hybrid LoRA),  
@@ -60,7 +61,8 @@ Last updated: 2026-08-02
 `lpc-llm search` / `knowledge list|purge` / `adapter auto-train` (Phase 7),  
 `lpc-llm project-map build|status|rebuild` / `run --project-map` / `--knowledge` / `--no-user-profile` (Phase 7–8),  
 On MoE GGUF: `experts.pack` + Top-K expert DMA (hybrid).  
-**Not available yet:** multi-GPU PPO in-process; optional hot-swap / inotify watch / 16GB regression bench.
+**Not available yet:** multi-GPU PPO in-process; optional hot-swap / inotify watch / 16GB regression bench.  
+**Phase 9 (landing):** `lpc-llm setup` (i18n Q&A) → `[ui]`/`[runtime]` in home `config_lpcllm`; `run --device`; Vulkan QMatMul offload (ash) with CPU fallback.
 
 ---
 
@@ -247,6 +249,26 @@ Without loading all code into 16GB RAM, pull only needed nodes from a structured
 - [x] Structural hints for refactor/codegen (callee signature lists · impact scope)
 - [ ] Regression bench that tens/hundreds of kLOC can be handled “as structure” on ~16GB RAM (optional)
 
+### Phase 9: Compute device selection + Candle-stack Vulkan — **Done** (first landing)
+
+Generic accelerator selection (CPU / CUDA / Vulkan / auto) via first-run i18n Q&A; persist to home `config_lpcllm`.  
+Vulkan compute offload for quantized MatMul on the Candle inference stack (ash + SPIR-V; no Candle `Device` fork).  
+**Deps:** Phase 1 hybrid `QMatMul` path. CUDA path is feature-gated (`--features cuda`).
+
+#### 9.1 First-run setup (i18n) + config
+
+- [x] `lpc-llm setup` / `config init --interactive` — one-question-at-a-time (language → compute device)
+- [x] Persist `[ui] language` (`ja`/`en`) and `[runtime] device` (`auto`/`cpu`/`cuda`/`vulkan`) under `~/.config/lpc-llm/config_lpcllm`
+- [x] Env overrides: `LPC_LLM_LANGUAGE`, `LPC_LLM_DEVICE`; CLI `--device` on `run`
+- [x] Gate: prompt setup when user config missing or `runtime.device` unset (skippable → CPU for session)
+
+#### 9.2 Device resolve + Vulkan backend
+
+- [x] `ComputeBackendKind` resolve: `auto` → Vulkan if present, else CUDA (feature), else CPU; fail-soft to CPU
+- [x] ash Vulkan: instance/device/queue + buffer pool + f32 GEMM SPIR-V (WGSL→SPIR-V via naga build.rs)
+- [x] QMatMul hot path: dequant (Candle `QTensor`) + Vulkan GEMM; unsupported → CPU `QMatMul::forward`
+- [x] Wire Hybrid / Eager load + ready banner (`Vulkan+pack+io_uring` / `CPU+…`)
+
 ---
 
 ## 4. Spec section status
@@ -284,6 +306,8 @@ Without loading all code into 16GB RAM, pull only needed nodes from a structured
 | `adapter auto-train` | **Implemented** (Phase 7) |
 | `search` / `knowledge …` | **Implemented** (Phase 7) |
 | `project-map build|status|rebuild` | **Implemented** (Phase 8) |
+| `setup` / `config init --interactive` | **Implemented** (Phase 9 i18n device wizard) |
+| `run … --device <auto\|cpu\|cuda\|vulkan>` | **Implemented** (Phase 9) |
 
 ### Memory / I/O pipeline
 
@@ -293,16 +317,18 @@ Without loading all code into 16GB RAM, pull only needed nodes from a structured
 | LoRA side-path (attach at compute) | **Implemented** (DMA buffers non-destructive) |
 | Expert-unit index / dynamic DMA | **Implemented** (`experts.pack` + `PrefetchRing`) |
 | project-map node `io_uring` prefetch | **Implemented** (`map.bin` + `PrefetchRing`; buffered fallback) |
+| Vulkan QMatMul offload (Candle stack) | **Implemented** (Phase 9; ash + SPIR-V; CPU fallback) |
 | ΔW merge at CQE (weight rewrite) | Not adopted (side-path policy) |
 
 ---
 
 ## 5. Recommended next steps
 
-1. **Phase 6 follow-ups** — Wire real cluster launchers / CUDA backends into `job.remote` and `$LPC_LLM_CONVERT_CMD`
-2. **(Optional)** In-process adapter hot-reload / mid-chat hot-swap (Phase 1 + 7.3 leftovers)
-3. **(Optional)** Distro / package install that ships system `config_lpcllm` with `install.mode = "system"`
-4. **(Optional)** project-map 16GB-scale regression bench / inotify incremental watch
+1. **Phase 9** — Finish setup wizard, device resolve, and Vulkan QMatMul offload (see checklist §Phase 9)
+2. **Phase 6 follow-ups** — Wire real cluster launchers / CUDA backends into `job.remote` and `$LPC_LLM_CONVERT_CMD`
+3. **(Optional)** In-process adapter hot-reload / mid-chat hot-swap (Phase 1 + 7.3 leftovers)
+4. **(Optional)** Distro / package install that ships system `config_lpcllm` with `install.mode = "system"`
+5. **(Optional)** project-map 16GB-scale regression bench / inotify incremental watch
 
 ---
 
@@ -345,6 +371,7 @@ Without loading all code into 16GB RAM, pull only needed nodes from a structured
 | 長期 / Phase 6 | 大規模化ブリッジ（リモートジョブ · 変換 · RLHF ステージ） | **完了**（ブリッジ；クラスタ PPO は外部） |
 | 拡張 / Phase 7 | 自動知識獲得 & ユーザー適応（Web + auto-train） | **完了**（条件付き可能） |
 | 拡張 / Phase 8 | NVMe 常駐 project-map & 俯瞰記憶 | **完了**（条件付き可能） |
+| 拡張 / Phase 9 | 計算デバイス選択 + Candle スタック Vulkan オフロード | **完了**（第一到達） |
 
 **いま使えるもの:**  
 `lpc-llm run <model> --adapter <name>`（Hybrid LoRA）、  
@@ -356,7 +383,8 @@ Without loading all code into 16GB RAM, pull only needed nodes from a structured
 `lpc-llm search` / `knowledge` / `adapter auto-train`（Phase 7）、  
 `lpc-llm project-map` / `run --project-map` / `--knowledge` / `--no-user-profile`（Phase 7–8）、  
 MoE GGUF では `experts.pack` + Top-K Expert DMA（hybrid）。  
-**まだ使えないもの:** プロセス内マルチ GPU PPO；任意のホットスワップ / inotify 監視 / 16GB 回帰ベンチ。
+**まだ使えないもの:** プロセス内マルチ GPU PPO；任意のホットスワップ / inotify 監視 / 16GB 回帰ベンチ。  
+**Phase 9（到達目標）:** `lpc-llm setup`（i18n 一問一答）→ ホーム `config_lpcllm` の `[ui]`/`[runtime]`；`run --device`；Vulkan QMatMul オフロード（ash、CPU フォールバック）。
 
 ---
 
@@ -543,6 +571,26 @@ Web 知識の非同期獲得と、ユーザー傾向の差分 LoRA 自動更新�
 - [x] リファクタ/生成向けの構造的ヒント（依存先シグネチャ列・影響範囲）
 - [ ] 16GB 級 RAM でも数十万行規模を「構造として」扱えることの回帰ベンチ（任意）
 
+### Phase 9: 計算デバイス選択 + Candle スタック Vulkan — **完了**（第一到達）
+
+CPU / CUDA / Vulkan / auto を初期設定の i18n 一問一答で選び、ホームの `config_lpcllm` に保存。  
+Candle 推論スタック上で量子化 MatMul を Vulkan（ash + SPIR-V）へオフロード（Candle `Device` の fork はしない）。  
+**依存:** Phase 1 hybrid `QMatMul`。CUDA は feature ゲート（`--features cuda`）。
+
+#### 9.1 初期設定（i18n）+ 設定ファイル
+
+- [x] `lpc-llm setup` / `config init --interactive` — 一問一答（言語 → 計算デバイス）
+- [x] `[ui] language`（`ja`/`en`）と `[runtime] device`（`auto`/`cpu`/`cuda`/`vulkan`）を `~/.config/lpc-llm/config_lpcllm` に保存
+- [x] 環境変数 `LPC_LLM_LANGUAGE` / `LPC_LLM_DEVICE`；`run --device` で一時上書き
+- [x] ゲート: ユーザ設定が無い、または `runtime.device` 未設定なら setup を促す（スキップ可→その場は CPU）
+
+#### 9.2 デバイス解決 + Vulkan バックエンド
+
+- [x] `ComputeBackendKind` 解決: `auto` → Vulkan 可なら Vulkan、次に CUDA（feature）、否则 CPU；失敗時は CPU へフォールバック
+- [x] ash Vulkan: instance/device/queue + バッファプール + f32 GEMM SPIR-V（WGSL→SPIR-V は naga build.rs）
+- [x] QMatMul ホットパス: Candle `QTensor` で dequant + Vulkan GEMM；未対応は CPU `QMatMul::forward`
+- [x] Hybrid / Eager の load と ready 表示（`Vulkan+pack+io_uring` / `CPU+…`）
+
 ---
 
 ## 4. 仕様書セクション別の対応状況
@@ -580,6 +628,8 @@ Web 知識の非同期獲得と、ユーザー傾向の差分 LoRA 自動更新�
 | `adapter auto-train` | **実装済**（Phase 7） |
 | `search` / `knowledge …` | **実装済**（Phase 7） |
 | `project-map build|status|rebuild` | **実装済**（Phase 8） |
+| `setup` / `config init --interactive` | **実装済**（Phase 9 i18n デバイスウィザード） |
+| `run … --device <auto\|cpu\|cuda\|vulkan>` | **実装済**（Phase 9） |
 
 ### メモリ・I/O パイプライン
 
@@ -589,16 +639,18 @@ Web 知識の非同期獲得と、ユーザー傾向の差分 LoRA 自動更新�
 | LoRA サイドパス（計算時アタッチ） | **実装済**（DMA バッファは非破壊） |
 | Expert 単位インデックス / 動的 DMA | **実装済**（`experts.pack` + `PrefetchRing`） |
 | project-map ノード単位 `io_uring` プレフェッチ | **実装済**（`map.bin` + `PrefetchRing`；バッファド可） |
+| Vulkan QMatMul オフロード（Candle スタック） | **実装済**（Phase 9；ash + SPIR-V；CPU フォールバック） |
 | CQE 時の ΔW マージ（重み書き換え） | 採用せず（サイドパス方針） |
 
 ---
 
 ## 5. 推奨する次工程
 
-1. **Phase 6 フォロー** — `job.remote` / `$LPC_LLM_CONVERT_CMD` に実クラスタ・CUDA 変換を接続
-2. **（任意）** プロセス内アダプタホットリロード / 会話途中ホットスワップ（Phase 1 + 7.3 残り）
-3. **（任意）** `install.mode = "system"` の `/etc/lpc-llm/config_lpcllm` を同梱するパッケージ化
-4. **（任意）** project-map 16GB 級回帰ベンチ / inotify 差分監視
+1. **Phase 9** — セットアップウィザード・デバイス解決・Vulkan QMatMul オフロードを完了（工程 §Phase 9）
+2. **Phase 6 フォロー** — `job.remote` / `$LPC_LLM_CONVERT_CMD` に実クラスタ・CUDA 変換を接続
+3. **（任意）** プロセス内アダプタホットリロード / 会話途中ホットスワップ（Phase 1 + 7.3 残り）
+4. **（任意）** `install.mode = "system"` の `/etc/lpc-llm/config_lpcllm` を同梱するパッケージ化
+5. **（任意）** project-map 16GB 級回帰ベンチ / inotify 差分監視
 
 ---
 

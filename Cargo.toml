@@ -4,9 +4,17 @@ version = "0.1.0"
 edition = "2024"
 description = "Hybrid LLM inference engine — Ollama-like CUI + NVMe weight prefetch"
 license = "Apache-2.0"
+build = "build.rs"
+
+[features]
+default = ["vulkan"]
+# ash + SPIR-V f32 GEMM offload for QMatMul (iGPU / dGPU via Vulkan)
+vulkan = ["dep:ash"]
+# Candle CUDA path (NVIDIA only; requires CUDA toolkit at build time)
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 
 [dependencies]
-# Inference (pure Rust — no C toolchain required)
+# Inference (pure Rust — no C toolchain required for default features)
 candle-core = "0.9"
 candle-nn = "0.9"
 candle-transformers = "0.9"
@@ -28,12 +36,18 @@ thiserror = "2"
 # Phase 7/8: content hashing (pure Rust). HTTP uses system `curl` (no rustls/ring).
 sha2 = "0.10"
 
+# Phase 9: Vulkan compute (optional; default on). Runtime-loads libvulkan via libloading.
+ash = { version = "0.38", optional = true, default-features = false, features = ["loaded", "std"] }
+
 # Existing I/O demo
 io-uring = "0.7"
 libc = "0.2"
 memmap2 = "0.9"
 rustyline = "14"
 toml = { version = "0.8", features = ["parse", "display"] }
+
+[build-dependencies]
+naga = { version = "0.19", default-features = false, features = ["wgsl-in", "spv-out"] }
 
 [profile.release]
 lto = true

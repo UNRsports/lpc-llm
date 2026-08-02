@@ -381,7 +381,8 @@ pub fn train_adapter(
         adapter_resident_bytes: 0,
     };
 
-    let mut engine = HybridEngine::load_with_config(model_path, hcfg, pack_cache, None)?;
+    let compute = crate::device::ComputeContext::from_pref(crate::config::ComputeDevicePref::Cpu)?;
+    let mut engine = HybridEngine::load_with_config(model_path, hcfg, pack_cache, None, compute)?;
     let device = engine.device().clone();
     let trainable = TrainableLora::init(&engine, &cfg, &device)?;
     let n_params: usize = trainable

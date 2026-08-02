@@ -8,5 +8,5 @@ mod lora;
 mod train;
 
 pub use format::{write_demo_adapter, AdapterSet};
-pub use lora::{qmatmul_with_lora, LayerLora};
+pub use lora::{LayerLora, LoraDelta};
 pub use train::{load_training_texts, train_adapter, TrainConfig};

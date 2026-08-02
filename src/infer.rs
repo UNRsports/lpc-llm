@@ -14,6 +14,7 @@ use crate::catalog::ModelEntry;
 use crate::commands::run::{resolve_adapter, resolve_adapter_name};
 use crate::engine::Engine;
 use crate::error::{AppError, Result};
+use crate::device::ComputeContext;
 use crate::hybrid::{HybridConfig, HybridEngine};
 use crate::knowledge::{
     inject_knowledge, needs_knowledge, spawn_search_job, KnowledgeInjectOpts, KnowledgeStore,
@@ -128,6 +129,7 @@ impl ChatSession {
         pack_cache: &std::path::Path,
         adapter: Option<AdapterSet>,
         mut extras: SessionExtras,
+        compute: ComputeContext,
     ) -> Result<Self> {
         if adapter.is_some() && !hybrid {
             return Err(AppError::msg(
@@ -158,9 +160,10 @@ impl ChatSession {
                 cfg,
                 pack_cache,
                 adapter,
+                compute,
             )?)
         } else {
-            Backend::Eager(Engine::load(&installed.model_path)?)
+            Backend::Eager(Engine::load(&installed.model_path, compute)?)
         };
 
         let tokenizer = Tokenizer::from_file(&installed.tokenizer_path)
@@ -201,6 +204,7 @@ impl ChatSession {
         agent_model: String,
         no_user_profile: bool,
         extras: SessionExtras,
+        compute: ComputeContext,
     ) -> Result<()> {
         println!(
             "{} {} — agent mode (`{}` router, exclusive RAM) — `/bye` exit",
@@ -272,8 +276,16 @@ impl ChatSession {
         // Agent always prefers hybrid so LoRA + MoE expert hints apply.
         let use_hybrid = true;
 
-        let mut session =
-            Self::load_with_config(installed, entry, use_hybrid, cfg, pack_cache, adapter_set, extras)?;
+        let mut session = Self::load_with_config(
+            installed,
+            entry,
+            use_hybrid,
+            cfg,
+            pack_cache,
+            adapter_set,
+            extras,
+            compute,
+        )?;
         session.backend.set_expert_hints(decision.expert_hints);
 
         // First turn already collected — generate immediately, then normal REPL.

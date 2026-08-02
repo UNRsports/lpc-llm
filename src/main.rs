@@ -5,9 +5,11 @@ mod agent;
 mod catalog;
 mod commands;
 mod config;
+mod device;
 mod engine;
 mod error;
 mod hybrid;
+mod i18n;
 mod infer;
 mod io;
 mod job;
@@ -38,7 +40,8 @@ use commands::io_demo::IoArgs;
                   `train scratch|sft|dpo` creates tiny models / preference opts (Phase 5).\n\
                   `job init|run|import|convert` bridges scale-up / RLHF stages (Phase 6).\n\
                   `search` / `knowledge` / `adapter auto-train` — Phase 7 knowledge & user profile.\n\
-                  `project-map` / `run --project-map` — Phase 8 NVMe project overview."
+                  `project-map` / `run --project-map` — Phase 8 NVMe project overview.\n\
+                  `setup` — Phase 9 i18n first-run (UI language + compute device)."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -94,7 +97,13 @@ enum Commands {
         /// Inject retrieved chunks from `cache/knowledge/` into prompts
         #[arg(long)]
         knowledge: bool,
+        /// Compute backend: auto|cpu|cuda|vulkan (overrides config_lpcllm `[runtime].device`)
+        #[arg(long, value_parser = parse_device_pref)]
+        device: Option<crate::config::ComputeDevicePref>,
     },
+
+    /// First-run Q&A: UI language + compute device → home config_lpcllm
+    Setup,
 
     /// Manage diff adapters (LoRA)
     Adapter {
@@ -375,6 +384,9 @@ enum ConfigCmd {
         /// Overwrite an existing user config
         #[arg(long)]
         force: bool,
+        /// Interactive i18n Q&A (same as `lpc-llm setup`)
+        #[arg(long)]
+        interactive: bool,
     },
     /// Print one resolved value (for install scripts): data_dir|train_dir|bin_dir|install.mode
     Get {
@@ -447,6 +459,7 @@ fn main() -> ExitCode {
             no_user_profile,
             project_map,
             knowledge,
+            device,
         }) => commands::cmd_run(commands::run::RunOpts {
             name,
             auto_pull: pull,
@@ -460,7 +473,9 @@ fn main() -> ExitCode {
             no_user_profile,
             project_map,
             knowledge,
+            device,
         }),
+        Some(Commands::Setup) => commands::cmd_setup(),
         Some(Commands::Search { query }) => commands::cmd_search(&query),
         Some(Commands::Knowledge { cmd }) => match cmd {
             KnowledgeCmd::List => commands::cmd_knowledge_list(),
@@ -638,7 +653,9 @@ fn main() -> ExitCode {
         },
         Some(Commands::Config { cmd }) => match cmd {
             ConfigCmd::Show => commands::cmd_config_show(),
-            ConfigCmd::Init { force } => commands::cmd_config_init(force),
+            ConfigCmd::Init { force, interactive } => {
+                commands::cmd_config_init(force, interactive)
+            }
             ConfigCmd::Get { key } => commands::cmd_config_get(&key),
             ConfigCmd::Example => commands::cmd_config_example(),
         },
@@ -655,4 +672,9 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn parse_device_pref(s: &str) -> std::result::Result<crate::config::ComputeDevicePref, String> {
+    crate::config::ComputeDevicePref::parse(s)
+        .ok_or_else(|| format!("invalid device `{s}` (want auto|cpu|cuda|vulkan)"))
 }
