@@ -29,7 +29,9 @@ It runs quantized GGUF with Candle, and on the hybrid path streams weights via p
 - **Inference engine**: in-house (Candle + hybrid I/O). No Ollama / llama.cpp binaries
 - **CUI**: Ollama-like `list` / `pull` / `run` / `rm` / `show` / `adapter`
 - **Storage**: model blobs and engine-derived cache are separated. Engine upgrades do not force re-download
-- **LoRA**: train with `adapter create` (corpora under `data/train/`); results under `~/.local/share/lpc-llm/adapters/` (**backup**)
+- **LoRA**: train with `adapter create` (private corpora under `train_dir` from `config_lpcllm`); results under `adapters/` (**backup**)
+- **Paths**: `config_lpcllm` sets binary install dir + per-user data/train dirs (`lpc-llm config show`)
+- **Model creation**: `train scratch|sft|dpo` (tiny from-scratch → GGUF → `run`); scale-up via `job`
 - **Roadmap**: progress and planned phases are tracked in [`todo.md`](todo.md)
 
 ## English table of contents
@@ -44,17 +46,21 @@ It runs quantized GGUF with Candle, and on the hybrid path streams weights via p
 
 ### Paths at a glance
 
-| What | Where | Git? | Backup? |
+Configured by **`config_lpcllm`** (`lpc-llm config init` / `config show`). Defaults below.
+
+| What | Where (default) | Git? | Backup? |
 |------|-------|------|---------|
 | Build output | `./target/debug/lpc-llm` or `./target/release/lpc-llm` | ignored (`/target/`) | no |
-| Dev PATH install | `~/.local/bin/lpc-llm` → symlink to `./target/debug/…` | n/a | no |
-| Base models (GGUF) | `~/.local/share/lpc-llm/blobs/` | n/a (outside repo) | optional (re-downloadable) |
-| Engine packs | `~/.local/share/lpc-llm/cache/packs/` | n/a | no (regenerable) |
-| **Training corpora** | **`data/train/*.txt` / `*.jsonl`** (repo-local) | **ignored** (private) | your choice |
-| Public sample only | `examples/train-sample.txt` | tracked | n/a |
-| **Trained LoRA adapters** | **`~/.local/share/lpc-llm/adapters/<name>/`** | n/a | **yes — back these up** |
+| Dev PATH install | `~/.local/bin/lpc-llm` → symlink (`install-dev.sh`) | n/a | no |
+| System binary (shared) | `/usr/local/bin/lpc-llm` (`install-system.sh`; **binary only**) | n/a | no |
+| Config file | `~/.config/lpc-llm/config_lpcllm` (+ optional `/etc/lpc-llm/…`) | n/a | optional |
+| Base models (GGUF) | `~/.local/share/lpc-llm/blobs/` | outside repo | optional (re-downloadable) |
+| Engine packs | `~/.local/share/lpc-llm/cache/packs/` | outside repo | no (regenerable) |
+| **Training corpora** | **`~/.local/share/lpc-llm/train/`** (`paths.train_dir`) | outside repo | your choice |
+| Public / dev samples | `examples/*.txt` / `*.jsonl` | tracked | n/a |
+| **Trained LoRA adapters** | **`~/.local/share/lpc-llm/adapters/<name>/`** | outside repo | **yes — back these up** |
 
-See also [`data/README.md`](data/README.md).
+Private data must not live in the git tree. Repo `data/train/` is gitignored as a safety net only. See [`data/README.md`](data/README.md) and [`config_lpcllm.example`](config_lpcllm.example).
 
 ---
 
@@ -106,10 +112,10 @@ Tuning levers (perceived impact):
 
 ### Data layout (module separation)
 
-**Runtime state** (XDG data dir — outside the git repo):
+**Runtime state** (from `config_lpcllm` / XDG — outside the git repo):
 
 ```text
-~/.local/share/lpc-llm/
+~/.local/share/lpc-llm/          # paths.data_dir
   blobs/                 # model module (durable GGUF + tokenizer)
     <hf-repo--name>/
       *.gguf
@@ -118,6 +124,7 @@ Tuning levers (perceived impact):
     <name>/
       adapter.json
       weights.bin
+  train/                 # paths.train_dir — private corpora ← not in git
   cache/                 # engine module (regenerable)
     packs/
       <model_name>/<engine_ver>/
@@ -126,20 +133,21 @@ Tuning levers (perceived impact):
   manifest.json          # soft index (models + adapters)
 ```
 
-**Repo-local training input** (not published; see `.gitignore`):
+**Public samples in the repo** (safe to commit):
 
 ```text
-data/train/              # your .txt / .jsonl corpora for `adapter create --from`
-examples/train-sample.txt  # tiny public sample (safe to commit)
+examples/train-sample.txt
+examples/pref-sample.jsonl
+config_lpcllm.example
 ```
 
 | Area | Safe to delete? | Notes |
 |------|-------------|------|
 | `blobs/` | Keep by default | Deleting forces re-download |
 | `adapters/` | **Keep / back up** | Trained LoRA; losing them means re-train |
+| `train/` | Your data | Private corpora under home; never in git |
 | `cache/` | Yes | Regenerated on next hybrid / train run |
 | `manifest.json` | Yes | Restored by `reconcile` at startup |
-| `data/train/` | Your data | Private corpora; never push to GitHub |
 
 `rm` only removes the registry entry; it **does not delete blobs**.
 
@@ -198,9 +206,11 @@ Linker `warning: linker stderr: ignoring deprecated...` can be ignored.
 
 | Goal | Command | Binary |
 |------|---------|--------|
-| Dev (updates on every `cargo build`) | `./scripts/install-dev.sh` then `cargo build` | `lpc-llm` on PATH |
+| Dev (updates on every `cargo build`) | `./scripts/install-dev.sh` then `cargo build` | `lpc-llm` on PATH (symlink; `install.bin_dir`) |
+| Shared system binary | `./scripts/install-system.sh` | `/usr/local/bin` (**binary only**; data stays per-user) |
 | Copied release install | `cargo install --path . --force` | `~/.cargo/bin/lpc-llm` (does **not** refresh on compile) |
 | No install | `./target/debug/lpc-llm` or `./target/release/lpc-llm` | path as given |
+| Path config | `lpc-llm config init` / `config show` | writes/reads `config_lpcllm` |
 
 ### 2. Install a model (pull)
 
@@ -268,11 +278,13 @@ packing 26 layers → ~/.local/share/lpc-llm/cache/packs/gemma2_2b/0.1.0/layers.
 
 ### 4. Training data placement
 
-Put **private** corpora under `data/train/` (gitignored — not published to GitHub):
+Put **private** corpora under `train_dir` from `config_lpcllm` (default `~/.local/share/lpc-llm/train/` — outside git):
 
 ```bash
-mkdir -p data/train
-cp /path/to/your-corpus.txt data/train/my-domain.txt
+lpc-llm config init          # once: ~/.config/lpc-llm/config_lpcllm
+TRAIN="$(lpc-llm config get train_dir)"
+mkdir -p "$TRAIN"
+cp /path/to/your-corpus.txt "$TRAIN/my-domain.txt"
 # JSONL also OK: each line {"text":"..."}
 ```
 
@@ -284,8 +296,9 @@ Details: [`data/README.md`](data/README.md).
 ```bash
 lpc-llm adapter list
 
+# bare name resolves under train_dir
 lpc-llm adapter create \
-  --from data/train/my-domain.txt \
+  --from my-domain.txt \
   --out my-lora \
   --base smollm2:360m \
   --steps 64 --rank 8 --last-layers 4
@@ -316,6 +329,48 @@ lpc-llm run smollm2:360m --adapter my-lora
 
 **Back up `~/.local/share/lpc-llm/adapters/`** for trained deltas.  
 `blobs/` is optional (re-downloadable); `cache/` is regenerable.
+
+### 6b. Tiny from-scratch / SFT / DPO (Phase 5)
+
+```bash
+# Train a tiny Llama-family model, export F16 GGUF, register for `run`
+lpc-llm train scratch \
+  --from examples/train-sample.txt \
+  --out tiny:demo \
+  --steps 64 --n-embd 128 --n-layers 2 --ram-mib 1024
+
+lpc-llm run tiny:demo
+
+# Full fine-tune a tiny checkpoint
+lpc-llm train sft --ckpt tiny:demo --from examples/train-sample.txt --out tiny:sft --steps 32
+
+# Preference optimization (JSONL: prompt / chosen / rejected)
+lpc-llm train dpo --ckpt tiny:sft --from examples/pref-sample.jsonl --out tiny:dpo --steps 32
+
+# Export only
+lpc-llm train export --ckpt tiny:dpo --register --name tiny:dpo
+```
+
+Checkpoints live under `~/.local/share/lpc-llm/cache/train/<name>/`  
+(`config.json`, `weights.bin`, `tokenizer.json`, optional `model.gguf`).
+
+### 6c. Scale-up jobs (Phase 6)
+
+```bash
+lpc-llm job init --template rlhf --out job.json
+lpc-llm job run --config job.json --local
+lpc-llm job status rlhf-demo
+
+# Import an external GGUF
+lpc-llm job import --gguf /path/model.gguf --tokenizer /path/tokenizer.json --name my:import
+
+# Convert: builtin (Phase 5 ckpt) or external ($LPC_LLM_CONVERT_CMD)
+lpc-llm job convert --from-dir ~/.local/share/lpc-llm/cache/train/tiny_demo \
+  --name tiny:from-ckpt --backend builtin
+```
+
+`job.json` can set `remote.launch` / `status_cmd` for cluster hand-off.  
+Multi-billion HF→GGUF: set `LPC_LLM_CONVERT_CMD` to write a `.gguf` into `$LPC_LLM_CONVERT_OUT`.
 
 ### 7. In-chat controls
 
@@ -372,8 +427,11 @@ lpc-llm io --help
 | `lpc-llm show <name>` | Catalog + local paths |
 | `lpc-llm rm <name>` | Remove from registry (blobs kept) |
 | `lpc-llm adapter list` | List LoRA adapters |
+| `lpc-llm config show\|init\|get\|example` | Resolve / write `config_lpcllm` (data_dir, train_dir, bin_dir) |
 | `lpc-llm adapter create …` | Train LoRA from `--from` → `adapters/<out>/` |
 | `lpc-llm adapter install-demo` | Zero LoRA fixture for tests |
+| `lpc-llm train scratch\|sft\|dpo\|export` | Tiny from-scratch / full SFT / DPO / GGUF (Phase 5) |
+| `lpc-llm job init\|run\|status\|import\|convert` | Declarative jobs / remote bridge (Phase 6) |
 | `lpc-llm prefetch <name>` | Pack + io_uring ping-pong timing |
 | `lpc-llm io` | I/O demo with synthetic weights |
 
@@ -394,7 +452,7 @@ lpc-llm io --help
 
 | Option | Default | Meaning |
 |--------|---------|---------|
-| `--from <path>` | required | Training `.txt` / `.jsonl` (prefer `data/train/`) |
+| `--from <path>` | required | Training `.txt` / `.jsonl` (cwd path or name under `train_dir`) |
 | `--out <name>` | required | Adapter directory name under `adapters/` |
 | `--base <model>` | required | Catalog base (e.g. `smollm2:360m`) |
 | `--rank` | 8 | LoRA rank |
@@ -415,7 +473,7 @@ lpc-llm io --help
 | `mlock failed` | Warning only. Optionally `ulimit -l unlimited` (depends on privileges) |
 | Downloads every time | Check `~/.local/share/lpc-llm/blobs`. Migrating from old `~/.local/share/l3m`: rename / symlink |
 | Pack is slow | First run only. Delete `cache/packs` to regenerate |
-| `--from file not found` | Place corpora under `data/train/` (or pass a real path). See [`data/README.md`](data/README.md) |
+| `--from file not found` | Place corpora under `train_dir` (`lpc-llm config get train_dir`) or pass a real path. See [`data/README.md`](data/README.md) |
 | `adapter … not found` | Run `adapter create` successfully first, or `adapter list` / check `~/.local/share/lpc-llm/adapters/` |
 | HF 401 | `HF_TOKEN` and license acceptance |
 | Long builds | release + LTO. Warnings alone are not failure |
@@ -487,7 +545,9 @@ Ollama に依存しない、**純 Rust のローカル LLM プレイヤー**で�
 - **推論エンジン**: 自前（Candle + hybrid I/O）。Ollama / llama.cpp バイナリは使いません
 - **CUI**: Ollama 風の `list` / `pull` / `run` / `rm` / `show` / `adapter`
 - **ストレージ**: モデル本体（blobs）とエンジン派生物（cache）を分離。エンジン更新でも再ダウンロードしません
-- **LoRA**: `adapter create` で学習（コーパスは `data/train/`）。成果は `~/.local/share/lpc-llm/adapters/`（**バックアップ対象**）
+- **LoRA**: `adapter create` で学習（非公開コーパスは `config_lpcllm` の `train_dir`）。成果は `adapters/`（**バックアップ対象**）
+- **パス**: `config_lpcllm` でバイナリ位置とユーザデータ位置を設定（`lpc-llm config show`）
+- **モデル作成**: `train scratch|sft|dpo`（超小型 from-scratch → GGUF → `run`）；大規模化は `job`
 - **今後の工程**: 進捗と予定は [`todo.md`](todo.md) を参照
 
 ## 日本語目次
@@ -502,17 +562,21 @@ Ollama に依存しない、**純 Rust のローカル LLM プレイヤー**で�
 
 ### パス早見表
 
-| 対象 | 場所 | Git | バックアップ |
+**`config_lpcllm`** で設定（`lpc-llm config init` / `config show`）。既定値は下表。
+
+| 対象 | 場所（既定） | Git | バックアップ |
 |------|------|-----|--------------|
 | ビルド成果 | `./target/debug/lpc-llm` または `./target/release/lpc-llm` | 無視（`/target/`） | 不要 |
-| 開発用 PATH | `~/.local/bin/lpc-llm` → `./target/debug/…` の symlink | n/a | 不要 |
+| 開発用 PATH | `~/.local/bin/lpc-llm` → symlink（`install-dev.sh`） | n/a | 不要 |
+| 共有バイナリ | `/usr/local/bin/lpc-llm`（`install-system.sh`；**バイナリのみ**） | n/a | 不要 |
+| 設定ファイル | `~/.config/lpc-llm/config_lpcllm`（任意で `/etc/lpc-llm/…`） | n/a | 任意 |
 | ベースモデル | `~/.local/share/lpc-llm/blobs/` | リポ外 | 任意（再 DL 可） |
 | エンジン pack | `~/.local/share/lpc-llm/cache/packs/` | リポ外 | 不要（再生成可） |
-| **学習用コーパス** | **`data/train/*.txt` / `*.jsonl`** | **無視（非公開）** | 任意 |
-| 公開サンプルのみ | `examples/train-sample.txt` | 追跡 | n/a |
+| **学習用コーパス** | **`~/.local/share/lpc-llm/train/`**（`paths.train_dir`） | リポ外 | 任意 |
+| 公開 / 開発サンプル | `examples/*` | 追跡 | n/a |
 | **学習済み LoRA** | **`~/.local/share/lpc-llm/adapters/<name>/`** | リポ外 | **要バックアップ** |
 
-詳細は [`data/README.md`](data/README.md)。
+非公開データは git ツリーに置かない。リポ内 `data/train/` は保険の gitignore のみ。詳細は [`data/README.md`](data/README.md) / [`config_lpcllm.example`](config_lpcllm.example)。
 
 ---
 
@@ -564,10 +628,10 @@ Ollama に依存しない、**純 Rust のローカル LLM プレイヤー**で�
 
 ### データレイアウト（モジュール分離）
 
-**ランタイム状態**（XDG データディレクトリ — git リポジトリの外）:
+**ランタイム状態**（`config_lpcllm` / XDG — git リポジトリの外）:
 
 ```text
-~/.local/share/lpc-llm/
+~/.local/share/lpc-llm/          # paths.data_dir
   blobs/                 # モデルモジュール（永続 GGUF + tokenizer）
     <hf-repo--name>/
       *.gguf
@@ -576,6 +640,7 @@ Ollama に依存しない、**純 Rust のローカル LLM プレイヤー**で�
     <name>/
       adapter.json
       weights.bin
+  train/                 # paths.train_dir — 非公開コーパス ← git に置かない
   cache/                 # エンジンモジュール（再生成可）
     packs/
       <model_name>/<engine_ver>/
@@ -584,20 +649,21 @@ Ollama に依存しない、**純 Rust のローカル LLM プレイヤー**で�
   manifest.json          # ソフト索引（models + adapters）
 ```
 
-**リポジトリ内の学習入力**（非公開・`.gitignore` 済み）:
+**リポジトリ内の公開サンプル**（コミット可）:
 
 ```text
-data/train/                 # `adapter create --from` 用の .txt / .jsonl
-examples/train-sample.txt   # 公開用の極小サンプル（コミット可）
+examples/train-sample.txt
+examples/pref-sample.jsonl
+config_lpcllm.example
 ```
 
 | 領域 | 消してよいか | 備考 |
 |------|-------------|------|
 | `blobs/` | 原則残す | 再 DL が必要になる |
 | `adapters/` | **残す / バックアップ** | 学習済み LoRA。消すと再学習が必要 |
+| `train/` | 自分のデータ | ホーム配下の非公開コーパス。git に置くな |
 | `cache/` | 消してよい | 次回 hybrid / train で再生成 |
 | `manifest.json` | 消してよい | 起動時 `reconcile` で復旧 |
-| `data/train/` | 自分のデータ | 非公開コーパス。GitHub に載せるな |
 
 `rm` はレジストリから外すだけで **blobs は削除しません**。
 
@@ -656,9 +722,11 @@ cargo build --release
 
 | 目的 | コマンド | バイナリ |
 |------|---------|----------|
-| 開発（`cargo build` ごとに更新） | `./scripts/install-dev.sh` のあと `cargo build` | PATH 上の `lpc-llm` |
+| 開発（`cargo build` ごとに更新） | `./scripts/install-dev.sh` のあと `cargo build` | PATH 上の symlink（`install.bin_dir`） |
+| 共有バイナリ | `./scripts/install-system.sh` | `/usr/local/bin`（**バイナリのみ**；データはユーザごと） |
 | コピーして入れる | `cargo install --path . --force` | `~/.cargo/bin/lpc-llm`（コンパイルでは自動更新されない） |
 | インストールなし | `./target/debug/lpc-llm` など | 指定パス |
+| パス設定 | `lpc-llm config init` / `config show` | `config_lpcllm` の読み書き |
 
 ### 2. モデルの導入（pull）
 
@@ -714,11 +782,13 @@ packing 26 layers → ~/.local/share/lpc-llm/cache/packs/gemma2_2b/0.1.0/layers.
 
 ### 4. 学習用データの設置場所
 
-**非公開**コーパスはリポジトリ内の `data/train/` に置く（`.gitignore` 済み — GitHub に上がらない）:
+**非公開**コーパスは `config_lpcllm` の `train_dir`（既定 `~/.local/share/lpc-llm/train/` — git 外）に置く:
 
 ```bash
-mkdir -p data/train
-cp /path/to/your-corpus.txt data/train/my-domain.txt
+lpc-llm config init          # 一度: ~/.config/lpc-llm/config_lpcllm
+TRAIN="$(lpc-llm config get train_dir)"
+mkdir -p "$TRAIN"
+cp /path/to/your-corpus.txt "$TRAIN/my-domain.txt"
 # JSONL も可: 各行 {"text":"..."}
 ```
 
@@ -730,8 +800,9 @@ cp /path/to/your-corpus.txt data/train/my-domain.txt
 ```bash
 lpc-llm adapter list
 
+# ファイル名のみなら train_dir 配下を解決
 lpc-llm adapter create \
-  --from data/train/my-domain.txt \
+  --from my-domain.txt \
   --out my-lora \
   --base smollm2:360m \
   --steps 64 --rank 8 --last-layers 4
@@ -762,6 +833,35 @@ lpc-llm run smollm2:360m --adapter my-lora
 
 **学習済み差分は `~/.local/share/lpc-llm/adapters/` をバックアップ**してください。  
 `blobs/` は任意（再 DL 可）、`cache/` は再生成可です。
+
+### 6b. 超小型 from-scratch / SFT / DPO（Phase 5）
+
+```bash
+lpc-llm train scratch \
+  --from examples/train-sample.txt \
+  --out tiny:demo \
+  --steps 64 --n-embd 128 --n-layers 2 --ram-mib 1024
+
+lpc-llm run tiny:demo
+
+lpc-llm train sft --ckpt tiny:demo --from examples/train-sample.txt --out tiny:sft --steps 32
+lpc-llm train dpo --ckpt tiny:sft --from examples/pref-sample.jsonl --out tiny:dpo --steps 32
+lpc-llm train export --ckpt tiny:dpo --register --name tiny:dpo
+```
+
+チェックポイント: `~/.local/share/lpc-llm/cache/train/<name>/`
+
+### 6c. 大規模化ジョブ（Phase 6）
+
+```bash
+lpc-llm job init --template rlhf --out job.json
+lpc-llm job run --config job.json --local
+lpc-llm job import --gguf /path/model.gguf --tokenizer /path/tokenizer.json --name my:import
+lpc-llm job convert --from-dir ~/.local/share/lpc-llm/cache/train/tiny_demo \
+  --name tiny:from-ckpt --backend builtin
+```
+
+数十億級 HF→GGUF は `LPC_LLM_CONVERT_CMD`（出力先 `$LPC_LLM_CONVERT_OUT`）を設定。
 
 ### 7. チャット中の操作
 
@@ -818,8 +918,11 @@ lpc-llm io --help
 | `lpc-llm show <name>` | カタログ + ローカルパス |
 | `lpc-llm rm <name>` | レジストリから削除（blobs は残す） |
 | `lpc-llm adapter list` | LoRA アダプタ一覧 |
+| `lpc-llm config show\|init\|get\|example` | `config_lpcllm` の解決 / 作成（data_dir, train_dir, bin_dir） |
 | `lpc-llm adapter create …` | `--from` から LoRA 学習 → `adapters/<out>/` |
 | `lpc-llm adapter install-demo` | 検証用ゼロ LoRA |
+| `lpc-llm train scratch\|sft\|dpo\|export` | 超小型 from-scratch / フル SFT / DPO / GGUF（Phase 5） |
+| `lpc-llm job init\|run\|status\|import\|convert` | 宣言的ジョブ / リモートブリッジ（Phase 6） |
 | `lpc-llm prefetch <name>` | pack + io_uring ping-pong 計測 |
 | `lpc-llm io` | 合成重みでの I/O デモ |
 
@@ -840,7 +943,7 @@ lpc-llm io --help
 
 | オプション | 既定 | 意味 |
 |------------|------|------|
-| `--from <path>` | 必須 | 学習用 `.txt` / `.jsonl`（推奨: `data/train/`） |
+| `--from <path>` | 必須 | 学習用 `.txt` / `.jsonl`（cwd パスまたは `train_dir` 下の名前） |
 | `--out <name>` | 必須 | `adapters/<name>/` の名前 |
 | `--base <model>` | 必須 | カタログのベース（例: `smollm2:360m`） |
 | `--rank` | 8 | LoRA rank |
@@ -861,7 +964,7 @@ lpc-llm io --help
 | `mlock failed` | 警告のみ。必要なら `ulimit -l unlimited`（権限による） |
 | 毎回ダウンロードされる | `~/.local/share/lpc-llm/blobs` を確認。旧 `~/.local/share/l3m` から移行する場合は rename / symlink |
 | pack が遅い | 初回のみ。`cache/packs` を消せば再生成される |
-| `--from file not found` | コーパスを `data/train/` に置く（または実在パスを渡す）。[`data/README.md`](data/README.md) |
+| `--from file not found` | コーパスを `train_dir`（`lpc-llm config get train_dir`）に置くか実在パスを渡す。[`data/README.md`](data/README.md) |
 | `adapter … not found` | 先に `adapter create` を成功させる。`adapter list` / `~/.local/share/lpc-llm/adapters/` を確認 |
 | HF 401 | `HF_TOKEN` とライセンス同意 |
 | ビルドが長い | release + LTO。警告だけなら失敗ではない |

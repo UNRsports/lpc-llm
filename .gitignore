@@ -17,12 +17,15 @@
 **/*.bin
 
 # --- local training corpora (private; do not publish) ---
-# Prefer data/train/ for real datasets. Root notes.txt is a common local leftover.
+# Canonical private corpora: ~/.local/share/lpc-llm/train (config_lpcllm paths.train_dir).
+# data/train/ is gitignored only as a safety net — do not store private data in-repo.
 /notes.txt
 /data/train/**
 !/data/train/.gitkeep
 # Accidental in-repo adapter exports (runtime adapters live under XDG data dir)
 /adapters/
+# Accidental local config copies in the repo root
+/config_lpcllm
 
 # --- secrets / credentials ---
 .env

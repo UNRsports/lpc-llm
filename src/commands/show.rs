@@ -5,8 +5,14 @@ use crate::error::{AppError, Result};
 use crate::store::LocalStore;
 
 pub fn run(name: &str) -> Result<()> {
-    let entry = catalog::find(name).ok_or_else(|| AppError::UnknownModel(name.into()))?;
     let store = LocalStore::open()?;
+    let entry = if let Some(e) = catalog::find(name) {
+        e
+    } else if let Some(m) = store.resolve_name(name)? {
+        catalog::entry_for_local(&m.name, &m.gguf_file, &m.tokenizer_repo)
+    } else {
+        return Err(AppError::UnknownModel(name.into()));
+    };
 
     println!("{} {}", style("name:").bold(), entry.name);
     println!("{} {}", style("display:").bold(), entry.display);
@@ -17,7 +23,7 @@ pub fn run(name: &str) -> Result<()> {
     println!("{} {}", style("tokenizer:").bold(), entry.tokenizer_repo);
     println!("{} {:?}", style("prompt:").bold(), entry.prompt_style);
 
-    match store.resolve(&entry)? {
+    match store.resolve_name(name)? {
         Some(m) => {
             println!("{} {}", style("status:").bold(), style("local").green());
             println!("{} {}", style("model path:").bold(), m.model_path.display());
@@ -39,10 +45,12 @@ pub fn run(name: &str) -> Result<()> {
         }
         None => {
             println!("{} {}", style("status:").bold(), style("not installed").yellow());
-            println!(
-                "{}",
-                style(format!("hint: lpc-llm pull {}", entry.name)).dim()
-            );
+            if catalog::find(name).is_some() {
+                println!(
+                    "{}",
+                    style(format!("hint: lpc-llm pull {}", entry.name)).dim()
+                );
+            }
         }
     }
 

@@ -1,16 +1,19 @@
 //! Local data layout — **model module** vs **engine module** vs **adapters**.
 //!
+//! Root and `train/` come from [`crate::config::AppConfig`] (`config_lpcllm`).
+//! Defaults:
+//!
 //! ```text
-//! ~/.local/share/lpc-llm/
+//! ~/.local/share/lpc-llm/          # paths.data_dir (XDG)
 //!   blobs/          # MODEL MODULE (durable). GGUF + tokenizer by HF repo.
-//!                   # Survives engine upgrades; never re-downloaded if present.
 //!   adapters/       # Diff modules (LoRA). Durable; independent of blobs.
+//!   train/          # Private corpora (paths.train_dir; may be relocated)
 //!   cache/          # ENGINE MODULE (regenerable). packs/, derived I/O layout.
-//!                   # Safe to delete; rebuilt from blobs on next hybrid run.
 //!   manifest.json   # Soft index (rebuildable by scanning blobs + catalog).
 //! ```
 //!
 //! Engine binary upgrades must not require re-pulling Gemma (or any) weights.
+//! Private data must not live in the git repository.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -19,7 +22,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::{self, ModelEntry};
-use crate::error::{AppError, Result};
+use crate::config::AppConfig;
+use crate::error::Result;
 
 /// Soft registry entry. Paths always point into [`LocalStore::blobs_dir`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,17 +57,25 @@ struct Manifest {
 
 pub struct LocalStore {
     root: PathBuf,
+    train_dir: PathBuf,
 }
 
 impl LocalStore {
     pub fn open() -> Result<Self> {
-        let root = data_dir()?;
+        let cfg = AppConfig::load()?;
+        Self::open_with(&cfg)
+    }
+
+    pub fn open_with(cfg: &AppConfig) -> Result<Self> {
+        let root = cfg.data_dir.clone();
+        let train_dir = cfg.train_dir.clone();
         fs::create_dir_all(root.join("blobs"))?;
         fs::create_dir_all(root.join("adapters"))?;
         fs::create_dir_all(root.join("cache").join("packs"))?;
+        fs::create_dir_all(&train_dir)?;
         // legacy empty dir from earlier layouts
         fs::create_dir_all(root.join("models"))?;
-        let store = Self { root };
+        let store = Self { root, train_dir };
         // Repair soft index from durable blobs (engine upgrade / wiped manifest).
         store.reconcile()?;
         store.reconcile_adapters()?;
@@ -72,6 +84,11 @@ impl LocalStore {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Private training corpora (from `config_lpcllm` `paths.train_dir`).
+    pub fn train_dir(&self) -> &Path {
+        &self.train_dir
     }
 
     /// Durable model assets (GGUF, tokenizer). Do not wipe on engine upgrade.
@@ -348,13 +365,6 @@ fn file_nonempty(path: &Path) -> Result<bool> {
         return Ok(false);
     }
     Ok(path.metadata()?.len() > 0)
-}
-
-fn data_dir() -> Result<PathBuf> {
-    let base = dirs::data_local_dir().ok_or_else(|| {
-        AppError::msg("could not resolve XDG data directory (~/.local/share)")
-    })?;
-    Ok(base.join("lpc-llm"))
 }
 
 pub fn now_unix() -> u64 {

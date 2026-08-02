@@ -2,12 +2,16 @@
 # Install a PATH entry that always tracks this repo's build artifact.
 #
 # Default: ~/.local/bin/lpc-llm → <repo>/target/debug/lpc-llm
+# Override bin dir via config_lpcllm [install].bin_dir or LPC_LLM_BIN_DIR.
+#
 # So every `cargo build` / `cargo test` refreshes what `lpc-llm` runs.
 #
 # Usage:
 #   ./scripts/install-dev.sh           # debug (dev default)
 #   ./scripts/install-dev.sh --release # track target/release instead
 #   ./scripts/install-dev.sh --no-build
+#
+# For a shared machine binary (no symlink), use ./scripts/install-system.sh
 
 set -euo pipefail
 
@@ -21,7 +25,7 @@ for arg in "$@"; do
     --debug) PROFILE="debug" ;;
     --no-build) DO_BUILD=0 ;;
     -h|--help)
-      sed -n '2,12p' "$0"
+      sed -n '2,16p' "$0"
       exit 0
       ;;
     *)
@@ -31,12 +35,10 @@ for arg in "$@"; do
   esac
 done
 
-BIN_DIR="${LPC_LLM_BIN_DIR:-$HOME/.local/bin}"
 # Always prefer the repo-local target/ so the symlink stays stable across shells
 # (ignore ambient CARGO_TARGET_DIR unless LPC_LLM_TARGET_DIR is set).
 TARGET_DIR="${LPC_LLM_TARGET_DIR:-$ROOT/target}"
 TARGET="$TARGET_DIR/$PROFILE/lpc-llm"
-LINK="$BIN_DIR/lpc-llm"
 
 if [[ "$DO_BUILD" -eq 1 ]]; then
   if [[ "$PROFILE" == "release" ]]; then
@@ -51,6 +53,19 @@ if [[ ! -x "$TARGET" ]]; then
   exit 1
 fi
 
+if [[ -n "${LPC_LLM_BIN_DIR:-}" ]]; then
+  BIN_DIR="$LPC_LLM_BIN_DIR"
+elif BIN_FROM_CFG="$("$TARGET" config get bin_dir 2>/dev/null)"; then
+  BIN_DIR="$BIN_FROM_CFG"
+else
+  BIN_DIR="$HOME/.local/bin"
+fi
+
+if [[ "$BIN_DIR" == ~* ]]; then
+  BIN_DIR="${BIN_DIR/#\~/$HOME}"
+fi
+
+LINK="$BIN_DIR/lpc-llm"
 mkdir -p "$BIN_DIR"
 ln -sfn "$TARGET" "$LINK"
 

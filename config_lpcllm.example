@@ -1,0 +1,36 @@
+# config_lpcllm — lpc-llm path and install layout
+#
+# Copy to:
+#   ~/.config/lpc-llm/config_lpcllm     (per-user; preferred)
+#   /etc/lpc-llm/config_lpcllm          (machine defaults: binary path only)
+# Or: lpc-llm config init
+#
+# Privacy:
+#   - Private training corpora and runtime state belong under paths below
+#     (user home / XDG). Do not put private data in the git repository.
+#   - Repo `data/train/` and `examples/` are for public/dev samples only.
+#   - Shared install copies the binary only; each user keeps their own data_dir.
+#
+# Search order: /etc/lpc-llm/config_lpcllm → ~/.config/lpc-llm/config_lpcllm
+#               → $LPC_LLM_CONFIG (exclusive overlay on defaults when set)
+# Env overrides: LPC_LLM_DATA_DIR, LPC_LLM_TRAIN_DIR, LPC_LLM_BIN_DIR
+
+[paths]
+# User data root (blobs, adapters, cache, manifest).
+# Default: $XDG_DATA_HOME/lpc-llm  (~/.local/share/lpc-llm)
+# data_dir = "~/.local/share/lpc-llm"
+
+# Private training corpora (.txt / .jsonl).
+# Default: <data_dir>/train
+# train_dir = "~/.local/share/lpc-llm/train"
+# Alternative:
+# train_dir = "~/Documents/lpc-llm/train"
+
+[install]
+# user   → per-user binary (default bin_dir ~/.local/bin)
+# system → shared binary only (default bin_dir /usr/local/bin); data stays per-user
+mode = "user"
+# bin_dir = "~/.local/bin"
+# For system-wide binary install:
+# mode = "system"
+# bin_dir = "/usr/local/bin"

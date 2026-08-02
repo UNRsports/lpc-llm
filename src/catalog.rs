@@ -130,3 +130,18 @@ pub fn catalog() -> Vec<ModelEntry> {
 pub fn find(name: &str) -> Option<ModelEntry> {
     catalog().into_iter().find(|e| e.name == name)
 }
+
+/// Synthetic catalog entry for locally trained / imported models (not in `catalog()`).
+pub fn entry_for_local(name: &str, gguf_file: &str, tokenizer_repo: &str) -> ModelEntry {
+    let safe = name.replace([':', '/'], "_");
+    ModelEntry {
+        name: name.to_string(),
+        display: format!("Local / trained model `{name}`"),
+        hf_repo: format!("local/{safe}"),
+        gguf_file: gguf_file.to_string(),
+        tokenizer_repo: tokenizer_repo.to_string(),
+        approx_size: "custom".into(),
+        min_ram_hint: "varies".into(),
+        prompt_style: PromptStyle::Raw,
+    }
+}

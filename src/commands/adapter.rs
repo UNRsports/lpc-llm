@@ -1,12 +1,11 @@
 //! Adapter management CLI (`list` / `create` / `install-demo`).
 
-use std::path::PathBuf;
-
 use console::style;
 use dialoguer::Confirm;
 
 use crate::adapter::{train_adapter, write_demo_adapter, TrainConfig};
 use crate::catalog;
+use crate::config::resolve_train_from;
 use crate::error::{AppError, Result};
 use crate::pull;
 use crate::store::{InstalledAdapter, LocalStore};
@@ -54,19 +53,13 @@ pub struct CreateOpts {
 }
 
 pub fn create(opts: CreateOpts) -> Result<()> {
-    let from = PathBuf::from(&opts.from);
-    if !from.is_file() {
-        return Err(AppError::msg(format!(
-            "--from file not found: {}",
-            from.display()
-        )));
-    }
     if opts.out.trim().is_empty() {
         return Err(AppError::msg("--out adapter name must be non-empty"));
     }
 
     let entry = catalog::find(&opts.base).ok_or_else(|| AppError::UnknownModel(opts.base.clone()))?;
     let store = LocalStore::open()?;
+    let from = resolve_train_from(&opts.from, store.train_dir())?;
     let installed = match store.resolve(&entry)? {
         Some(m) => m,
         None => {

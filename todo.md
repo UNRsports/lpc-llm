@@ -23,7 +23,7 @@
 
 Implementation status against the spec “MoE support · delta-adapter driven · lightweight agent integration”.  
 Project theme: **efficient LLM execution and model creation under constrained resources**  
-Last updated: 2026-08-01
+Last updated: 2026-08-02
 
 ## English table of contents
 
@@ -45,7 +45,8 @@ Last updated: 2026-08-01
 | Axis 1 / Phase 2 | MoE expert split pack + dynamic DMA | **Done** |
 | Axis 3 / Phase 3 | Ultra-light router agent + memory exclusivity | **Done** |
 | Axis 2 / Phase 4 | `adapter create` trainer prototype | **Done** |
-| Long-term / Phase 5+ | Full base training · multi-billion GGUF · SFT/RLHF | **Not started** (see feasibility below) |
+| Axis 2 / Phase 5 | Tiny from-scratch · GGUF export · local SFT/DPO | **Done** |
+| Long-term / Phase 6 | Scale-up bridge (remote jobs · convert · RLHF stages) | **Done** (bridge; full cluster PPO external) |
 | Extension / Phase 7 | Auto knowledge acquisition & user adaptation (Web + auto-train) | **Not started** (conditionally feasible) |
 | Extension / Phase 8 | NVMe-resident project-map & overview memory | **Not started** (conditionally feasible) |
 
@@ -53,8 +54,11 @@ Last updated: 2026-08-01
 `lpc-llm run <model> --adapter <name>` (Hybrid LoRA),  
 `lpc-llm run <model> --agent` (SmolLM2 router → auto adapter/expert hints, exclusive RAM),  
 `lpc-llm adapter create --from … --out … --base …` (LoRA SFT → `adapters/<name>/`),  
+`lpc-llm train scratch|sft|dpo|export` (tiny from-scratch → GGUF → `run`),  
+`lpc-llm job init|run|import|convert` (declarative stages / remote bridge / RLHF stubs),  
+`lpc-llm config show|init|get` (`config_lpcllm`: bin_dir + per-user data/train),  
 On MoE GGUF: `experts.pack` + Top-K expert DMA (hybrid).  
-**Not available yet:** full base training, full SFT/RLHF, Web knowledge acquisition, `user_profile` auto-train, `--project-map`.
+**Not available yet:** multi-GPU PPO in-process, Web knowledge acquisition, `user_profile` auto-train, `--project-map`.
 
 ---
 
@@ -138,36 +142,50 @@ How to treat the following three requirements under the theme “efficient execu
 - [x] Train/save a few-MB delta from small text in minutes
 - [x] Match output to Phase 1 form (`adapter.json` + `weights.bin`)
 - [x] Document build / run / train-data / adapter-backup paths in README  
-      (`data/train/` gitignored; results under `~/.local/share/lpc-llm/adapters/`)
+      (private corpora under `train_dir` from `config_lpcllm`; results under `adapters/`)
 - [ ] (Optional) Separate crate / Safetensors output
 
-### Phase 5: Constrained-resource “model creation” foundation — **Not started** (theme-critical · runnable)
+### Privacy / install layout — **Done** (user isolation + GitHub leak avoidance)
+
+Goal: shared **binary only**; per-user data under home; private corpora never in the git tree.
+
+- [x] `config_lpcllm` schema: `[paths]` (`data_dir`, `train_dir`) + `[install]` (`mode`, `bin_dir`)
+- [x] Load order: defaults → `/etc/lpc-llm/config_lpcllm` → `~/.config/lpc-llm/config_lpcllm` → `$LPC_LLM_CONFIG` → env overrides
+- [x] `lpc-llm config show|init|get|example` CLI
+- [x] `LocalStore` / `--from` resolve via configured `data_dir` / `train_dir` (default `~/.local/share/lpc-llm/train`)
+- [x] User install: `scripts/install-dev.sh` → `install.bin_dir` (default `~/.local/bin`)
+- [x] System install: `scripts/install-system.sh` → `/usr/local/bin` (**binary only**; no user data)
+- [x] Demote repo `data/train/` to safety-net gitignore only; public samples stay in `examples/`
+- [x] Document privacy rule in README / `data/README.md` / `config_lpcllm.example`
+- [ ] (Optional) Package unit / distro packaging that ships `/etc/lpc-llm/config_lpcllm` with `mode = "system"`
+
+### Phase 5: Constrained-resource “model creation” foundation — **Done** (theme-critical · runnable)
 
 **Front stage** of the three full-scale requirements. Completes on home–workstation scale.
 
-- [ ] Tiny Transformer from-scratch training loop (Candle; CPU / single GPU)
-- [ ] Training checkpoint → GGUF (or intermediate Safetensors) write-out
-- [ ] Register artifacts in `blobs/` + `manifest` and run with `lpc-llm run`
-- [ ] Local SFT pipeline (full fine-tune or LoRA; can merge with Phase 4)
-- [ ] Minimal light preference opt (DPO / ORPO, etc.) — foothold toward “full RLHF”
-- [ ] Memory-aware training design (`--ram-mib` / grad checkpointing, etc.)
+- [x] Tiny Transformer from-scratch training loop (Candle; CPU) — `lpc-llm train scratch`
+- [x] Training checkpoint → GGUF (F16 llama) write-out — `train export` / auto on register
+- [x] Register artifacts in `blobs/` + `manifest` and run with `lpc-llm run`
+- [x] Local SFT pipeline (full FT on tiny ckpt; LoRA via Phase 4 `adapter create`)
+- [x] Minimal light preference opt (DPO) — `lpc-llm train dpo` + `examples/pref-sample.jsonl`
+- [x] Memory-aware training design (`--ram-mib` / `--grad-checkpoint`, seq clamp)
 
-### Phase 6: Scale-up bridge — **Not started** (conditional · external resources)
+### Phase 6: Scale-up bridge — **Done** (conditional · external resources)
 
 Bridge so “multi-billion” and “full RLHF” can be handled as **extensions of this toolchain**. Single-machine local completion is not required.
 
-- [ ] **Full base-model training from scratch**  
-      - Interfaces to launch / resume remote/distributed jobs and import artifacts  
-      - Declarative dataset / tokenizer / train config  
-      - Wire progress / checkpoints to `cache/` or external store
-- [ ] **Build a new multi-billion-param GGUF from scratch**  
-      - Large checkpoint → quantized GGUF conversion pipeline  
-      - Hybrid pack of conversion results (Phase 2) + catalog registration  
-      - ※ Training compute itself stays on Phase 6 remote/cluster side
-- [ ] **Full SFT / RLHF pipeline**  
-      - Stage defs: SFT → reward model (or preference data) → PPO/similar  
-      - Eval / regression / emit adapters or merged weights to `adapters/` or `blobs/`  
-      - Optional accelerator (CUDA etc.) backend (separated from Linux io_uring inference path)
+- [x] **Full base-model training from scratch**  
+      - Interfaces to launch / resume remote/distributed jobs and import artifacts (`job` + `remote.launch`)  
+      - Declarative dataset / tokenizer / train config (`job.json` stages)  
+      - Wire progress / checkpoints to `cache/jobs/` + `cache/train/`
+- [x] **Build a new multi-billion-param GGUF from scratch**  
+      - Large checkpoint → GGUF conversion bridge (`job convert --backend external` + `$LPC_LLM_CONVERT_CMD`)  
+      - Builtin tiny ckpt → GGUF + register; hybrid pack on first `--hybrid` run  
+      - ※ Training compute itself stays on remote/cluster side
+- [x] **Full SFT / RLHF pipeline**  
+      - Stage defs: SFT → preference (DPO) → PPO stub → export (`job init --template rlhf`)  
+      - Eval / emit to `adapters/` or `blobs/` via export/import stages  
+      - Accelerator left to external `remote.launch` / convert cmd (io_uring inference path unchanged)
 
 ### Phase 7: Auto knowledge acquisition & user adaptation — **Not started** (conditionally feasible)
 
@@ -238,7 +256,8 @@ Without loading all code into 16GB RAM, pull only needed nodes from a structured
 | `blobs/` | Base GGUF | As existing |
 | `adapters/` | Delta modules | **Implemented** (dir + json/bin); **back up** |
 | `adapters/user_profile/` | Auto-train user LoRA | **Not implemented** (Phase 7) |
-| `data/train/` (repo) | Local corpora for `adapter create` | **Convention + gitignore** (private; not under XDG) |
+| `paths.train_dir` (home) | Private corpora for `adapter create` / `train` | **Implemented** (default `<data_dir>/train`; via `config_lpcllm`) |
+| `data/train/` (repo) | Dev leftover only | **gitignore safety net** — do not store private data here |
 | `cache/packs/.../layers.pack` | Base layer pack | Existing (name is `layers.pack`; rename to spec’s `base_layers.pack` not done) |
 | `cache/packs/.../experts.pack` | MoE expert pack | **Implemented** |
 | `cache/knowledge/` | Web-fetched knowledge | **Not implemented** (Phase 7) |
@@ -255,7 +274,10 @@ Without loading all code into 16GB RAM, pull only needed nodes from a structured
 | `run … --project-map` | **Not implemented** (Phase 8) |
 | `adapter list` | **Implemented** |
 | `adapter install-demo` | **Implemented** (for verification) |
-| `adapter create …` | **Implemented** (LoRA SFT → Phase 1 on-disk form; corpora via `data/train/` or `--from`) |
+| `config show\|init\|get\|example` | **Implemented** (`config_lpcllm` path / install layout) |
+| `adapter create …` | **Implemented** (LoRA SFT → Phase 1 on-disk form; `--from` via `train_dir`) |
+| `train scratch|sft|dpo|export` | **Implemented** (Phase 5 tiny train → GGUF → `run`) |
+| `job init|run|status|import|convert` | **Implemented** (Phase 6 bridge) |
 | `adapter auto-train` | **Not implemented** (Phase 7) |
 | `search` / `knowledge …` | **Not implemented** (Phase 7) |
 | `project-map build|status` | **Not implemented** (Phase 8) |
@@ -274,18 +296,19 @@ Without loading all code into 16GB RAM, pull only needed nodes from a structured
 
 ## 5. Recommended next steps
 
-1. **Phase 5** — Tiny from-scratch + GGUF export + local SFT/DPO (completes within the theme)
-2. **Phase 7** — Web knowledge → `user_profile` auto-train · auto-attach (can reuse Phase 4 trainer)
-3. **Phase 8** — `project-map` index + `io_uring` on-demand fetch + `--project-map`
-4. **Phase 6** — Full base train / multi-billion GGUF / full RLHF (bridge to external compute)
+1. **Phase 7** — Web knowledge → `user_profile` auto-train · auto-attach (can reuse Phase 4 trainer); keep logs under user `cache/` only
+2. **Phase 8** — `project-map` index + `io_uring` on-demand fetch + `--project-map`
+3. **Phase 6 follow-ups** — Wire real cluster launchers / CUDA backends into `job.remote` and `$LPC_LLM_CONVERT_CMD`
+4. **(Optional)** Distro / package install that ships system `config_lpcllm` with `install.mode = "system"`
 
 ---
 
 ## 6. Notes (done outside the spec)
 
 - [x] Fix Backspace on Japanese input truncating UTF-8 bytes (REPL switched to `rustyline`)
-- [x] Dev PATH install via `scripts/install-dev.sh` (symlink → `target/debug`)
-- [x] Repo convention: private training corpora in `data/train/` (gitignored); public sample in `examples/train-sample.txt`
+- [x] Dev PATH install via `scripts/install-dev.sh` (symlink → `target/debug`; respects `config_lpcllm` `bin_dir`)
+- [x] System binary install via `scripts/install-system.sh` (shared binary only)
+- [x] Privacy: private corpora under `train_dir` (home/XDG); repo `data/train/` is gitignore-only; public samples in `examples/`
 
 ---
 
@@ -293,7 +316,7 @@ Without loading all code into 16GB RAM, pull only needed nodes from a structured
 
 仕様書「MoE 対応・差分アダプタ駆動・軽量エージェント統合」に対する実装状況。  
 プロジェクトテーマ: **限定的リソース下での LLM 効率化実行とモデル作成**  
-最終更新: 2026-08-01
+最終更新: 2026-08-02
 
 ## 日本語目次
 
@@ -315,7 +338,8 @@ Without loading all code into 16GB RAM, pull only needed nodes from a structured
 | 軸1 / Phase 2 | MoE Expert 分割パック + 動的 DMA | **完了** |
 | 軸3 / Phase 3 | 超軽量ルーターエージェント + メモリ排他 | **完了** |
 | 軸2 / Phase 4 | `adapter create` 学習器プロトタイプ | **完了** |
-| 長期 / Phase 5+ | 基盤フル学習・数十億 GGUF・SFT/RLHF | **未着手**（下記の実現可能性を参照） |
+| 軸2 / Phase 5 | 超小型 from-scratch · GGUF 出力 · ローカル SFT/DPO | **完了** |
+| 長期 / Phase 6 | 大規模化ブリッジ（リモートジョブ · 変換 · RLHF ステージ） | **完了**（ブリッジ；クラスタ PPO は外部） |
 | 拡張 / Phase 7 | 自動知識獲得 & ユーザー適応（Web + auto-train） | **未着手**（条件付き可能） |
 | 拡張 / Phase 8 | NVMe 常駐 project-map & 俯瞰記憶 | **未着手**（条件付き可能） |
 
@@ -323,8 +347,11 @@ Without loading all code into 16GB RAM, pull only needed nodes from a structured
 `lpc-llm run <model> --adapter <name>`（Hybrid LoRA）、  
 `lpc-llm run <model> --agent`（SmolLM2 ルーター → アダプタ/Expert ヒント自動選択、RAM 排他）、  
 `lpc-llm adapter create --from … --out … --base …`（LoRA SFT → `adapters/<name>/`）、  
+`lpc-llm train scratch|sft|dpo|export`（超小型 from-scratch → GGUF → `run`）、  
+`lpc-llm job init|run|import|convert`（宣言的ステージ / リモートブリッジ / RLHF スタブ）、  
+`lpc-llm config show|init|get`（`config_lpcllm`: bin_dir + ユーザごとの data/train）、  
 MoE GGUF では `experts.pack` + Top-K Expert DMA（hybrid）。  
-**まだ使えないもの:** 基盤フル学習、本格 SFT/RLHF、Web 知識獲得、`user_profile` 自動学習、`--project-map`。
+**まだ使えないもの:** プロセス内マルチ GPU PPO、Web 知識獲得、`user_profile` 自動学習、`--project-map`。
 
 ---
 
@@ -408,36 +435,50 @@ MoE GGUF では `experts.pack` + Top-K Expert DMA（hybrid）。
 - [x] 小規模テキストから数 MB 差分を数分で学習・保存する処理線
 - [x] 出力を Phase 1 形式（`adapter.json` + `weights.bin`）に合わせる
 - [x] README にビルド / 実行 / 学習データ配置 / アダプタバックアップパスを明記  
-      （`data/train/` は gitignore；成果は `~/.local/share/lpc-llm/adapters/`）
+      （非公開コーパスは `config_lpcllm` の `train_dir`；成果は `adapters/`）
 - [ ] （任意）独立クレート化 / Safetensors 出力
 
-### Phase 5: 限定リソース向け「モデル作成」基盤 — **未着手**（テーマ直結・実行可能）
+### プライバシー / インストール配置 — **完了**（ユーザ隔離 + GitHub 流出回避）
+
+目標: 共有は **バイナリのみ**；データはホーム配下；非公開コーパスは git ツリーに置かない。
+
+- [x] `config_lpcllm` スキーマ: `[paths]`（`data_dir`, `train_dir`）+ `[install]`（`mode`, `bin_dir`）
+- [x] 読込順: 既定 → `/etc/lpc-llm/config_lpcllm` → `~/.config/lpc-llm/config_lpcllm` → `$LPC_LLM_CONFIG` → 環境変数
+- [x] CLI: `lpc-llm config show|init|get|example`
+- [x] `LocalStore` / `--from` を設定の `data_dir` / `train_dir` で解決（既定 `~/.local/share/lpc-llm/train`）
+- [x] ユーザ導入: `scripts/install-dev.sh` → `install.bin_dir`（既定 `~/.local/bin`）
+- [x] システム導入: `scripts/install-system.sh` → `/usr/local/bin`（**バイナリのみ**；ユーザデータはコピーしない）
+- [x] リポ内 `data/train/` は gitignore 保険のみに降格；公開サンプルは `examples/`
+- [x] README / `data/README.md` / `config_lpcllm.example` にプライバシー規約を記載
+- [ ] （任意）`mode = "system"` の `/etc/lpc-llm/config_lpcllm` を同梱するパッケージ化
+
+### Phase 5: 限定リソース向け「モデル作成」基盤 — **完了**（テーマ直結・実行可能）
 
 フルスケール 3 要件の **前段**。家庭用〜ワークステーション規模で完結させる。
 
-- [ ] 超小型 Transformer の from-scratch 学習ループ（Candle、CPU/単一 GPU 想定）
-- [ ] 学習チェックポイント → GGUF（または中間 Safetensors）書き出し
-- [ ] 書き出した成果を `blobs/` + `manifest` に登録し `lpc-llm run` で推論
-- [ ] ローカル SFT パイプライン（フル微調整または LoRA；Phase 4 と統合可）
-- [ ] 軽量嗜好最適化（DPO / ORPO など）の最小実装 — 「本格 RLHF」への足場
-- [ ] `--ram-mib` / 勾配チェックポイント等、学習時もメモリ上限を意識した設計
+- [x] 超小型 Transformer の from-scratch 学習ループ（Candle、CPU）— `lpc-llm train scratch`
+- [x] 学習チェックポイント → GGUF（F16 llama）書き出し — `train export` / 登録時自動
+- [x] 書き出した成果を `blobs/` + `manifest` に登録し `lpc-llm run` で推論
+- [x] ローカル SFT パイプライン（tiny のフル微調整；LoRA は Phase 4 `adapter create`）
+- [x] 軽量嗜好最適化（DPO）の最小実装 — `lpc-llm train dpo` + `examples/pref-sample.jsonl`
+- [x] `--ram-mib` / `--grad-checkpoint` 等、学習時もメモリ上限を意識した設計
 
-### Phase 6: 大規模化ブリッジ — **未着手**（条件付き・外部資源前提）
+### Phase 6: 大規模化ブリッジ — **完了**（条件付き・外部資源前提）
 
 「数十億級」「本格 RLHF」を **このツールチェーンの延長**で扱うための橋。ローカル単機完結は求めない。
 
-- [ ] **ゼロから基盤モデルをフル学習する**  
-      - 分散/リモート学習ジョブの起動・再開・成果物取込インターフェース  
-      - データセット仕様・トークナイザ・学習設定の宣言的定義  
-      - 進捗・チェックポイントを `cache/` または外部ストアへ接続
-- [ ] **数十億パラメータ級の新規 GGUF を一から作る**  
-      - 大規模チェックポイント → 量子化 GGUF 変換パイプライン  
-      - 変換結果の hybrid pack（Phase 2 連携）とカタログ登録  
-      - ※学習計算そのものは Phase 6 のリモート/クラスタ側
-- [ ] **本格的な SFT / RLHF パイプライン全体**  
-      - SFT → 報酬モデル（または嗜好データ）→ PPO/類似アルゴリズムのステージ定義  
-      - 評価・回帰テスト・成果アダプタ/マージ重みの `adapters/` or `blobs/` への出力  
-      - アクセラレータ（CUDA 等）バックエンドの任意接続（Linux 本体の io_uring 推論パスとは分離）
+- [x] **ゼロから基盤モデルをフル学習する**  
+      - 分散/リモート学習ジョブの起動・再開・成果物取込（`job` + `remote.launch`）  
+      - データセット仕様・トークナイザ・学習設定の宣言的定義（`job.json`）  
+      - 進捗・チェックポイントを `cache/jobs/` + `cache/train/` へ接続
+- [x] **数十億パラメータ級の新規 GGUF を一から作る**  
+      - 大規模チェックポイント → GGUF 変換ブリッジ（`job convert --backend external` + `$LPC_LLM_CONVERT_CMD`）  
+      - builtin tiny ckpt → GGUF + 登録；hybrid pack は初回 `--hybrid` で構築  
+      - ※学習計算そのものはリモート/クラスタ側
+- [x] **本格的な SFT / RLHF パイプライン全体**  
+      - SFT → 嗜好（DPO）→ PPO スタブ → export（`job init --template rlhf`）  
+      - 評価・成果の `adapters/` / `blobs/` 出力ステージ  
+      - アクセラレータは `remote.launch` / convert cmd 側（io_uring 推論パスは不変）
 
 ### Phase 7: 自動知識獲得 & ユーザー適応 — **未着手**（条件付き可能）
 
@@ -508,7 +549,8 @@ Web 知識の非同期獲得と、ユーザー傾向の差分 LoRA 自動更新�
 | `blobs/` | ベース GGUF | 既存どおり |
 | `adapters/` | 差分モジュール | **実装済**（ディレクトリ + json/bin）；**バックアップ対象** |
 | `adapters/user_profile/` | 自動学習ユーザー LoRA | **未実装**（Phase 7） |
-| `data/train/`（リポ内） | `adapter create` 用ローカルコーパス | **規約 + gitignore**（非公開；XDG 外） |
+| `paths.train_dir`（ホーム） | `adapter create` / `train` 用非公開コーパス | **実装済**（既定 `<data_dir>/train`；`config_lpcllm`） |
+| `data/train/`（リポ内） | 開発用の残り場所のみ | **gitignore 保険** — 非公開データを置かない |
 | `cache/packs/.../layers.pack` | ベース層パック | 既存（名称は `layers.pack`、仕様の `base_layers.pack` 改名は未実施） |
 | `cache/packs/.../experts.pack` | MoE Expert パック | **実装済** |
 | `cache/knowledge/` | Web 取得ナレッジ | **未実装**（Phase 7） |
@@ -525,7 +567,10 @@ Web 知識の非同期獲得と、ユーザー傾向の差分 LoRA 自動更新�
 | `run … --project-map` | **未実装**（Phase 8） |
 | `adapter list` | **実装済** |
 | `adapter install-demo` | **実装済**（検証用） |
-| `adapter create …` | **実装済**（LoRA SFT → Phase 1 形式；コーパスは `data/train/` または `--from`） |
+| `config show\|init\|get\|example` | **実装済**（`config_lpcllm` のパス / 導入レイアウト） |
+| `adapter create …` | **実装済**（LoRA SFT → Phase 1 形式；`--from` は `train_dir` 解決） |
+| `train scratch|sft|dpo|export` | **実装済**（Phase 5 超小型学習 → GGUF → `run`） |
+| `job init|run|status|import|convert` | **実装済**（Phase 6 ブリッジ） |
 | `adapter auto-train` | **未実装**（Phase 7） |
 | `search` / `knowledge …` | **未実装**（Phase 7） |
 | `project-map build|status` | **未実装**（Phase 8） |
@@ -544,15 +589,16 @@ Web 知識の非同期獲得と、ユーザー傾向の差分 LoRA 自動更新�
 
 ## 5. 推奨する次工程
 
-1. **Phase 5** — 超小型 from-scratch + GGUF 出力 + ローカル SFT/DPO（テーマ内で完結）
-2. **Phase 7** — Web 知識獲得 → `user_profile` 自動学習・自動アタッチ（Phase 4 学習器を再利用可）
-3. **Phase 8** — `project-map` 索引 + `io_uring` オンデマンド引出 + `--project-map`
-4. **Phase 6** — フル基盤学習 / 数十億 GGUF / 本格 RLHF（外部計算とブリッジ）
+1. **Phase 7** — Web 知識獲得 → `user_profile` 自動学習・自動アタッチ（ログはユーザ `cache/` のみ）
+2. **Phase 8** — `project-map` 索引 + `io_uring` オンデマンド引出 + `--project-map`
+3. **Phase 6 フォロー** — `job.remote` / `$LPC_LLM_CONVERT_CMD` に実クラスタ・CUDA 変換を接続
+4. **（任意）** `install.mode = "system"` の `/etc/lpc-llm/config_lpcllm` を同梱するパッケージ化
 
 ---
 
 ## 6. 補足（仕様外だが実施済み）
 
 - [x] 日本語入力時の Backspace が UTF-8 バイト欠けする問題への対処（REPL を `rustyline` 化）
-- [x] 開発用 PATH 導入 `scripts/install-dev.sh`（symlink → `target/debug`）
-- [x] リポ規約: 非公開学習コーパスは `data/train/`（gitignore）、公開サンプルは `examples/train-sample.txt`
+- [x] 開発用 PATH 導入 `scripts/install-dev.sh`（symlink → `target/debug`；`config_lpcllm` の `bin_dir` 対応）
+- [x] 共有バイナリ導入 `scripts/install-system.sh`（バイナリのみ）
+- [x] プライバシー: 非公開コーパスは `train_dir`（ホーム/XDG）；リポ `data/train/` は gitignore 保険；公開サンプルは `examples/`

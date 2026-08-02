@@ -4,13 +4,16 @@ mod adapter;
 mod agent;
 mod catalog;
 mod commands;
+mod config;
 mod engine;
 mod error;
 mod hybrid;
 mod infer;
 mod io;
+mod job;
 mod pull;
 mod store;
+mod train;
 
 use std::process::ExitCode;
 
@@ -23,15 +26,14 @@ use commands::io_demo::IoArgs;
     name = "lpc-llm",
     about = "Local LLM runner (Ollama-style CUI) + hybrid NVMe prefetch I/O",
     long_about = "Pull and run quantized GGUF models via Candle (pure Rust).\n\
-                  Subcommands: list / pull / run / rm / show / adapter / prefetch / io.\n\
-                  Model blobs live under ~/.local/share/lpc-llm/blobs (durable);\n\
-                  adapters under ~/.local/share/lpc-llm/adapters;\n\
-                  engine packs under ~/.local/share/lpc-llm/cache (regenerable).\n\
-                  Engine upgrades reuse downloaded weights (e.g. gemma2:2b).\n\
-                  `run --hybrid` streams layers via io_uring double buffers.\n\
-                  `run --adapter <name>` binds a LoRA side-path (forces hybrid).\n\
-                  `run --agent` classifies intent with SmolLM2 then runs the main model.\n\
-                  `adapter create --from … --out … --base …` trains a LoRA delta (Phase 4)."
+                  Subcommands: list / pull / run / rm / show / adapter / train / job / config / …\n\
+                  Paths come from config_lpcllm (see `lpc-llm config show`).\n\
+                  Defaults: data under ~/.local/share/lpc-llm; private corpora under …/train;\n\
+                  binary under ~/.local/bin (user) or /usr/local/bin (system install).\n\
+                  Shared install ships the binary only; each user's data stays in their home.\n\
+                  `adapter create --from …` resolves files under train_dir when needed.\n\
+                  `train scratch|sft|dpo` creates tiny models / preference opts (Phase 5).\n\
+                  `job init|run|import|convert` bridges scale-up / RLHF stages (Phase 6)."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -86,6 +88,24 @@ enum Commands {
         cmd: AdapterCmd,
     },
 
+    /// Phase 5: tiny from-scratch / full SFT / DPO / GGUF export
+    Train {
+        #[command(subcommand)]
+        cmd: TrainCmd,
+    },
+
+    /// Phase 6: declarative jobs, import/convert, RLHF stage bridge
+    Job {
+        #[command(subcommand)]
+        cmd: JobCmd,
+    },
+
+    /// Show / init path settings (`config_lpcllm`)
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
+
     /// Map GGUF layers and benchmark io_uring ping-pong prefetch
     Prefetch {
         name: String,
@@ -113,7 +133,7 @@ enum AdapterCmd {
     List,
     /// Create a LoRA adapter from a local text / JSONL dataset (Phase 4)
     Create {
-        /// Training file (plain text lines, or `.jsonl` with `{"text":"..."}`)
+        /// Training file (cwd path, or bare name under train_dir from config_lpcllm)
         #[arg(long)]
         from: String,
         /// Output adapter name under `adapters/<name>/`
@@ -160,6 +180,159 @@ enum AdapterCmd {
         emb_dim: usize,
         #[arg(long, default_value_t = 8)]
         rank: usize,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TrainCmd {
+    /// Train a tiny Llama-family model from scratch → checkpoint (+ register GGUF)
+    Scratch {
+        #[arg(long)]
+        from: String,
+        /// Model name for registration, e.g. `tiny:demo`
+        #[arg(long)]
+        out: String,
+        #[arg(long, default_value_t = 64)]
+        steps: usize,
+        #[arg(long, default_value_t = 3e-3)]
+        lr: f64,
+        #[arg(long, default_value_t = 64)]
+        max_seq: usize,
+        #[arg(long, default_value_t = 1024)]
+        ram_mib: usize,
+        /// Recompute activations layer-by-layer (lower peak RAM)
+        #[arg(long, default_value_t = true)]
+        grad_checkpoint: bool,
+        #[arg(long, default_value_t = 128)]
+        n_embd: usize,
+        #[arg(long, default_value_t = 2)]
+        n_layers: usize,
+        #[arg(long, default_value_t = 4)]
+        n_heads: usize,
+        #[arg(long, default_value_t = 512)]
+        n_ff: usize,
+        /// Skip blobs/manifest registration
+        #[arg(long)]
+        no_register: bool,
+    },
+    /// Full fine-tune SFT continuing a tiny checkpoint
+    Sft {
+        /// Checkpoint dir or registered train name under cache/train/
+        #[arg(long)]
+        ckpt: String,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        out: String,
+        #[arg(long, default_value_t = 32)]
+        steps: usize,
+        #[arg(long, default_value_t = 1e-3)]
+        lr: f64,
+        #[arg(long, default_value_t = 64)]
+        max_seq: usize,
+        #[arg(long, default_value_t = 1024)]
+        ram_mib: usize,
+        #[arg(long, default_value_t = true)]
+        grad_checkpoint: bool,
+        #[arg(long)]
+        no_register: bool,
+    },
+    /// Lightweight preference optimization (DPO)
+    Dpo {
+        #[arg(long)]
+        ckpt: String,
+        /// JSONL with prompt/chosen/rejected
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        out: String,
+        #[arg(long, default_value_t = 32)]
+        steps: usize,
+        #[arg(long, default_value_t = 5e-4)]
+        lr: f64,
+        #[arg(long, default_value_t = 64)]
+        max_seq: usize,
+        #[arg(long, default_value_t = 1024)]
+        ram_mib: usize,
+        #[arg(long, default_value_t = 0.1)]
+        beta: f64,
+        #[arg(long, default_value_t = true)]
+        grad_checkpoint: bool,
+        #[arg(long)]
+        no_register: bool,
+    },
+    /// Export a tiny checkpoint to GGUF (optionally register)
+    Export {
+        #[arg(long)]
+        ckpt: String,
+        #[arg(long)]
+        out: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        register: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCmd {
+    /// Print resolved data_dir / train_dir / bin_dir
+    Show,
+    /// Write ~/.config/lpc-llm/config_lpcllm with documented defaults
+    Init {
+        /// Overwrite an existing user config
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print one resolved value (for install scripts): data_dir|train_dir|bin_dir|install.mode
+    Get {
+        key: String,
+    },
+    /// Print the default config_lpcllm text to stdout
+    Example,
+}
+
+#[derive(Debug, Subcommand)]
+enum JobCmd {
+    /// Write a declarative job JSON template
+    Init {
+        /// Template: scratch | sft | rlhf | remote
+        #[arg(long, default_value = "scratch")]
+        template: String,
+        #[arg(long, default_value = "job.json")]
+        out: String,
+    },
+    /// Run stages from a job config (local and/or remote.launch)
+    Run {
+        #[arg(long)]
+        config: String,
+        /// Skip remote.launch even if present
+        #[arg(long)]
+        local: bool,
+    },
+    /// Show job status.json
+    Status {
+        /// Job name or path to status.json
+        name: String,
+    },
+    /// Import an existing GGUF + tokenizer into blobs/manifest
+    Import {
+        #[arg(long)]
+        gguf: String,
+        #[arg(long)]
+        tokenizer: String,
+        #[arg(long)]
+        name: String,
+    },
+    /// Convert checkpoint / external HF tree → GGUF + register
+    Convert {
+        #[arg(long)]
+        from_dir: String,
+        #[arg(long)]
+        name: String,
+        /// builtin (Phase 5 ckpt) or external ($LPC_LLM_CONVERT_CMD)
+        #[arg(long, default_value = "builtin")]
+        backend: String,
     },
 }
 
@@ -224,6 +397,111 @@ fn main() -> ExitCode {
                 emb_dim,
                 rank,
             } => commands::cmd_adapter_install_demo(name, base, layers, emb_dim, rank),
+        },
+        Some(Commands::Train { cmd }) => match cmd {
+            TrainCmd::Scratch {
+                from,
+                out,
+                steps,
+                lr,
+                max_seq,
+                ram_mib,
+                grad_checkpoint,
+                n_embd,
+                n_layers,
+                n_heads,
+                n_ff,
+                no_register,
+            } => commands::cmd_train_scratch(commands::train::ScratchOpts {
+                from,
+                out,
+                steps,
+                lr,
+                max_seq,
+                ram_mib,
+                grad_checkpoint,
+                n_embd,
+                n_layers,
+                n_heads,
+                n_ff,
+                no_register,
+            }),
+            TrainCmd::Sft {
+                ckpt,
+                from,
+                out,
+                steps,
+                lr,
+                max_seq,
+                ram_mib,
+                grad_checkpoint,
+                no_register,
+            } => commands::cmd_train_sft(commands::train::SftOpts {
+                ckpt,
+                from,
+                out,
+                steps,
+                lr,
+                max_seq,
+                ram_mib,
+                grad_checkpoint,
+                no_register,
+            }),
+            TrainCmd::Dpo {
+                ckpt,
+                from,
+                out,
+                steps,
+                lr,
+                max_seq,
+                ram_mib,
+                beta,
+                grad_checkpoint,
+                no_register,
+            } => commands::cmd_train_dpo(commands::train::DpoOpts {
+                ckpt,
+                from,
+                out,
+                steps,
+                lr,
+                max_seq,
+                ram_mib,
+                beta,
+                grad_checkpoint,
+                no_register,
+            }),
+            TrainCmd::Export {
+                ckpt,
+                out,
+                name,
+                register,
+            } => commands::cmd_train_export(commands::train::ExportOpts {
+                ckpt,
+                out_gguf: out,
+                name,
+                register,
+            }),
+        },
+        Some(Commands::Job { cmd }) => match cmd {
+            JobCmd::Init { template, out } => commands::cmd_job_init(template, out),
+            JobCmd::Run { config, local } => commands::cmd_job_run(config, local),
+            JobCmd::Status { name } => commands::cmd_job_status(name),
+            JobCmd::Import {
+                gguf,
+                tokenizer,
+                name,
+            } => commands::cmd_job_import(gguf, tokenizer, name),
+            JobCmd::Convert {
+                from_dir,
+                name,
+                backend,
+            } => commands::cmd_job_convert(from_dir, name, backend),
+        },
+        Some(Commands::Config { cmd }) => match cmd {
+            ConfigCmd::Show => commands::cmd_config_show(),
+            ConfigCmd::Init { force } => commands::cmd_config_init(force),
+            ConfigCmd::Get { key } => commands::cmd_config_get(&key),
+            ConfigCmd::Example => commands::cmd_config_example(),
         },
         Some(Commands::Prefetch { name, pull }) => commands::cmd_prefetch(&name, pull),
         Some(Commands::Rm { name }) => commands::cmd_rm(&name),

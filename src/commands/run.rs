@@ -31,7 +31,7 @@ pub fn run(opts: RunOpts) -> Result<()> {
         None => select_model_name(&store)?,
     };
 
-    let entry = catalog::find(&name).ok_or_else(|| AppError::UnknownModel(name.clone()))?;
+    let (entry, installed) = resolve_run_model(&store, &name, opts.auto_pull)?;
 
     if opts.agent {
         let router_mib = agent::router_ram_hint_mib(&opts.agent_model);
@@ -61,33 +61,6 @@ pub fn run(opts: RunOpts) -> Result<()> {
             pull::pull_model(&store, &router_entry)?;
         }
     }
-
-    // Prefer durable blobs via resolve (no re-download after engine upgrade).
-    let installed = match store.resolve(&entry)? {
-        Some(m) => m,
-        None => {
-            if !opts.auto_pull {
-                let ok = Confirm::new()
-                    .with_prompt(format!(
-                        "`{name}` is not installed. Pull it now ({})?",
-                        entry.approx_size
-                    ))
-                    .default(true)
-                    .interact()
-                    .map_err(|e| AppError::msg(e.to_string()))?;
-                if !ok {
-                    return Err(AppError::NotInstalled(name));
-                }
-            } else {
-                eprintln!(
-                    "{} auto-pulling {} …",
-                    style("↓").cyan(),
-                    style(&name).bold()
-                );
-            }
-            pull::pull_model(&store, &entry)?
-        }
-    };
 
     let pack_cache = store.pack_cache_dir(&entry.name);
     let cfg = HybridConfig {
@@ -166,13 +139,59 @@ pub(crate) fn resolve_adapter(
     Ok((Some(set), cfg))
 }
 
+fn resolve_run_model(
+    store: &LocalStore,
+    name: &str,
+    auto_pull: bool,
+) -> Result<(catalog::ModelEntry, crate::store::InstalledModel)> {
+    if let Some(entry) = catalog::find(name) {
+        let installed = match store.resolve(&entry)? {
+            Some(m) => m,
+            None => {
+                if !auto_pull {
+                    let ok = Confirm::new()
+                        .with_prompt(format!(
+                            "`{name}` is not installed. Pull it now ({})?",
+                            entry.approx_size
+                        ))
+                        .default(true)
+                        .interact()
+                        .map_err(|e| AppError::msg(e.to_string()))?;
+                    if !ok {
+                        return Err(AppError::NotInstalled(name.to_string()));
+                    }
+                } else {
+                    eprintln!(
+                        "{} auto-pulling {} …",
+                        style("↓").cyan(),
+                        style(name).bold()
+                    );
+                }
+                pull::pull_model(store, &entry)?
+            }
+        };
+        return Ok((entry, installed));
+    }
+
+    // Locally trained / imported models live only in the manifest.
+    let installed = store.resolve_name(name)?.ok_or_else(|| {
+        AppError::UnknownModel(name.to_string())
+    })?;
+    let entry = catalog::entry_for_local(
+        &installed.name,
+        &installed.gguf_file,
+        &installed.tokenizer_repo,
+    );
+    Ok((entry, installed))
+}
+
 fn select_model_name(store: &LocalStore) -> Result<String> {
     let catalog = catalog::catalog();
     let installed = store.list_installed()?;
     let installed_set: std::collections::HashSet<_> =
         installed.iter().map(|m| m.name.clone()).collect();
 
-    let labels: Vec<String> = catalog
+    let mut labels: Vec<String> = catalog
         .iter()
         .map(|e| {
             let tag = if installed_set.contains(&e.name) {
@@ -183,6 +202,18 @@ fn select_model_name(store: &LocalStore) -> Result<String> {
             format!("{:<16} [{tag}]  {} ({})", e.name, e.display, e.approx_size)
         })
         .collect();
+    let mut names: Vec<String> = catalog.iter().map(|e| e.name.clone()).collect();
+
+    for m in &installed {
+        if catalog::find(&m.name).is_some() {
+            continue;
+        }
+        labels.push(format!(
+            "{:<16} [local]  trained/imported",
+            m.name
+        ));
+        names.push(m.name.clone());
+    }
 
     let idx = Select::new()
         .with_prompt("Select a model to run")
@@ -191,5 +222,5 @@ fn select_model_name(store: &LocalStore) -> Result<String> {
         .interact()
         .map_err(|e| AppError::msg(e.to_string()))?;
 
-    Ok(catalog[idx].name.clone())
+    Ok(names[idx].clone())
 }

@@ -1,8 +1,11 @@
 # Development workflow:
 #   1. Once:  ./scripts/install-dev.sh
 #      → ~/.local/bin/lpc-llm  ──symlink──►  <repo>/target/debug/lpc-llm
+#      (bin_dir from config_lpcllm / LPC_LLM_BIN_DIR)
 #   2. Daily: cargo build   (or cargo test / cargo run)
 #      → binary under target/debug updates; PATH `lpc-llm` follows automatically
+#   Shared machine binary (no user data): ./scripts/install-system.sh
 #
 # install-dev.sh always writes to <repo>/target (ignores ambient CARGO_TARGET_DIR).
 # Override with: LPC_LLM_TARGET_DIR=... ./scripts/install-dev.sh
+# Paths: lpc-llm config show  /  config_lpcllm.example

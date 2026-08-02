@@ -1,0 +1,3 @@
+{"prompt":"User: Say hello\nAssistant: ","chosen":"Hello! How can I help you today?","rejected":"asdf qwer zxcv"}
+{"prompt":"User: 2+2=\nAssistant: ","chosen":"4","rejected":"blue"}
+{"prompt":"User: Color of the sky?\nAssistant: ","chosen":"Blue.","rejected":"I refuse to answer."}
