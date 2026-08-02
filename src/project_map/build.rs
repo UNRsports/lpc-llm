@@ -266,7 +266,7 @@ fn materialize_map(
     let mut edges = Vec::new();
     let mut edge_set: BTreeSet<(u32, u32)> = BTreeSet::new();
     for fe in extracts {
-        for CallEdge { from, to, .. } in &fe.calls {
+        for CallEdge { from, to } in &fe.calls {
             let Some(&fid) = name_to_id.get(from) else {
                 continue;
             };

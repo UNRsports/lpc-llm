@@ -38,3 +38,7 @@ toml = { version = "0.8", features = ["parse", "display"] }
 [profile.release]
 lto = true
 codegen-units = 1
+
+# zigcc (user ~/.cargo/config.toml linker) emits a harmless deprecation note.
+[lints.rust]
+linker_messages = "allow"

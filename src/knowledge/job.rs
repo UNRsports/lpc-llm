@@ -37,7 +37,7 @@ impl SearchJobHandle {
 
     /// Block until the job finishes; returns chunks added.
     pub fn join(mut self) -> Result<usize> {
-        if let Some(h) = self.join.take() {
+        let result = if let Some(h) = self.join.take() {
             match h.join() {
                 Ok(r) => r,
                 Err(_) => Err(crate::error::AppError::msg("search job thread panicked")),
@@ -49,6 +49,15 @@ impl SearchJobHandle {
             } else {
                 Ok(st.added.unwrap_or(0))
             }
+        };
+        result
+    }
+}
+
+impl Drop for SearchJobHandle {
+    fn drop(&mut self) {
+        if let Some(h) = self.join.take() {
+            let _ = h.join();
         }
     }
 }

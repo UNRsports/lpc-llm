@@ -2,6 +2,7 @@
 
 use crate::error::Result;
 use crate::project_map::build::{DecodedNode, MapMeta};
+use crate::project_map::embed::{cosine, embed_from_i16, hash_embed};
 use crate::project_map::fetch::{fetch_nodes, ProjectMapReader};
 use crate::project_map::query::{select_nodes, QueryOpts};
 
@@ -36,7 +37,7 @@ pub fn synthesize_context(
     if ids.is_empty() {
         return Ok(String::new());
     }
-    let nodes = match fetch_nodes(reader, &ids) {
+    let mut nodes = match fetch_nodes(reader, &ids) {
         Ok(n) => n,
         Err(e) => {
             // Fallback: meta-only summary without DMA payloads.
@@ -44,6 +45,13 @@ pub fn synthesize_context(
             return Ok(synthesize_from_meta(&reader.meta, &ids, opts.max_chars));
         }
     };
+    // Re-rank fetched payloads by stored embedding vs the user query.
+    let q_emb = hash_embed(user_query);
+    nodes.sort_by(|a, b| {
+        let sa = cosine(&q_emb, &embed_from_i16(&a.embed));
+        let sb = cosine(&q_emb, &embed_from_i16(&b.embed));
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
     Ok(synthesize_from_decoded(
         &reader.meta,
         &ids,
@@ -67,12 +75,17 @@ fn synthesize_from_decoded(
     ));
 
     for n in nodes {
+        let detail = if n.preview.trim().is_empty() {
+            truncate(&n.signature, 120)
+        } else {
+            truncate(&n.preview, 120)
+        };
         let line = format!(
             "- {} @ {}:{} — {}\n  deps: {}\n",
             n.name,
             n.file,
             n.line,
-            truncate(&n.signature, 120),
+            detail,
             neighbor_names(meta, find_id_by_name(meta, &n.name), 4)
         );
         if out.len() + line.len() > max_chars {

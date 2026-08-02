@@ -16,7 +16,6 @@ pub enum Lang {
     TypeScript,
     Go,
     CFamily,
-    Other,
 }
 
 #[derive(Debug, Clone)]
@@ -47,14 +46,11 @@ pub enum SymbolKind {
 pub struct CallEdge {
     pub from: String,
     pub to: String,
-    pub file: PathBuf,
-    pub line: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct FileExtract {
     pub path: PathBuf,
-    pub lang: Lang,
     pub symbols: Vec<Symbol>,
     pub calls: Vec<CallEdge>,
     pub mtime_unix: u64,
@@ -125,7 +121,6 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<FileExtract>) -> Result<()> {
             .unwrap_or(0);
         out.push(FileExtract {
             path: rel,
-            lang,
             symbols,
             calls,
             mtime_unix,
@@ -165,7 +160,6 @@ fn extract_file(file: &Path, lang: Lang, text: &str) -> (Vec<Symbol>, Vec<CallEd
             Lang::JavaScript | Lang::TypeScript => parse_js_symbol(file, line_no, trimmed),
             Lang::Go => parse_go_symbol(file, line_no, trimmed),
             Lang::CFamily => parse_c_symbol(file, line_no, trimmed),
-            Lang::Other => None,
         } {
             if matches!(sym.kind, SymbolKind::Function | SymbolKind::Method) {
                 current_fn = Some(sym.name.clone());
@@ -181,8 +175,6 @@ fn extract_file(file: &Path, lang: Lang, text: &str) -> (Vec<Symbol>, Vec<CallEd
                 calls.push(CallEdge {
                     from: from.clone(),
                     to,
-                    file: file.to_path_buf(),
-                    line: line_no,
                 });
             }
         }

@@ -60,10 +60,10 @@ impl ProjectMapReader {
 
         Ok(Self { dir, meta, backend })
     }
+}
 
-    pub fn node_meta(&self, id: u32) -> Option<&NodeMeta> {
-        self.meta.nodes.iter().find(|n| n.id == id)
-    }
+fn lookup_node<'a>(meta: &'a MapMeta, id: u32) -> Option<&'a NodeMeta> {
+    meta.nodes.iter().find(|n| n.id == id)
 }
 
 /// Prefetch selected node records (io_uring when available) and decode them.
@@ -83,7 +83,7 @@ fn fetch_direct(
     let mut out = Vec::with_capacity(ids.len());
     let n_slots = ring.len();
     for (i, id) in ids.iter().enumerate() {
-        let Some(node) = meta.nodes.iter().find(|n| n.id == *id).cloned() else {
+        let Some(node) = lookup_node(meta, *id).cloned() else {
             continue;
         };
         if node.offset % DIRECT_ALIGN as u64 != 0 {
@@ -115,7 +115,7 @@ fn fetch_nodes_buffered(dir: &Path, meta: &MapMeta, ids: &[u32]) -> Result<Vec<D
     let mut f = File::open(dir.join("map.bin"))?;
     let mut out = Vec::new();
     for id in ids {
-        let Some(n) = meta.nodes.iter().find(|x| x.id == *id) else {
+        let Some(n) = lookup_node(meta, *id) else {
             continue;
         };
         f.seek(SeekFrom::Start(n.offset))?;

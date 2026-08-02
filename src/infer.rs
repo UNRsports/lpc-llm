@@ -374,10 +374,31 @@ impl ChatSession {
         let Some(dir) = self.knowledge_dir.clone() else {
             return;
         };
-        // Avoid stacking jobs.
-        if let Some(ref h) = self.pending_search {
-            if !h.status().done {
+        // Avoid stacking jobs; join a finished handle so results / errors surface.
+        if let Some(h) = self.pending_search.take() {
+            let st = h.status();
+            if !st.done {
+                self.pending_search = Some(h);
                 return;
+            }
+            match h.join() {
+                Ok(n) => {
+                    if n > 0 {
+                        eprintln!(
+                            "{} background search `{}` added {} chunk(s)",
+                            style("·").cyan(),
+                            st.query,
+                            n
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "{} background search `{}` failed: {e}",
+                        style("·").cyan(),
+                        st.query
+                    );
+                }
             }
         }
         eprintln!(
