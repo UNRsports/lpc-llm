@@ -130,6 +130,9 @@ struct LayerLive {
     ffn_norm: Norm,
     post_attention_norm: Option<Norm>,
     post_ffw_norm: Option<Norm>,
+    /// Gemma 3 QK-Norm (per-head dim).
+    attn_q_norm: Option<Norm>,
+    attn_k_norm: Option<Norm>,
     ff: FeedForward,
 }
 
@@ -144,9 +147,13 @@ pub struct HybridEngine {
     output: QMatMul,
     cos: Tensor,
     sin: Tensor,
+    /// Gemma 3 local-attention RoPE (period-local layers); falls back to `cos`/`sin`.
+    cos_local: Option<Tensor>,
+    sin_local: Option<Tensor>,
     neg_inf: Tensor,
     kv_cache: Vec<Option<(Tensor, Tensor)>>,
-    masks: HashMap<usize, Tensor>,
+    /// Masks keyed by `(seq_len, window)` where `window == 0` means full causal.
+    masks: HashMap<(usize, usize), Tensor>,
     buffers: PrefetchBufferManager,
     reader: AsyncNvmeReader,
     /// MoE expert pack + DMA ring (absent on dense models).
@@ -288,8 +295,45 @@ impl HybridEngine {
 
         let (cos, sin) =
             precompute_rope(map.head_dim.max(map.rope_dim), map.rope_freq_base, &device)?;
+        let (cos_local, sin_local) = if map.is_gemma3() {
+            let local_base = map.rope_freq_base_local.unwrap_or(10_000.0);
+            let (c, s) =
+                precompute_rope(map.head_dim.max(map.rope_dim), local_base, &device)?;
+            (Some(c), Some(s))
+        } else {
+            (None, None)
+        };
         let neg_inf = Tensor::new(f32::NEG_INFINITY, &device)?;
         let n_layers = packed.layers.len();
+
+        if map.has_vision_tensors() {
+            eprintln!(
+                "warning: GGUF includes vision/projector tensors — Phase 11 text-only; \
+                 image input is not implemented (language weights still run)"
+            );
+        }
+        if map.is_gemma3() {
+            let n_local = map.layer_is_sliding.iter().filter(|&&s| s).count();
+            let n_global = n_layers.saturating_sub(n_local);
+            eprintln!(
+                "gemma3: sliding_window={:?} pattern={} local_layers={n_local} global_layers={n_global} \
+                 rope_global={} rope_local={}",
+                map.sliding_window,
+                if map.sliding_window_pattern >= 2 {
+                    map.sliding_window_pattern
+                } else {
+                    6
+                },
+                map.rope_freq_base,
+                map.rope_freq_base_local.unwrap_or(10_000.0)
+            );
+            if n_layers >= 40 {
+                eprintln!(
+                    "hint: gemma3 large — prefer `--ram-mib 16384`+ (or `--hot-layers N`) so \
+                     fewer layers stream from NVMe; ctx capped at {MAX_SEQ_LEN} for this build"
+                );
+            }
+        }
 
         let mut lora = vec![LayerLora::default(); n_layers];
         if let Some(set) = adapter {
@@ -344,7 +388,13 @@ impl HybridEngine {
             );
         }
         if let Some(sw) = map.sliding_window {
-            eprintln!("hybrid: sliding_window={sw} (short prompts use full causal mask)");
+            if map.is_gemma3() {
+                eprintln!(
+                    "hybrid: sliding_window={sw} (Gemma3 local layers; global layers use full causal)"
+                );
+            } else {
+                eprintln!("hybrid: sliding_window={sw} (short prompts use full causal mask)");
+            }
         }
 
         Ok(Self {
@@ -356,6 +406,8 @@ impl HybridEngine {
             output,
             cos,
             sin,
+            cos_local,
+            sin_local,
             neg_inf,
             kv_cache: vec![None; n_layers],
             masks: HashMap::new(),
@@ -542,11 +594,6 @@ impl HybridEngine {
     /// Hidden states after `output_norm`, shape `[B, T, C]`.
     fn forward_hidden(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         let (_b, seq_len) = x.dims2()?;
-        let mask = if seq_len == 1 {
-            None
-        } else {
-            Some(self.mask(seq_len)?)
-        };
 
         let mut xs = self.embeddings.forward(x)?;
         // Gemma/Gemma2: scale embeddings by √hidden.
@@ -565,6 +612,13 @@ impl HybridEngine {
         }
 
         for i in 0..n {
+            // Per-layer mask: Gemma3 local layers use sliding-window+causal.
+            let mask = if seq_len == 1 {
+                None
+            } else {
+                Some(self.mask_for_layer(i, seq_len)?)
+            };
+
             if i < self.hot_count {
                 // Resident path — no I/O.
                 // Safety: temporarily take layer, run, put back.
@@ -813,6 +867,8 @@ impl HybridEngine {
         let n_head = self.map.head_count;
         let n_kv = self.map.head_count_kv;
         let head_dim = self.map.head_dim;
+        let sliding = self.map.layer_sliding(layer_idx);
+        let window = self.map.sliding_window.unwrap_or(0);
 
         let (q, k, v) = {
             let lora = self.lora.get(layer_idx);
@@ -822,11 +878,11 @@ impl HybridEngine {
             (q, k, v)
         };
 
-        let q = q
+        let mut q = q
             .reshape((b_sz, seq_len, n_head, head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
-        let k = k
+        let mut k = k
             .reshape((b_sz, seq_len, n_kv, head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
@@ -835,22 +891,26 @@ impl HybridEngine {
             .transpose(1, 2)?
             .contiguous()?;
 
-        let q = apply_rope(
-            &q,
-            &self.cos,
-            &self.sin,
-            index_pos,
-            self.map.is_gemma_family(),
-        )?;
-        let k = apply_rope(
-            &k,
-            &self.cos,
-            &self.sin,
-            index_pos,
-            self.map.is_gemma_family(),
-        )?;
+        // Gemma 3: QK-Norm before RoPE (replaces Gemma 2 attn softcap).
+        if let Some(n) = &layer.attn_q_norm {
+            q = n.forward(&q)?;
+        }
+        if let Some(n) = &layer.attn_k_norm {
+            k = n.forward(&k)?;
+        }
 
-        let (k, v) = match &self.kv_cache[layer_idx] {
+        let (rope_cos, rope_sin) = if sliding {
+            (
+                self.cos_local.as_ref().unwrap_or(&self.cos),
+                self.sin_local.as_ref().unwrap_or(&self.sin),
+            )
+        } else {
+            (&self.cos, &self.sin)
+        };
+        let q = apply_rope(&q, rope_cos, rope_sin, index_pos, self.map.is_gemma_family())?;
+        let k = apply_rope(&k, rope_cos, rope_sin, index_pos, self.map.is_gemma_family())?;
+
+        let (mut k, mut v) = match &self.kv_cache[layer_idx] {
             None => (k, v),
             Some((_kc, _vc)) if index_pos == 0 => (k, v),
             Some((kc, vc)) => {
@@ -859,12 +919,23 @@ impl HybridEngine {
                 (k, v)
             }
         };
+
+        // Gemma 3 local layers: keep only the last `window` KV positions.
+        if sliding && window > 0 {
+            let kv_len = k.dim(2)?;
+            if kv_len > window {
+                let start = kv_len - window;
+                k = k.narrow(2, start, window)?;
+                v = v.narrow(2, start, window)?;
+            }
+        }
         self.kv_cache[layer_idx] = Some((k.clone(), v.clone()));
 
         let k = repeat_kv(k, n_head / n_kv.max(1))?;
         let v = repeat_kv(v, n_head / n_kv.max(1))?;
 
         let mut att = (q.matmul(&k.t()?)? / (head_dim as f64).sqrt())?;
+        // Gemma 2 softcap only when present (Gemma 3 uses QK-Norm instead).
         if let Some(sc) = self.map.attn_logit_softcapping {
             att = ((att / sc)?.tanh()? * sc)?;
         }
@@ -885,15 +956,33 @@ impl HybridEngine {
         qmm(&self.compute, &layer.wo, lora.and_then(|l| l.o.as_ref()), &y)
     }
 
-    fn mask(&mut self, t: usize) -> Result<Tensor> {
-        if let Some(m) = self.masks.get(&t) {
+    fn mask_for_layer(&mut self, layer_idx: usize, t: usize) -> Result<Tensor> {
+        let window = if self.map.layer_sliding(layer_idx) {
+            self.map.sliding_window.unwrap_or(0)
+        } else {
+            0
+        };
+        self.mask(t, window)
+    }
+
+    /// Causal mask; when `window > 0`, also mask keys outside the sliding window.
+    /// Mask value `1` means "masked out" (filled with -inf).
+    fn mask(&mut self, t: usize, window: usize) -> Result<Tensor> {
+        let key = (t, window);
+        if let Some(m) = self.masks.get(&key) {
             return Ok(m.clone());
         }
         let mask: Vec<_> = (0..t)
-            .flat_map(|i| (0..t).map(move |j| u8::from(j > i)))
+            .flat_map(|i| {
+                (0..t).map(move |j| {
+                    let future = j > i;
+                    let out_of_window = window > 0 && i >= window && j + window <= i;
+                    u8::from(future || out_of_window)
+                })
+            })
             .collect();
         let mask = Tensor::from_slice(&mask, (t, t), &self.device)?;
-        self.masks.insert(t, mask.clone());
+        self.masks.insert(key, mask.clone());
         Ok(mask)
     }
 
@@ -1004,6 +1093,8 @@ fn build_layer_live(
         ffn_norm: Norm::from_qtensor(q("ffn_norm.weight")?, map.rms_norm_eps)?,
         post_attention_norm: opt_norm("post_attention_norm.weight")?,
         post_ffw_norm: opt_norm("post_ffw_norm.weight")?,
+        attn_q_norm: opt_norm("attn_q_norm.weight")?,
+        attn_k_norm: opt_norm("attn_k_norm.weight")?,
         ff,
     })
 }

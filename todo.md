@@ -51,6 +51,7 @@ Last updated: 2026-08-03
 | Extension / Phase 8 | NVMe-resident project-map & overview memory | **Done** (conditionally feasible) |
 | Extension / Phase 9 | Compute device selection + Candle-stack Vulkan offload | **Done** (first landing) |
 | Extension / Phase 10 | Vulkan real speedup (quantized shaders + VRAM-resident hot weights) | **In progress** (Q4_K GEMV + VRAM cache) |
+| Extension / Phase 11 | Gemma 3 largest (27B) hybrid **text** run | **Done** (text hybrid verified) |
 
 **Available now:**  
 `lpc-llm run <model> --adapter <name>` (Hybrid LoRA),  
@@ -63,9 +64,10 @@ Last updated: 2026-08-03
 `lpc-llm project-map build|status|rebuild` / `run --project-map` / `--knowledge` / `--no-user-profile` (Phase 7–8),  
 On MoE GGUF: `experts.pack` + Top-K expert DMA (hybrid).  
 `lpc-llm setup` / `run --device` (Phase 9; Vulkan first landing — often **not** faster than CPU yet).  
-**Not available yet:** multi-GPU PPO in-process; optional hot-swap / inotify watch / 16GB regression bench; Phase 10 quantized Vulkan GEMV.  
+**Not available yet:** Gemma 3 27B hybrid text run (Phase 11); vision/multimodal; multi-GPU PPO in-process; optional hot-swap / inotify watch / 16GB regression bench.  
 **Phase 9 (landing):** setup → `[ui]`/`[runtime]` in home `config_lpcllm`; Vulkan path today = CPU dequant + f32 GEMM + H2D/D2H (GPU busy, decode often slower than `--device cpu`).  
-**Phase 10 (next):** GPU-side Q4_K-class dequant+GEMV; VRAM-resident hot quantized weights; CPU baseline for A/B.
+**Phase 10 (parallel):** GPU-side Q4_K dequant+GEMV; VRAM-resident hot weights; CPU baseline for A/B (can finish alongside Phase 11).  
+**Phase 11 (next pillar):** Gemma 3 **27B** instruct via `--hybrid` (text-only success criteria; **verify 27B first**, smaller sizes only if needed to debug).
 
 ---
 
@@ -299,6 +301,44 @@ Phase 9 proves the Vulkan path and may show GPU utilization, but decode often fe
 - [x] Remove hard `hot≤8` cap so `--ram-mib` can pin all layers of small models (biggest TTFT win for gemma2:2b)
 - [ ] Optional: warn at startup when residual non-Q4_K tensors dominate the model
 
+### Phase 11: Gemma 3 largest (27B) hybrid text run — **Done** (text hybrid verified)
+
+Prove the project theme on a **dense** multi-billion model: run Gemma 3 Instruct **27B** (Q4-class GGUF) with RAM + NVMe layer-pack hybrid, without loading the full weight set into RAM.  
+**Success:** `lpc-llm run gemma3:27b --hybrid` completes **text** chat on a home/workstation RAM budget.  
+**Out of success criteria:** image input / vision encoder (optional leftover or later phase).  
+**Deps:** existing hybrid pack + io_uring; Gemma2 path as baseline; Phase 10 optional for speed.
+
+#### 11.1 Catalog + prompt
+
+- [x] Catalog entries: `gemma3:4b`, `gemma3:12b`, `gemma3:27b` (HF GGUF + tokenizer)
+- [x] Confirm `PromptStyle::Gemma` (`<start_of_turn>` / `<end_of_turn>`) works for Gemma 3 IT
+- [x] Document approx size / `--ram-mib` hints for 27B Q4 (~15–20 GB weights; stream layers)
+
+#### 11.2 GGUF / architecture (vs Gemma 2)
+
+- [x] Parse `gemma3` metadata: sliding window, **sliding_window_pattern** (5 local : 1 global), dual RoPE bases (local vs global)
+- [x] Materialize **attn_q_norm** / **attn_k_norm**; keep post-attn / post-ffw norms
+- [x] Per-layer attention: local SWA mask + KV trim vs global full causal; no Gemma2-style attn softcap when absent
+- [x] Soft-fail clearly if multimodal projector tensors are present but vision path is not implemented
+
+#### 11.3 Hybrid memory for 27B
+
+- [x] Layer pack + hot selection fit 27B Q4 under `--ram-mib` (stream non-hot; embeddings / norms / lm_head resident)
+- [x] KV / context budget coherent with rope table length and RAM hint (first landing may cap ctx below 128K)
+- [x] Startup hints when `stream > 0` (already present) and recommended `--ram-mib` for 27B
+
+#### 11.4 Verification (27B-first)
+
+- [x] **`gemma3:27b --hybrid` text dialogue** (phase exit criterion; start here)
+- [ ] (Optional) `gemma3:4b` / `12b` smoke only if 27B debug needs a smaller repro
+- [ ] (Optional) Vision / multimodal Gemma 3 — deferred
+
+#### 11.5 Quant / compute notes
+
+- [x] Q4_K_M path preferred; Q4_0 QAT falls back to Candle CPU MatMul (Phase 10 is Q4_K-first)
+- [x] Bump `tokenizers` to 0.21 so Gemma 3 `tokenizer.json` (array merges) loads
+- [ ] (Optional) A/B `--device cpu` vs `vulkan` on 4B after Phase 10
+
 ---
 
 ## 4. Spec section status
@@ -349,17 +389,19 @@ Phase 9 proves the Vulkan path and may show GPU utilization, but decode often fe
 | project-map node `io_uring` prefetch | **Implemented** (`map.bin` + `PrefetchRing`; buffered fallback) |
 | Vulkan QMatMul offload (Candle stack) | **Implemented** (Phase 9; ash + SPIR-V; CPU fallback; often slower than CPU decode) |
 | Vulkan Q4_K-class dequant+GEMV + VRAM hot weights | **In progress** (Phase 10; Q4_K shader + Arc cache; other dtypes → CPU) |
+| Gemma 3 27B hybrid text run | **Done** (Phase 11; text hybrid verified) |
 | ΔW merge at CQE (weight rewrite) | Not adopted (side-path policy) |
 
 ---
 
 ## 5. Recommended next steps
 
-1. **Phase 10** — GPU-side Q4_K dequant+GEMV; VRAM-resident hot quantized weights; A/B vs `--device cpu` (see checklist §Phase 10)
-2. **Phase 6 follow-ups** — Wire real cluster launchers / CUDA backends into `job.remote` and `$LPC_LLM_CONVERT_CMD`
-3. **(Optional)** In-process adapter hot-reload / mid-chat hot-swap (Phase 1 + 7.3 leftovers)
-4. **(Optional)** Distro / package install that ships system `config_lpcllm` with `install.mode = "system"`
-5. **(Optional)** project-map 16GB-scale regression bench / inotify incremental watch
+1. **Phase 11** — Gemma 3 **27B** hybrid text run (catalog → SWA/QK-norm/dual RoPE → **verify 27B first**; see checklist §Phase 11)
+2. **Phase 10** — Finish remaining Vulkan Q4_K polish in parallel (microbench path already landed; streamed-layer VRAM optional)
+3. **Phase 6 follow-ups** — Wire real cluster launchers / CUDA backends into `job.remote` and `$LPC_LLM_CONVERT_CMD`
+4. **(Optional)** In-process adapter hot-reload / mid-chat hot-swap (Phase 1 + 7.3 leftovers)
+5. **(Optional)** Distro / package install that ships system `config_lpcllm` with `install.mode = "system"`
+6. **(Optional)** project-map 16GB-scale regression bench / inotify incremental watch; Gemma 3 vision
 
 ---
 
@@ -404,6 +446,7 @@ Phase 9 proves the Vulkan path and may show GPU utilization, but decode often fe
 | 拡張 / Phase 8 | NVMe 常駐 project-map & 俯瞰記憶 | **完了**（条件付き可能） |
 | 拡張 / Phase 9 | 計算デバイス選択 + Candle スタック Vulkan オフロード | **完了**（第一到達） |
 | 拡張 / Phase 10 | Vulkan 本格高速化（量子化シェーダ + VRAM ホット重み常駐） | **進行中**（Q4_K GEMV + VRAM キャッシュ） |
+| 拡張 / Phase 11 | Gemma 3 最大版（27B）hybrid **テキスト**実行 | **完了**（テキスト hybrid 検証済） |
 
 **いま使えるもの:**  
 `lpc-llm run <model> --adapter <name>`（Hybrid LoRA）、  
@@ -416,9 +459,10 @@ Phase 9 proves the Vulkan path and may show GPU utilization, but decode often fe
 `lpc-llm project-map` / `run --project-map` / `--knowledge` / `--no-user-profile`（Phase 7–8）、  
 MoE GGUF では `experts.pack` + Top-K Expert DMA（hybrid）。  
 `lpc-llm setup` / `run --device`（Phase 9；Vulkan 第一到達 — 現状 CPU より速くないことが多い）。  
-**まだ使えないもの:** プロセス内マルチ GPU PPO；任意のホットスワップ / inotify 監視 / 16GB 回帰ベンチ；Phase 10 量子化 Vulkan GEMV。  
+**まだ使えないもの:** Gemma 3 27B hybrid テキスト実行（Phase 11）；vision/マルチモーダル；プロセス内マルチ GPU PPO；任意のホットスワップ / inotify 監視 / 16GB 回帰ベンチ。  
 **Phase 9（到達）:** setup → ホーム `config_lpcllm` の `[ui]`/`[runtime]`；現行 Vulkan = CPU dequant + f32 GEMM + 転送（GPU は忙しいがデコードは `--device cpu` より遅いことが多い）。  
-**Phase 10（次）:** GPU 側 Q4_K 系 dequant+GEMV；ホット層量子化重みの VRAM 常駐；CPU との A/B 比較。
+**Phase 10（並行）:** GPU 側 Q4_K 系 dequant+GEMV；ホット層量子化重みの VRAM 常駐；CPU との A/B（Phase 11 と並行完了可）。  
+**Phase 11（次の柱）:** Gemma 3 **27B** Instruct を `--hybrid` でテキスト実行（成功条件はテキストのみ；**検証は 27B から開始**、小サイズは不具合切り分け時のみ）。
 
 ---
 
@@ -648,7 +692,47 @@ Phase 9 で Vulkan 経路と GPU 使用率は確認できるが、デコード�
 
 - [x] 10.1–10.2 完了まで **`--device cpu` の方が速い可能性**があることを文書化；比較基準として使う
 - [x] 単体 A/B: CPU 参照 GEMV vs Vulkan Q4_K（`q4k_gpu_matches_cpu_when_vulkan_available`）
+- [x] 起動時 GEMV マイクロベンチ: GPU が遅ければ Candle CPU を優先；スクラッチバッファ再利用
+- [x] hot≤8 ハード上限を撤廃（小モデルで `--ram-mib` が効くように）
 - [ ] （任意）非 Q4_K テンソルが支配的なときの起動警告
+
+### Phase 11: Gemma 3 最大版（27B）hybrid テキスト実行 — **完了**（テキスト hybrid 検証済）
+
+テーマ実証: **dense** な数十億パラメータを、全重みを RAM に載せず RAM + NVMe 層パック hybrid で動かす。対象は Gemma 3 Instruct **27B**（Q4 系 GGUF）。  
+**成功条件:** `lpc-llm run gemma3:27b --hybrid` で家庭用〜ワークステーション RAM 予算の **テキスト**対話が完走すること。  
+**成功条件外:** 画像入力 / vision encoder（任意残り、または後続フェーズ）。  
+**依存:** 既存 hybrid pack + io_uring；Gemma2 経路をベース；速度は Phase 10 と並行可。
+
+#### 11.1 カタログ + プロンプト
+
+- [x] カタログ: `gemma3:4b` / `gemma3:12b` / `gemma3:27b`（HF GGUF + tokenizer）
+- [x] `PromptStyle::Gemma`（`<start_of_turn>` / `<end_of_turn>`）が Gemma 3 IT で使えることを確認
+- [x] 27B Q4 の概算サイズ / `--ram-mib` ヒントを文書化（重み ~15–20 GB；層ストリーム）
+
+#### 11.2 GGUF / アーキ（Gemma 2 との差分）
+
+- [x] `gemma3` メタデータ: sliding window、**sliding_window_pattern**（局所5 : 大域1）、二重 RoPE（local / global）
+- [x] **attn_q_norm** / **attn_k_norm** の materialize；post-attn / post-ffw norm は既存を維持
+- [x] 層ごとの attention: 局所 SWA マスク + KV trim vs 大域フル causal；attn softcap が無い場合は掛けない
+- [x] multimodal projector があるが vision 未実装のとき、明確にソフト失敗 / 警告
+
+#### 11.3 27B 向け Hybrid メモリ
+
+- [x] 層パック + hot 選定が 27B Q4 と `--ram-mib` で成立（非ホットはストリーム；emb / norm / lm_head 常駐）
+- [x] KV / コンテキスト予算を RoPE 表長・RAM ヒントと整合（第一到達では 128K 未満キャップ可）
+- [x] `stream > 0` 時ヒント（既存）と 27B 向け推奨 `--ram-mib`
+
+#### 11.4 検証（27B 優先）
+
+- [x] **`gemma3:27b --hybrid` テキスト対話**（フェーズ完了条件；ここから開始）
+- [ ] （任意）`gemma3:4b` / `12b` スモークは 27B の不具合切り分け時のみ
+- [ ] （任意）Vision / マルチモーダル Gemma 3 — 後回し
+
+#### 11.5 量子化 / 計算メモ
+
+- [x] Q4_K_M を推奨；Q4_0 QAT は Candle CPU MatMul へフォールバック（Phase 10 は Q4_K 優先）
+- [x] Gemma 3 `tokenizer.json`（配列 merges）読込のため `tokenizers` を 0.21 へ更新
+- [ ] （任意）4B で `--device cpu` vs `vulkan` の A/B（Phase 10 後）
 
 ---
 
@@ -700,17 +784,19 @@ Phase 9 で Vulkan 経路と GPU 使用率は確認できるが、デコード�
 | project-map ノード単位 `io_uring` プレフェッチ | **実装済**（`map.bin` + `PrefetchRing`；バッファド可） |
 | Vulkan QMatMul オフロード（Candle スタック） | **実装済**（Phase 9；ash + SPIR-V；CPU フォールバック；デコードは CPU より遅いことが多い） |
 | Vulkan Q4_K 系 dequant+GEMV + VRAM ホット重み | **進行中**（Phase 10；Q4_K シェーダ + Arc キャッシュ；他 dtype → CPU） |
+| Gemma 3 27B hybrid テキスト実行 | **完了**（Phase 11；テキスト hybrid 検証済） |
 | CQE 時の ΔW マージ（重み書き換え） | 採用せず（サイドパス方針） |
 
 ---
 
 ## 5. 推奨する次工程
 
-1. **Phase 10** — GPU 側 Q4_K dequant+GEMV；ホット層量子化重みの VRAM 常駐；`--device cpu` との A/B（工程 §Phase 10）
-2. **Phase 6 フォロー** — `job.remote` / `$LPC_LLM_CONVERT_CMD` に実クラスタ・CUDA 変換を接続
-3. **（任意）** プロセス内アダプタホットリロード / 会話途中ホットスワップ（Phase 1 + 7.3 残り）
-4. **（任意）** `install.mode = "system"` の `/etc/lpc-llm/config_lpcllm` を同梱するパッケージ化
-5. **（任意）** project-map 16GB 級回帰ベンチ / inotify 差分監視
+1. **Phase 11** — Gemma 3 **27B** hybrid テキスト実行（カタログ → SWA/QK-norm/二重 RoPE → **27B から検証**；工程 §Phase 11）
+2. **Phase 10** — Vulkan Q4_K の残りを並行で仕上げ（マイクロベンチ経路は到達済；ストリーム層 VRAM は任意）
+3. **Phase 6 フォロー** — `job.remote` / `$LPC_LLM_CONVERT_CMD` に実クラスタ・CUDA 変換を接続
+4. **（任意）** プロセス内アダプタホットリロード / 会話途中ホットスワップ（Phase 1 + 7.3 残り）
+5. **（任意）** `install.mode = "system"` の `/etc/lpc-llm/config_lpcllm` を同梱するパッケージ化
+6. **（任意）** project-map 16GB 級回帰ベンチ / inotify 差分監視；Gemma 3 vision
 
 ---
 

@@ -157,6 +157,9 @@ config_lpcllm.example
 |------|------|------------|--------|
 | `smollm2:360m` | SmolLM2 360M Instruct Q4_K_M | ~260 MB | enable with `--hybrid` |
 | `gemma2:2b` | Gemma 2 2B Instruct Q4_K_M | ~1.7 GB | **hybrid by default** |
+| `gemma3:4b` | Gemma 3 4B Instruct Q4_K_M | ~2.5 GB | hybrid (Phase 11 ladder) |
+| `gemma3:12b` | Gemma 3 12B Instruct Q4_K_M | ~7.3 GB | hybrid |
+| `gemma3:27b` | Gemma 3 27B Instruct Q4_K_M | ~16.5 GB | **Phase 11 target** (`--hybrid`, raise `--ram-mib`) |
 | `qwen2.5:1.5b` | Qwen2.5 1.5B Instruct Q4_K_M | ~1.1 GB | enable with `--hybrid` |
 | `phi3:mini` | Phi-3 Mini 4K Instruct Q4_K_M | ~2.2 GB | enable with `--hybrid` |
 
@@ -673,6 +676,9 @@ config_lpcllm.example
 |------|------|------------|--------|
 | `smollm2:360m` | SmolLM2 360M Instruct Q4_K_M | ~260 MB | `--hybrid` で有効 |
 | `gemma2:2b` | Gemma 2 2B Instruct Q4_K_M | ~1.7 GB | **既定で hybrid** |
+| `gemma3:4b` | Gemma 3 4B Instruct Q4_K_M | ~2.5 GB | hybrid（Phase 11 ラダー） |
+| `gemma3:12b` | Gemma 3 12B Instruct Q4_K_M | ~7.3 GB | hybrid |
+| `gemma3:27b` | Gemma 3 27B Instruct Q4_K_M | ~16.5 GB | **Phase 11 目標**（`--hybrid`、`--ram-mib` を上げる） |
 | `qwen2.5:1.5b` | Qwen2.5 1.5B Instruct Q4_K_M | ~1.1 GB | `--hybrid` で有効 |
 | `phi3:mini` | Phi-3 Mini 4K Instruct Q4_K_M | ~2.2 GB | `--hybrid` で有効 |
 

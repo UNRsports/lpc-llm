@@ -59,7 +59,7 @@ pub fn build_char_tokenizer(texts: &[String], path: impl AsRef<Path>) -> Result<
         false,
     )
     .map_err(|e| AppError::msg(format!("char split pre-tokenizer: {e}")))?;
-    tokenizer.with_pre_tokenizer(split);
+    tokenizer.with_pre_tokenizer(Some(split));
 
     tokenizer.add_special_tokens(&[
         AddedToken::from(UNK, true),

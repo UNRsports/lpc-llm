@@ -68,6 +68,13 @@ pub struct GgufLayerMap {
     /// Final logit softcap (Gemma2); `None` = disabled.
     pub final_logit_softcapping: Option<f64>,
     pub sliding_window: Option<usize>,
+    /// Gemma 3: period of local/global interleave (e.g. 6 ⇒ 5 local + 1 global).
+    /// `0` means unused (non-gemma3 or explicit per-layer vector only).
+    pub sliding_window_pattern: usize,
+    /// Per-layer: `true` = local sliding-window attention (Gemma 3).
+    pub layer_is_sliding: Vec<bool>,
+    /// Local-attention RoPE base (Gemma 3); `None` ⇒ reuse `rope_freq_base`.
+    pub rope_freq_base_local: Option<f32>,
     pub tensor_data_offset: u64,
     pub layers: Vec<LayerDmaPlan>,
     pub hot: Vec<TensorLoc>,
@@ -87,6 +94,34 @@ impl GgufLayerMap {
             self.architecture.as_str(),
             "gemma" | "gemma2" | "gemma3"
         )
+    }
+
+    pub fn is_gemma3(&self) -> bool {
+        self.architecture.eq_ignore_ascii_case("gemma3")
+    }
+
+    /// True when the GGUF also carries vision / multimodal projector weights.
+    pub fn has_vision_tensors(&self) -> bool {
+        let is_vision = |name: &str| {
+            let n = name.to_ascii_lowercase();
+            n.starts_with("v.")
+                || n.starts_with("mm.")
+                || n.starts_with("vision")
+                || n.contains("multi_modal")
+                || n.contains("mm_projector")
+        };
+        self.hot.iter().any(|t| is_vision(&t.name))
+            || self
+                .layers
+                .iter()
+                .any(|l| l.tensors.iter().any(|t| is_vision(&t.name)))
+    }
+
+    pub fn layer_sliding(&self, layer_idx: usize) -> bool {
+        self.layer_is_sliding
+            .get(layer_idx)
+            .copied()
+            .unwrap_or(false)
     }
 
     #[allow(dead_code)]
@@ -175,6 +210,24 @@ impl GgufLayerMap {
         let sliding_window = md_u32_arch(&content, &architecture, "attention.sliding_window")
             .map(|v| v as usize)
             .filter(|v| *v > 0);
+
+        let rope_freq_base_local =
+            md_f32_arch(&content, &architecture, "rope.local.freq_base").filter(|v| *v > 0.0);
+
+        let sliding_window_pattern = md_u32_arch(
+            &content,
+            &architecture,
+            "attention.sliding_window_pattern",
+        )
+        .map(|v| v as usize)
+        .unwrap_or(0);
+
+        let layer_is_sliding = build_layer_is_sliding(
+            &architecture,
+            block_count,
+            sliding_window_pattern,
+            md_bool_array_arch(&content, &architecture, "attention.sliding_window_pattern"),
+        );
 
         let tensor_data_offset = content.tensor_data_offset;
 
@@ -384,6 +437,9 @@ impl GgufLayerMap {
             attn_logit_softcapping,
             final_logit_softcapping,
             sliding_window,
+            sliding_window_pattern,
+            layer_is_sliding,
+            rope_freq_base_local,
             tensor_data_offset,
             layers,
             hot,
@@ -501,7 +557,11 @@ fn md_string(ct: &gguf_file::Content, key: &str) -> Option<String> {
 }
 
 fn md_u32(ct: &gguf_file::Content, key: &str) -> Option<u32> {
-    ct.metadata.get(key).and_then(|v| v.to_u32().ok())
+    let v = ct.metadata.get(key)?;
+    v.to_u32()
+        .ok()
+        .or_else(|| v.to_i32().ok().and_then(|i| if i >= 0 { Some(i as u32) } else { None }))
+        .or_else(|| v.to_u64().ok().and_then(|u| u32::try_from(u).ok()))
 }
 
 fn md_f32(ct: &gguf_file::Content, key: &str) -> Option<f32> {
@@ -514,6 +574,58 @@ fn md_u32_arch(ct: &gguf_file::Content, arch: &str, suffix: &str) -> Option<u32>
 
 fn md_f32_arch(ct: &gguf_file::Content, arch: &str, suffix: &str) -> Option<f32> {
     md_f32(ct, &format!("{arch}.{suffix}"))
+}
+
+/// Bool array metadata (Gemma 3 may store per-layer sliding flags this way).
+fn md_bool_array_arch(
+    ct: &gguf_file::Content,
+    arch: &str,
+    suffix: &str,
+) -> Option<Vec<bool>> {
+    let key = format!("{arch}.{suffix}");
+    let v = ct.metadata.get(&key)?;
+    match v {
+        gguf_file::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    gguf_file::Value::Bool(b) => out.push(*b),
+                    gguf_file::Value::U8(x) => out.push(*x != 0),
+                    gguf_file::Value::U32(x) => out.push(*x != 0),
+                    gguf_file::Value::I32(x) => out.push(*x != 0),
+                    _ => return None,
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Build per-layer sliding flags for Gemma 3 (5 local : 1 global by default).
+pub fn build_layer_is_sliding(
+    architecture: &str,
+    n_layers: usize,
+    pattern_period: usize,
+    pattern_bools: Option<Vec<bool>>,
+) -> Vec<bool> {
+    if let Some(flags) = pattern_bools {
+        if flags.len() == n_layers {
+            return flags;
+        }
+    }
+    if !architecture.eq_ignore_ascii_case("gemma3") {
+        return vec![false; n_layers];
+    }
+    // Default: 5 local + 1 global (period 6), matching llama.cpp / Gemma 3 report.
+    let period = if pattern_period >= 2 {
+        pattern_period
+    } else {
+        6
+    };
+    (0..n_layers)
+        .map(|il| il % period < period.saturating_sub(1))
+        .collect()
 }
 
 /// Load a [`TensorLoc`] from a DMA buffer into a [`candle_core::quantized::QTensor`].
@@ -543,9 +655,45 @@ pub fn qtensor_from_loc(
 
 #[cfg(test)]
 mod tests {
+    use super::build_layer_is_sliding;
+
     #[test]
     fn align_math() {
         assert_eq!(0u64 & !(4096u64 - 1), 0);
         assert_eq!(4097u64 & !(4096u64 - 1), 4096);
+    }
+
+    #[test]
+    fn gemma3_default_sliding_pattern_5_local_1_global() {
+        let flags = build_layer_is_sliding("gemma3", 12, 0, None);
+        assert_eq!(flags.len(), 12);
+        // period 6: indices 0..4 local, 5 global, 6..10 local, 11 global
+        assert!(flags[0] && flags[4] && !flags[5]);
+        assert!(flags[6] && flags[10] && !flags[11]);
+        assert_eq!(flags.iter().filter(|&&s| s).count(), 10);
+        assert_eq!(flags.iter().filter(|&&s| !s).count(), 2);
+    }
+
+    #[test]
+    fn gemma3_explicit_period() {
+        let flags = build_layer_is_sliding("gemma3", 4, 4, None);
+        assert_eq!(flags, vec![true, true, true, false]);
+    }
+
+    #[test]
+    fn gemma3_bool_array_wins() {
+        let flags = build_layer_is_sliding(
+            "gemma3",
+            3,
+            6,
+            Some(vec![true, false, true]),
+        );
+        assert_eq!(flags, vec![true, false, true]);
+    }
+
+    #[test]
+    fn non_gemma3_no_sliding_flags() {
+        let flags = build_layer_is_sliding("gemma2", 8, 6, None);
+        assert!(flags.iter().all(|&s| !s));
     }
 }
