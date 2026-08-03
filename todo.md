@@ -50,7 +50,7 @@ Last updated: 2026-08-03
 | Extension / Phase 7 | Auto knowledge acquisition & user adaptation (Web + auto-train) | **Done** (conditionally feasible) |
 | Extension / Phase 8 | NVMe-resident project-map & overview memory | **Done** (conditionally feasible) |
 | Extension / Phase 9 | Compute device selection + Candle-stack Vulkan offload | **Done** (first landing) |
-| Extension / Phase 10 | Vulkan real speedup (quantized shaders + VRAM-resident hot weights) | **Not started** |
+| Extension / Phase 10 | Vulkan real speedup (quantized shaders + VRAM-resident hot weights) | **In progress** (Q4_K GEMV + VRAM cache) |
 
 **Available now:**  
 `lpc-llm run <model> --adapter <name>` (Hybrid LoRA),  
@@ -272,7 +272,7 @@ Vulkan compute offload for quantized MatMul on the Candle inference stack (ash +
 - [x] QMatMul hot path: dequant (Candle `QTensor`) + Vulkan GEMM; unsupported → CPU `QMatMul::forward`
 - [x] Wire Hybrid / Eager load + ready banner (`Vulkan+pack+io_uring` / `CPU+…`)
 
-### Phase 10: Vulkan real speedup (quantized shaders + VRAM hot weights) — **Not started**
+### Phase 10: Vulkan real speedup (quantized shaders + VRAM hot weights) — **In progress**
 
 Phase 9 proves the Vulkan path and may show GPU utilization, but decode often feels **no faster** (or slower) than Candle CPU: every QMatMul still does full CPU dequant → upload f32 weights → naive f32 GEMM → download.  
 **Goal:** make `--device vulkan` competitive with (then faster than) `--device cpu` for hybrid decode.  
@@ -280,22 +280,22 @@ Phase 9 proves the Vulkan path and may show GPU utilization, but decode often fe
 
 #### 10.1 GPU-side quantized MatMul (stop per-call full dequant)
 
-- [ ] SPIR-V / WGSL shaders for **dequant + GEMV/GEMM** on common GGUF types (at least **Q4_K**; then Q5_K / Q8_0 as needed)
-- [ ] Keep weights **quantized on device**; do not CPU-dequantize the full matrix on every forward
-- [ ] Avoid uploading the entire f32 weight matrix each call (activation + tiny staging only, or resident buffers)
-- [ ] Soft-fallback to Candle CPU `QMatMul::forward` for unsupported dtypes (log once)
+- [x] SPIR-V / WGSL shaders for **dequant + GEMV/GEMM** on common GGUF types (at least **Q4_K**; then Q5_K / Q8_0 as needed)
+- [x] Keep weights **quantized on device**; do not CPU-dequantize the full matrix on every forward (Q4_K path)
+- [x] Avoid uploading the entire f32 weight matrix each call (activation + tiny staging only, or resident buffers)
+- [x] Soft-fallback to Candle CPU `QMatMul::forward` for unsupported dtypes (log once / `vulkan-skip:`)
 
 #### 10.2 VRAM-resident hot quantized weights
 
-- [ ] When pinning hybrid hot layers, also upload quantized weight blobs into **VRAM** (budget vs `--ram-mib` / VRAM softcap)
+- [x] Cache quantized Q4_K blobs in VRAM keyed by `Arc<QTensor>` (hot layers + MoE experts after materialize)
 - [ ] Streamed (non-hot) layers: optional path later; first target is hot-resident path that dominates TTFT after warmup
-- [ ] Explicit teardown / reuse across turns (no leak across `/clear` or session end)
+- [x] Explicit teardown on `VulkanContext` Drop (cache drain)
 
 #### 10.3 CPU baseline & measurement (A/B)
 
-- [ ] Document that **`--device cpu` may still be faster** until 10.1–10.2 land; use it as the comparison baseline
-- [ ] Simple A/B recipe: same model/flags, `--device cpu` vs `--device vulkan` (tokens/s or wall time for fixed prompt)
-- [ ] Optional: warn at startup when Vulkan path is the Phase-9 f32-dequant path (pre-10.1)
+- [x] Document that **`--device cpu` may still be faster** until 10.1–10.2 land; use it as the comparison baseline
+- [x] Unit A/B: CPU reference GEMV vs Vulkan Q4_K shader (`q4k_gpu_matches_cpu_when_vulkan_available`)
+- [ ] Optional: warn at startup when residual non-Q4_K tensors dominate the model
 
 ---
 
@@ -346,7 +346,7 @@ Phase 9 proves the Vulkan path and may show GPU utilization, but decode often fe
 | Expert-unit index / dynamic DMA | **Implemented** (`experts.pack` + `PrefetchRing`) |
 | project-map node `io_uring` prefetch | **Implemented** (`map.bin` + `PrefetchRing`; buffered fallback) |
 | Vulkan QMatMul offload (Candle stack) | **Implemented** (Phase 9; ash + SPIR-V; CPU fallback; often slower than CPU decode) |
-| Vulkan Q4_K-class dequant+GEMV + VRAM hot weights | **Not started** (Phase 10) |
+| Vulkan Q4_K-class dequant+GEMV + VRAM hot weights | **In progress** (Phase 10; Q4_K shader + Arc cache; other dtypes → CPU) |
 | ΔW merge at CQE (weight rewrite) | Not adopted (side-path policy) |
 
 ---
@@ -401,7 +401,7 @@ Phase 9 proves the Vulkan path and may show GPU utilization, but decode often fe
 | 拡張 / Phase 7 | 自動知識獲得 & ユーザー適応（Web + auto-train） | **完了**（条件付き可能） |
 | 拡張 / Phase 8 | NVMe 常駐 project-map & 俯瞰記憶 | **完了**（条件付き可能） |
 | 拡張 / Phase 9 | 計算デバイス選択 + Candle スタック Vulkan オフロード | **完了**（第一到達） |
-| 拡張 / Phase 10 | Vulkan 本格高速化（量子化シェーダ + VRAM ホット重み常駐） | **未着手** |
+| 拡張 / Phase 10 | Vulkan 本格高速化（量子化シェーダ + VRAM ホット重み常駐） | **進行中**（Q4_K GEMV + VRAM キャッシュ） |
 
 **いま使えるもの:**  
 `lpc-llm run <model> --adapter <name>`（Hybrid LoRA）、  
@@ -623,7 +623,7 @@ Candle 推論スタック上で量子化 MatMul を Vulkan（ash + SPIR-V）へ�
 - [x] QMatMul ホットパス: Candle `QTensor` で dequant + Vulkan GEMM；未対応は CPU `QMatMul::forward`
 - [x] Hybrid / Eager の load と ready 表示（`Vulkan+pack+io_uring` / `CPU+…`）
 
-### Phase 10: Vulkan 本格高速化（量子化シェーダ + VRAM ホット重み常駐） — **未着手**
+### Phase 10: Vulkan 本格高速化（量子化シェーダ + VRAM ホット重み常駐） — **進行中**
 
 Phase 9 で Vulkan 経路と GPU 使用率は確認できるが、デコード体感は Candle CPU より速くない（遅い）ことが多い。現行は毎回 CPU でフル dequant → f32 重み転送 → 素朴 f32 GEMM → 結果を戻すため。  
 **目標:** `--device vulkan` を hybrid デコードで `--device cpu` と同等→上回る。  
@@ -631,22 +631,22 @@ Phase 9 で Vulkan 経路と GPU 使用率は確認できるが、デコード�
 
 #### 10.1 GPU 側量子化 MatMul（毎回フル dequant / 全重み転送をやめる）
 
-- [ ] 主要 GGUF 型向け **dequant + GEMV/GEMM** の SPIR-V / WGSL シェーダ（まず **Q4_K**；必要なら Q5_K / Q8_0）
-- [ ] 重みは **デバイス上で量子化のまま**保持；フォワード毎に行列全体を CPU dequant しない
-- [ ] 毎回の f32 全重みアップロードを避ける（活性化＋小さな staging のみ、または常駐バッファ）
-- [ ] 未対応 dtype は Candle CPU `QMatMul::forward` へソフトフォールバック（ログは一度）
+- [x] 主要 GGUF 型向け **dequant + GEMV/GEMM** の SPIR-V / WGSL シェーダ（まず **Q4_K**；必要なら Q5_K / Q8_0）
+- [x] 重みは **デバイス上で量子化のまま**保持；フォワード毎に行列全体を CPU dequant しない（Q4_K 経路）
+- [x] 毎回の f32 全重みアップロードを避ける（活性化＋小さな staging のみ、または常駐バッファ）
+- [x] 未対応 dtype は Candle CPU `QMatMul::forward` へソフトフォールバック（`vulkan-skip:`）
 
 #### 10.2 ホット層量子化重みの VRAM 常駐
 
-- [ ] Hybrid ホット層ピン時に、量子化重みブロブを **VRAM へも**載せる（`--ram-mib` / VRAM ソフトキャップと予算調整）
+- [x] Q4_K ブロブを `Arc<QTensor>` キーで VRAM キャッシュ（ホット層 + MoE expert materialize 後）
 - [ ] ストリーム（非ホット）層は後続；まずウォームアップ後 TTFT を支配するホット常駐経路を対象
-- [ ] ターン跨ぎ・`/clear`・セッション終了での明示的解放 / 再利用（リーク防止）
+- [x] `VulkanContext` Drop 時にキャッシュ解放
 
 #### 10.3 CPU ベースラインと比較測定（A/B）
 
-- [ ] 10.1–10.2 完了まで **`--device cpu` の方が速い可能性が高い**ことを文書化；比較基準として使う
-- [ ] 簡易 A/B: 同一モデル/フラグで `--device cpu` vs `--device vulkan`（固定プロンプトの tokens/s または壁時計）
-- [ ] （任意）Phase 9 の f32-dequant 経路のままのとき起動時に警告
+- [x] 10.1–10.2 完了まで **`--device cpu` の方が速い可能性**があることを文書化；比較基準として使う
+- [x] 単体 A/B: CPU 参照 GEMV vs Vulkan Q4_K（`q4k_gpu_matches_cpu_when_vulkan_available`）
+- [ ] （任意）非 Q4_K テンソルが支配的なときの起動警告
 
 ---
 
@@ -697,7 +697,7 @@ Phase 9 で Vulkan 経路と GPU 使用率は確認できるが、デコード�
 | Expert 単位インデックス / 動的 DMA | **実装済**（`experts.pack` + `PrefetchRing`） |
 | project-map ノード単位 `io_uring` プレフェッチ | **実装済**（`map.bin` + `PrefetchRing`；バッファド可） |
 | Vulkan QMatMul オフロード（Candle スタック） | **実装済**（Phase 9；ash + SPIR-V；CPU フォールバック；デコードは CPU より遅いことが多い） |
-| Vulkan Q4_K 系 dequant+GEMV + VRAM ホット重み | **未着手**（Phase 10） |
+| Vulkan Q4_K 系 dequant+GEMV + VRAM ホット重み | **進行中**（Phase 10；Q4_K シェーダ + Arc キャッシュ；他 dtype → CPU） |
 | CQE 時の ΔW マージ（重み書き換え） | 採用せず（サイドパス方針） |
 
 ---

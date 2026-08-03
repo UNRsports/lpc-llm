@@ -53,7 +53,10 @@ impl ComputeContext {
         #[cfg(feature = "vulkan")]
         let vulkan = if matches!(backend, ResolvedBackend::Vulkan) {
             match vulkan::VulkanContext::new() {
-                Ok(ctx) => Some(Arc::new(ctx)),
+                Ok(ctx) => {
+                    eprintln!("compute: Vulkan Q4_K dequant+GEMV enabled (other dtypes → CPU)");
+                    Some(Arc::new(ctx))
+                }
                 Err(e) => {
                     eprintln!("warning: Vulkan init failed ({e}); QMatMul stays on CPU");
                     None
@@ -83,15 +86,17 @@ impl ComputeContext {
         &self.candle_device
     }
 
-    /// Quantized matmul, optionally offloaded to Vulkan GEMM (LoRA applied by caller).
+    /// Quantized matmul: Vulkan Q4_K GEMV when available; else Candle CPU.
     pub fn qmatmul(&self, w: &QMatMul, x: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "vulkan")]
         if let Some(ref vk) = self.vulkan {
             match vk.qmatmul(w, x) {
                 Ok(t) => return Ok(t),
                 Err(e) => {
-                    // Soft-fail once per call; keep inference alive.
-                    eprintln!("warning: Vulkan QMatMul fell back to CPU ({e})");
+                    let msg = e.to_string();
+                    if !msg.starts_with("vulkan-skip:") {
+                        eprintln!("warning: Vulkan QMatMul fell back to CPU ({e})");
+                    }
                 }
             }
         }
