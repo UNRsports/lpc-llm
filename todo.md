@@ -52,6 +52,7 @@ Last updated: 2026-08-03
 | Extension / Phase 9 | Compute device selection + Candle-stack Vulkan offload | **Done** (first landing) |
 | Extension / Phase 10 | Vulkan real speedup (quantized shaders + VRAM-resident hot weights) | **In progress** (Q4_K GEMV + VRAM cache) |
 | Extension / Phase 11 | Gemma 3 largest (27B) hybrid **text** run | **Done** (text hybrid verified) |
+| Extension / Phase 12 | Gemma 4 **26B-A4B (MoE)** hybrid text run | **Not started** |
 
 **Available now:**  
 `lpc-llm run <model> --adapter <name>` (Hybrid LoRA),  
@@ -64,10 +65,12 @@ Last updated: 2026-08-03
 `lpc-llm project-map build|status|rebuild` / `run --project-map` / `--knowledge` / `--no-user-profile` (Phase 7–8),  
 On MoE GGUF: `experts.pack` + Top-K expert DMA (hybrid).  
 `lpc-llm setup` / `run --device` (Phase 9; Vulkan first landing — often **not** faster than CPU yet).  
-**Not available yet:** Gemma 3 27B hybrid text run (Phase 11); vision/multimodal; multi-GPU PPO in-process; optional hot-swap / inotify watch / 16GB regression bench.  
+`lpc-llm run gemma3:27b --hybrid` (Phase 11 dense text verified).  
+**Not available yet:** Gemma 4 **26B-A4B MoE** (Phase 12); vision/multimodal; multi-GPU PPO in-process; optional hot-swap / inotify watch / true ≤16 GiB process cap.  
 **Phase 9 (landing):** setup → `[ui]`/`[runtime]` in home `config_lpcllm`; Vulkan path today = CPU dequant + f32 GEMM + H2D/D2H (GPU busy, decode often slower than `--device cpu`).  
-**Phase 10 (parallel):** GPU-side Q4_K dequant+GEMV; VRAM-resident hot weights; CPU baseline for A/B (can finish alongside Phase 11).  
-**Phase 11 (next pillar):** Gemma 3 **27B** instruct via `--hybrid` (text-only success criteria; **verify 27B first**, smaller sizes only if needed to debug).
+**Phase 10 (parallel):** GPU-side Q4_K dequant+GEMV; VRAM-resident hot weights; CPU baseline for A/B.  
+**Phase 11 (done):** Gemma 3 **27B** dense instruct via `--hybrid` (text-only). Note: Gemma 3 has **no** MoE 27B; MoE for ~27B-class Gemma is **Gemma 4 26B-A4B**.  
+**Phase 12 (next pillar):** Gemma 4 **26B-A4B MoE** (~25.2B total / ~3.8B active) via `--hybrid` + `experts.pack` Top-K; target **≤16 GiB resident** and lower latency than dense 27B.
 
 ---
 
@@ -339,6 +342,48 @@ Prove the project theme on a **dense** multi-billion model: run Gemma 3 Instruct
 - [x] Bump `tokenizers` to 0.21 so Gemma 3 `tokenizer.json` (array merges) loads
 - [ ] (Optional) A/B `--device cpu` vs `vulkan` on 4B after Phase 10
 
+### Phase 12: Gemma 4 26B-A4B (MoE) hybrid text run — **Not started**
+
+Gemma 3 has **no MoE 27B**. The Gemma-family MoE near that class is **Gemma 4 26B-A4B** (~25.2B total / ~3.8B active per token; 128 routed experts, Top-8, + shared expert).  
+**Goal:** run it under the theme (RAM + NVMe hybrid): attention/router/shared in `layers.pack`, routed experts in `experts.pack` with Top-K DMA — so **resident RAM can stay ≤16 GiB** while decode compute tracks ~4B-active, not dense 27B.  
+**Success:** `lpc-llm run gemma4:26b-a4b --hybrid --ram-mib 16384` completes **text** chat with process RSS meaningfully under ~16 GiB (not “hot≈all layers” like dense 27B today).  
+**Out of success criteria (first landing):** image / vision encoder; full 256K context.  
+**Deps:** Phase 2 MoE pack + ring; Phase 11 Gemma SWA / QK-norm experience; tighten `--ram-mib` accounting (emb / KV / slots).  
+**Note:** Alternate MoE of similar class (`qwen3:30b-a3b`, ~30.5B/3.3B active) may be used as a pathfinder if Gemma 4 GGUF/arch lands slower — document in checklist, do not replace Phase 12 success criterion.
+
+#### 12.1 Catalog + artifacts
+
+- [ ] Catalog entry `gemma4:26b-a4b` (IT, Q4-class GGUF + tokenizer once published / mirrored)
+- [ ] Confirm prompt / special tokens for Gemma 4 IT (may extend `PromptStyle::Gemma`)
+- [ ] Document disk size vs **active** params vs `--ram-mib` (all experts on NVMe; only Top-K + core in RAM)
+
+#### 12.2 GGUF / architecture (Gemma 4 MoE)
+
+- [ ] Parse `gemma4` / MoE metadata (expert_count, expert_used_count, shared expert, sliding/global pattern)
+- [ ] Extend `MoeFamily` / layout for Gemma 4 (shared expert + routed Top-K; not Mixtral-identical)
+- [ ] Reuse / extend SWA + dual RoPE + QK-norm patterns from Phase 11 where applicable
+- [ ] Soft-warn or skip vision tensors (text-only first landing)
+
+#### 12.3 Hybrid memory ≤16 GiB
+
+- [ ] Treat `--ram-mib` as a **hard-ish resident ceiling**: reserve embeddings, lm_head, KV, 2× layer slots, MoE expert ring
+- [ ] Core layers (attn / norms / router / shared expert) via `layers.pack`; **routed experts only via `experts.pack` Top-K**
+- [ ] Avoid f32 full dequant of huge embedding tables when budget is tight (f16 / quantized lookup path)
+- [ ] Startup log: estimated resident MiB, hot layers, expert ring slots, stream counts
+
+#### 12.4 Latency (MoE-active path)
+
+- [ ] Prefetch next Top-K experts overlapping compute (existing `PrefetchRing`; tune slot count for Top-8)
+- [ ] Measure TTFT / tok/s vs `gemma3:27b` dense under same `--ram-mib 16384`
+- [ ] (Optional) Pathfinder A/B with `qwen3:30b-a3b` on existing Qwen-MoE path if Gemma 4 GGUF delayed
+
+#### 12.5 Verification
+
+- [ ] Pack build: `layers.pack` + `experts.pack` for Gemma 4 26B-A4B
+- [ ] **`gemma4:26b-a4b --hybrid --ram-mib 16384` text dialogue** (phase exit)
+- [ ] Confirm RSS / hot selection respects ~16 GiB intent (document measurement method)
+- [ ] (Optional) Vision / multimodal Gemma 4 — later phase
+
 ---
 
 ## 4. Spec section status
@@ -390,18 +435,20 @@ Prove the project theme on a **dense** multi-billion model: run Gemma 3 Instruct
 | Vulkan QMatMul offload (Candle stack) | **Implemented** (Phase 9; ash + SPIR-V; CPU fallback; often slower than CPU decode) |
 | Vulkan Q4_K-class dequant+GEMV + VRAM hot weights | **In progress** (Phase 10; Q4_K shader + Arc cache; other dtypes → CPU) |
 | Gemma 3 27B hybrid text run | **Done** (Phase 11; text hybrid verified) |
+| Gemma 4 26B-A4B MoE hybrid text run | **Not started** (Phase 12) |
 | ΔW merge at CQE (weight rewrite) | Not adopted (side-path policy) |
 
 ---
 
 ## 5. Recommended next steps
 
-1. **Phase 11** — Gemma 3 **27B** hybrid text run (catalog → SWA/QK-norm/dual RoPE → **verify 27B first**; see checklist §Phase 11)
+1. **Phase 12** — Gemma 4 **26B-A4B MoE** hybrid text (`experts.pack` Top-K + ≤16 GiB resident; see checklist §Phase 12)
 2. **Phase 10** — Finish remaining Vulkan Q4_K polish in parallel (microbench path already landed; streamed-layer VRAM optional)
 3. **Phase 6 follow-ups** — Wire real cluster launchers / CUDA backends into `job.remote` and `$LPC_LLM_CONVERT_CMD`
-4. **(Optional)** In-process adapter hot-reload / mid-chat hot-swap (Phase 1 + 7.3 leftovers)
-5. **(Optional)** Distro / package install that ships system `config_lpcllm` with `install.mode = "system"`
-6. **(Optional)** project-map 16GB-scale regression bench / inotify incremental watch; Gemma 3 vision
+4. **(Optional)** Pathfinder MoE catalog `qwen3:30b-a3b` if Gemma 4 GGUF/arch is blocked
+5. **(Optional)** In-process adapter hot-reload / mid-chat hot-swap (Phase 1 + 7.3 leftovers)
+6. **(Optional)** Distro / package install that ships system `config_lpcllm` with `install.mode = "system"`
+7. **(Optional)** project-map 16GB-scale regression bench / inotify incremental watch; Gemma vision
 
 ---
 
@@ -447,6 +494,7 @@ Prove the project theme on a **dense** multi-billion model: run Gemma 3 Instruct
 | 拡張 / Phase 9 | 計算デバイス選択 + Candle スタック Vulkan オフロード | **完了**（第一到達） |
 | 拡張 / Phase 10 | Vulkan 本格高速化（量子化シェーダ + VRAM ホット重み常駐） | **進行中**（Q4_K GEMV + VRAM キャッシュ） |
 | 拡張 / Phase 11 | Gemma 3 最大版（27B）hybrid **テキスト**実行 | **完了**（テキスト hybrid 検証済） |
+| 拡張 / Phase 12 | Gemma 4 **26B-A4B（MoE）** hybrid テキスト実行 | **未着手** |
 
 **いま使えるもの:**  
 `lpc-llm run <model> --adapter <name>`（Hybrid LoRA）、  
@@ -459,10 +507,12 @@ Prove the project theme on a **dense** multi-billion model: run Gemma 3 Instruct
 `lpc-llm project-map` / `run --project-map` / `--knowledge` / `--no-user-profile`（Phase 7–8）、  
 MoE GGUF では `experts.pack` + Top-K Expert DMA（hybrid）。  
 `lpc-llm setup` / `run --device`（Phase 9；Vulkan 第一到達 — 現状 CPU より速くないことが多い）。  
-**まだ使えないもの:** Gemma 3 27B hybrid テキスト実行（Phase 11）；vision/マルチモーダル；プロセス内マルチ GPU PPO；任意のホットスワップ / inotify 監視 / 16GB 回帰ベンチ。  
+`lpc-llm run gemma3:27b --hybrid`（Phase 11 dense テキスト検証済）。  
+**まだ使えないもの:** Gemma 4 **26B-A4B MoE**（Phase 12）；vision/マルチモーダル；プロセス内マルチ GPU PPO；任意のホットスワップ / inotify 監視 / 実 ≤16 GiB 常駐上限。  
 **Phase 9（到達）:** setup → ホーム `config_lpcllm` の `[ui]`/`[runtime]`；現行 Vulkan = CPU dequant + f32 GEMM + 転送（GPU は忙しいがデコードは `--device cpu` より遅いことが多い）。  
-**Phase 10（並行）:** GPU 側 Q4_K 系 dequant+GEMV；ホット層量子化重みの VRAM 常駐；CPU との A/B（Phase 11 と並行完了可）。  
-**Phase 11（次の柱）:** Gemma 3 **27B** Instruct を `--hybrid` でテキスト実行（成功条件はテキストのみ；**検証は 27B から開始**、小サイズは不具合切り分け時のみ）。
+**Phase 10（並行）:** GPU 側 Q4_K 系 dequant+GEMV；ホット層量子化重みの VRAM 常駐；CPU との A/B。  
+**Phase 11（完了）:** Gemma 3 **27B** dense Instruct を `--hybrid` でテキスト実行。注: Gemma 3 に **MoE 27B は無い**；~27B 級 Gemma MoE は **Gemma 4 26B-A4B**。  
+**Phase 12（次の柱）:** Gemma 4 **26B-A4B MoE**（総量 ~25.2B / 活性 ~3.8B）を `--hybrid` + `experts.pack` Top-K で実行；目標は **常駐 ≤16 GiB** と dense 27B より低いレイテンシ。
 
 ---
 
@@ -734,6 +784,48 @@ Phase 9 で Vulkan 経路と GPU 使用率は確認できるが、デコード�
 - [x] Gemma 3 `tokenizer.json`（配列 merges）読込のため `tokenizers` を 0.21 へ更新
 - [ ] （任意）4B で `--device cpu` vs `vulkan` の A/B（Phase 10 後）
 
+### Phase 12: Gemma 4 26B-A4B（MoE）hybrid テキスト実行 — **未着手**
+
+Gemma 3 に **MoE 27B は無い**。同クラスの Gemma 系 MoE は **Gemma 4 26B-A4B**（総量 ~25.2B / トークンあたり活性 ~3.8B；ルーテッド Expert 128・Top-8 + 共有 Expert）。  
+**目標:** テーマどおり RAM + NVMe hybrid で動かす — attention / router / shared は `layers.pack`、ルーテッド Expert は `experts.pack` + Top-K DMA。これにより **常駐 RAM ≤16 GiB** を狙いつつ、デコード計算量は dense 27B ではなく ~4B 活性に寄せる。  
+**成功条件:** `lpc-llm run gemma4:26b-a4b --hybrid --ram-mib 16384` で **テキスト**対話が完走し、プロセス RSS が実質 ~16 GiB 未満（現状の dense 27B のような「ほぼ全層 hot」ではないこと）。  
+**成功条件外（第一到達）:** 画像 / vision encoder；フル 256K コンテキスト。  
+**依存:** Phase 2 MoE pack + ring；Phase 11 の Gemma SWA / QK-norm 経験；`--ram-mib` 会計の厳格化（emb / KV / slots）。  
+**注:** 同クラス代替 MoE（`qwen3:30b-a3b`、~30.5B/3.3B 活性）は Gemma 4 GGUF/アーキが遅延した場合の **経路探査**として可。Phase 12 の成功条件は置き換えない。
+
+#### 12.1 カタログ + 成果物
+
+- [ ] カタログ `gemma4:26b-a4b`（IT、Q4 系 GGUF + tokenizer；公開/ミラー確定後）
+- [ ] Gemma 4 IT のプロンプト / 特殊トークン確認（`PromptStyle::Gemma` 拡張の可能性）
+- [ ] ディスクサイズ vs **活性**パラメータ vs `--ram-mib` を文書化（全 Expert は NVMe；RAM は Top-K + コアのみ）
+
+#### 12.2 GGUF / アーキ（Gemma 4 MoE）
+
+- [ ] `gemma4` / MoE メタデータ解析（expert_count、expert_used_count、共有 Expert、sliding/global パターン）
+- [ ] `MoeFamily` / レイアウトを Gemma 4 向けに拡張（共有 Expert + ルーテッド Top-K；Mixtral と同一ではない）
+- [ ] Phase 11 の SWA / 二重 RoPE / QK-norm を適用可能な範囲で再利用・拡張
+- [ ] vision テンソルはソフト警告またはスキップ（テキストのみ第一到達）
+
+#### 12.3 Hybrid メモリ ≤16 GiB
+
+- [ ] `--ram-mib` を **実質常駐上限**として扱う: embeddings / lm_head / KV / 層スロット×2 / MoE Expert リングを予約
+- [ ] コア層（attn / norms / router / shared expert）は `layers.pack`；**ルーテッド Expert は `experts.pack` Top-K のみ**
+- [ ] 予算逼迫時に巨大 embedding の f32 全 dequant を避ける（f16 / 量子化 lookup 経路）
+- [ ] 起動ログ: 推定常駐 MiB、hot 層、Expert リングスロット、stream 数
+
+#### 12.4 レイテンシ（MoE 活性経路）
+
+- [ ] 次 Top-K Expert の prefetch と計算の重ね合わせ（既存 `PrefetchRing`；Top-8 向けスロット調整）
+- [ ] 同一 `--ram-mib 16384` で `gemma3:27b` dense との TTFT / tok/s を計測
+- [ ] （任意）Gemma 4 GGUF 遅延時は既存 Qwen-MoE 経路で `qwen3:30b-a3b` を経路探査 A/B
+
+#### 12.5 検証
+
+- [ ] パック構築: Gemma 4 26B-A4B 向け `layers.pack` + `experts.pack`
+- [ ] **`gemma4:26b-a4b --hybrid --ram-mib 16384` テキスト対話**（フェーズ完了条件）
+- [ ] RSS / hot 選定が ~16 GiB 意図を満たすことを確認（計測方法を文書化）
+- [ ] （任意）Vision / マルチモーダル Gemma 4 — 後続フェーズ
+
 ---
 
 ## 4. 仕様書セクション別の対応状況
@@ -785,18 +877,20 @@ Phase 9 で Vulkan 経路と GPU 使用率は確認できるが、デコード�
 | Vulkan QMatMul オフロード（Candle スタック） | **実装済**（Phase 9；ash + SPIR-V；CPU フォールバック；デコードは CPU より遅いことが多い） |
 | Vulkan Q4_K 系 dequant+GEMV + VRAM ホット重み | **進行中**（Phase 10；Q4_K シェーダ + Arc キャッシュ；他 dtype → CPU） |
 | Gemma 3 27B hybrid テキスト実行 | **完了**（Phase 11；テキスト hybrid 検証済） |
+| Gemma 4 26B-A4B MoE hybrid テキスト実行 | **未着手**（Phase 12） |
 | CQE 時の ΔW マージ（重み書き換え） | 採用せず（サイドパス方針） |
 
 ---
 
 ## 5. 推奨する次工程
 
-1. **Phase 11** — Gemma 3 **27B** hybrid テキスト実行（カタログ → SWA/QK-norm/二重 RoPE → **27B から検証**；工程 §Phase 11）
+1. **Phase 12** — Gemma 4 **26B-A4B MoE** hybrid テキスト（`experts.pack` Top-K + 常駐 ≤16 GiB；工程 §Phase 12）
 2. **Phase 10** — Vulkan Q4_K の残りを並行で仕上げ（マイクロベンチ経路は到達済；ストリーム層 VRAM は任意）
 3. **Phase 6 フォロー** — `job.remote` / `$LPC_LLM_CONVERT_CMD` に実クラスタ・CUDA 変換を接続
-4. **（任意）** プロセス内アダプタホットリロード / 会話途中ホットスワップ（Phase 1 + 7.3 残り）
-5. **（任意）** `install.mode = "system"` の `/etc/lpc-llm/config_lpcllm` を同梱するパッケージ化
-6. **（任意）** project-map 16GB 級回帰ベンチ / inotify 差分監視；Gemma 3 vision
+4. **（任意）** Gemma 4 GGUF/アーキが塞がる場合の経路探査カタログ `qwen3:30b-a3b`
+5. **（任意）** プロセス内アダプタホットリロード / 会話途中ホットスワップ（Phase 1 + 7.3 残り）
+6. **（任意）** `install.mode = "system"` の `/etc/lpc-llm/config_lpcllm` を同梱するパッケージ化
+7. **（任意）** project-map 16GB 級回帰ベンチ / inotify 差分監視；Gemma vision
 
 ---
 
