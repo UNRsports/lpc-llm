@@ -140,8 +140,7 @@ pub fn q4k_gemv_cpu(w_bytes: &[u8], n: usize, k: usize, x: &[f32]) -> Result<Vec
     q4k_gemm_cpu(w_bytes, n, k, x, 1)
 }
 
-/// Pack a synthetic Q4_K weight with constant nibble value for tests.
-#[cfg(test)]
+/// Pack a synthetic Q4_K weight with constant nibble value (tests / microbench).
 pub fn pack_constant_q4k(n: usize, k: usize, nibble: u8, d_f32: f32, dmin_f32: f32) -> Vec<u8> {
     assert!(k.is_multiple_of(QK_K));
     let blocks_per_row = k / QK_K;
@@ -178,7 +177,6 @@ pub fn pack_constant_q4k(n: usize, k: usize, nibble: u8, d_f32: f32, dmin_f32: f
     out
 }
 
-#[cfg(test)]
 fn f32_to_f16_bits(v: f32) -> u16 {
     let bits = v.to_bits();
     let sign = (bits >> 16) & 0x8000;

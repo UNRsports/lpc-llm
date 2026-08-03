@@ -295,6 +295,8 @@ Phase 9 proves the Vulkan path and may show GPU utilization, but decode often fe
 
 - [x] Document that **`--device cpu` may still be faster** until 10.1–10.2 land; use it as the comparison baseline
 - [x] Unit A/B: CPU reference GEMV vs Vulkan Q4_K shader (`q4k_gpu_matches_cpu_when_vulkan_available`)
+- [x] Startup GEMV microbench: if GPU slower, prefer Candle CPU for Q4_K; scratch buffer reuse for submits
+- [x] Remove hard `hot≤8` cap so `--ram-mib` can pin all layers of small models (biggest TTFT win for gemma2:2b)
 - [ ] Optional: warn at startup when residual non-Q4_K tensors dominate the model
 
 ---

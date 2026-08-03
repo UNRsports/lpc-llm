@@ -54,7 +54,17 @@ impl ComputeContext {
         let vulkan = if matches!(backend, ResolvedBackend::Vulkan) {
             match vulkan::VulkanContext::new() {
                 Ok(ctx) => {
-                    eprintln!("compute: Vulkan Q4_K dequant+GEMV enabled (other dtypes → CPU)");
+                    if ctx.gpu_gemv_worthwhile() {
+                        eprintln!(
+                            "compute: Vulkan Q4_K path ready (VRAM-cached weights; \
+                             other dtypes / cold weights → CPU)"
+                        );
+                    } else {
+                        eprintln!(
+                            "compute: Vulkan opened but Q4_K uses Candle CPU on this GPU \
+                             (faster); attention/norms stay on CPU either way"
+                        );
+                    }
                     Some(Arc::new(ctx))
                 }
                 Err(e) => {

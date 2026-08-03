@@ -324,17 +324,25 @@ impl HybridEngine {
             }
         }
 
+        let stream_count = n_layers.saturating_sub(hot_count);
         eprintln!(
             "hybrid: arch={} layers={} hot={} stream={} slot={} MiB softcap={:?}/{:?} pack={}",
             map.architecture,
             n_layers,
             hot_count,
-            n_layers.saturating_sub(hot_count),
+            stream_count,
             slot / (1024 * 1024),
             map.attn_logit_softcapping,
             map.final_logit_softcapping,
             packed.pack_path.display()
         );
+        if stream_count > 0 {
+            eprintln!(
+                "hint: {stream_count} layers stream from pack each forward — \
+                 for lower latency try `--hot-layers {n_layers}` or raise `--ram-mib` \
+                 (and `ulimit -l` if mlock failed)"
+            );
+        }
         if let Some(sw) = map.sliding_window {
             eprintln!("hybrid: sliding_window={sw} (short prompts use full causal mask)");
         }
@@ -921,7 +929,10 @@ fn choose_hot_layers(
         .saturating_add(expert_ring_bytes);
     let hot_budget = budget.saturating_sub(reserve);
     let by_ram = hot_budget / layer_bytes;
-    by_ram.min(n_layers.saturating_mul(1) / 2).min(8)
+    // Keep as many layers resident as the RAM budget allows. The old hard
+    // cap of 8 forced NVMe streaming on small models (e.g. gemma2:2b) and
+    // dominated latency even when --ram-mib had headroom.
+    by_ram.min(n_layers)
 }
 
 fn try_tensor<'a>(plan: &'a LayerDmaPlan, suffix: &str) -> Option<&'a TensorLoc> {

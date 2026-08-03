@@ -9,15 +9,42 @@ use ash::{Device, Entry, Instance};
 use candle_core::quantized::{GgmlDType, QMatMul};
 use candle_core::{DType, Device as CandleDevice, Tensor};
 
-use super::q4k::{BLOCK_Q4K_SIZE, QK_K};
+use super::q4k::{self, pack_constant_q4k, BLOCK_Q4K_SIZE, QK_K};
 use crate::error::{AppError, Result};
 
 const SPIRV_Q4K: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/q4k_gemv.spv"));
+
+/// Cap cached weight buffers so streamed (rebuilt) tensors cannot grow VRAM forever.
+const MAX_WEIGHT_CACHE: usize = 384;
+
+/// Below this batch size, Candle CPU Q4_K is usually faster than H2D+dispatch+D2H
+/// unless the weight is already resident in the VRAM cache.
+const SMALL_BATCH_CPU: u32 = 8;
 
 struct GpuBuffer {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     size: u64,
+}
+
+/// Host-visible scratch kept mapped across calls.
+struct MappedScratch {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    capacity: u64,
+    ptr: *mut u8,
+}
+
+// SAFETY: only touched under `submit_lock`.
+unsafe impl Send for MappedScratch {}
+
+struct SubmitResources {
+    x: MappedScratch,
+    y: MappedScratch,
+    u: MappedScratch,
+    set: vk::DescriptorSet,
+    cmd: vk::CommandBuffer,
+    fence: vk::Fence,
 }
 
 /// Vulkan compute context (thread-safe via mutex around queue submits).
@@ -38,6 +65,9 @@ pub struct VulkanContext {
     submit_lock: Mutex<()>,
     /// Quantized weight blobs keyed by `Arc<QTensor>` pointer.
     weight_cache: Mutex<HashMap<usize, GpuBuffer>>,
+    scratch: Mutex<Option<SubmitResources>>,
+    /// When false, always fall back to Candle CPU (microbench lost on this GPU).
+    gpu_gemv_worthwhile: bool,
 }
 
 impl VulkanContext {
@@ -106,7 +136,7 @@ impl VulkanContext {
                 .map_err(|e| AppError::msg(format!("vkCreateCommandPool: {e}")))?
         };
 
-        Ok(Self {
+        let mut ctx = Self {
             _entry: entry,
             instance,
             device,
@@ -121,12 +151,58 @@ impl VulkanContext {
             shader,
             submit_lock: Mutex::new(()),
             weight_cache: Mutex::new(HashMap::new()),
-        })
+            scratch: Mutex::new(None),
+            gpu_gemv_worthwhile: true,
+        };
+        ctx.gpu_gemv_worthwhile = ctx.microbench_gpu_vs_cpu().unwrap_or(false);
+        Ok(ctx)
+    }
+
+    /// True when the naive GPU GEMV path beat Candle-style CPU on a small probe.
+    pub fn gpu_gemv_worthwhile(&self) -> bool {
+        self.gpu_gemv_worthwhile
+    }
+
+    fn microbench_gpu_vs_cpu(&self) -> Result<bool> {
+        let n = 256usize;
+        let k = 2048usize;
+        let w = pack_constant_q4k(n, k, 2, 0.25, 0.0);
+        let x = vec![1.0f32; k];
+        let t0 = std::time::Instant::now();
+        for _ in 0..3 {
+            let _ = q4k::q4k_gemv_cpu(&w, n, k, &x)?;
+        }
+        let cpu_ms = t0.elapsed().as_secs_f64() * 1000.0 / 3.0;
+
+        // Warm GPU path once (pipeline / scratch).
+        let key = 0xBEEF_u64 as usize;
+        let _ = self.q4k_gemm_gpu(key, &w, n as u32, k as u32, 1, &x)?;
+        let t1 = std::time::Instant::now();
+        for _ in 0..3 {
+            let _ = self.q4k_gemm_gpu(key, &w, n as u32, k as u32, 1, &x)?;
+        }
+        let gpu_ms = t1.elapsed().as_secs_f64() * 1000.0 / 3.0;
+
+        let win = gpu_ms < cpu_ms * 0.85;
+        eprintln!(
+            "compute: Q4_K GEMV probe CPU≈{cpu_ms:.2}ms GPU≈{gpu_ms:.2}ms → {}",
+            if win {
+                "use GPU when weights are VRAM-cached"
+            } else {
+                "prefer Candle CPU for Q4_K (GPU path slower on this device)"
+            }
+        );
+        Ok(win)
     }
 
     /// Q4_K path: VRAM-resident quantized weights + GPU dequant+GEMV.
     /// Returns `Err` with message starting `vulkan-skip:` for silent CPU fallback.
     pub fn qmatmul(&self, w: &QMatMul, x: &Tensor) -> Result<Tensor> {
+        if !self.gpu_gemv_worthwhile {
+            return Err(AppError::msg(
+                "vulkan-skip: GPU GEMV slower than CPU on this device",
+            ));
+        }
         let QMatMul::QTensor(qt) = w else {
             return Err(AppError::msg(
                 "vulkan-skip: weight already dequantized (Tensor/F16)",
@@ -159,12 +235,28 @@ impl VulkanContext {
             )));
         }
         let m: usize = x_dims[..x_dims.len() - 1].iter().product::<usize>().max(1);
+        let key = Arc::as_ptr(qt) as usize;
+
+        // Small batches: only use GPU if the weight is already in VRAM (hot layers).
+        // Uploading ephemeral streamed tensors every token is far slower than CPU.
+        if (m as u32) < SMALL_BATCH_CPU {
+            let cached = self
+                .weight_cache
+                .lock()
+                .map_err(|_| AppError::msg("weight cache lock poisoned"))?
+                .contains_key(&key);
+            if !cached {
+                return Err(AppError::msg(
+                    "vulkan-skip: small batch / weight not yet in VRAM cache",
+                ));
+            }
+        }
+
         let a_flat = x_f32
             .reshape((m, k))?
             .flatten_all()?
             .to_vec1::<f32>()?;
 
-        let key = Arc::as_ptr(qt) as usize;
         let w_bytes = qt
             .data()
             .map_err(|e| AppError::msg(format!("QTensor data: {e}")))?;
@@ -190,8 +282,89 @@ impl VulkanContext {
         if cache.contains_key(&key) {
             return Ok(());
         }
+        if cache.len() >= MAX_WEIGHT_CACHE {
+            // Evict an arbitrary entry (streamed tensors churn Arc keys).
+            if let Some(old_key) = cache.keys().next().copied() {
+                if let Some(old) = cache.remove(&old_key) {
+                    self.destroy_buffer(old);
+                }
+            }
+        }
         let buf = self.upload_bytes(bytes)?;
         cache.insert(key, buf);
+        Ok(())
+    }
+
+    fn ensure_scratch(&self) -> Result<()> {
+        let mut slot = self
+            .scratch
+            .lock()
+            .map_err(|_| AppError::msg("scratch lock poisoned"))?;
+        if slot.is_some() {
+            return Ok(());
+        }
+        let x = self.alloc_mapped(
+            64 * 1024,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+        )?;
+        let y = self.alloc_mapped(
+            64 * 1024,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+        )?;
+        let u = self.alloc_mapped(
+            size_of::<[u32; 4]>() as u64,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+        )?;
+
+        let set_layouts = [self.descriptor_set_layout];
+        let alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&set_layouts);
+        let sets = unsafe {
+            self.device
+                .allocate_descriptor_sets(&alloc)
+                .map_err(|e| AppError::msg(format!("allocate_descriptor_sets: {e}")))?
+        };
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cmds = unsafe {
+            self.device
+                .allocate_command_buffers(&alloc_info)
+                .map_err(|e| AppError::msg(format!("allocate_command_buffers: {e}")))?
+        };
+        let fence = unsafe {
+            self.device
+                .create_fence(
+                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                    None,
+                )
+                .map_err(|e| AppError::msg(format!("create_fence: {e}")))?
+        };
+        *slot = Some(SubmitResources {
+            x,
+            y,
+            u,
+            set: sets[0],
+            cmd: cmds[0],
+            fence,
+        });
+        Ok(())
+    }
+
+    fn grow_mapped(&self, scratch: &mut MappedScratch, need: u64, usage: vk::BufferUsageFlags) -> Result<()> {
+        if scratch.capacity >= need {
+            return Ok(());
+        }
+        let new_cap = need.next_power_of_two().max(4096);
+        unsafe {
+            self.device.unmap_memory(scratch.memory);
+            self.device.destroy_buffer(scratch.buffer, None);
+            self.device.free_memory(scratch.memory, None);
+        }
+        let grown = self.alloc_mapped(new_cap, usage)?;
+        *scratch = grown;
         Ok(())
     }
 
@@ -211,6 +384,7 @@ impl VulkanContext {
             .map_err(|_| AppError::msg("vulkan submit lock poisoned"))?;
 
         self.ensure_weight(key, w_bytes)?;
+        self.ensure_scratch()?;
 
         let (w_buffer, w_size) = {
             let cache = self
@@ -223,26 +397,42 @@ impl VulkanContext {
             (w_buf.buffer, w_buf.size)
         };
 
-        let x_buf = self.upload_storage(x)?;
-        let y_buf = self.alloc_storage((c_len * size_of::<f32>()) as u64)?;
+        let x_bytes = (x.len() * size_of::<f32>()) as u64;
+        let y_bytes = (c_len * size_of::<f32>()) as u64;
         let dims = [n, k, m, 0u32];
-        let u_buf = self.upload_uniform(&dims)?;
 
-        let set_layouts = [self.descriptor_set_layout];
-        let alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&set_layouts);
-        let sets = unsafe {
-            self.device
-                .allocate_descriptor_sets(&alloc)
-                .map_err(|e| AppError::msg(format!("allocate_descriptor_sets: {e}")))?
-        };
-        let set = sets[0];
+        let mut scratch_guard = self
+            .scratch
+            .lock()
+            .map_err(|_| AppError::msg("scratch lock poisoned"))?;
+        let scratch = scratch_guard
+            .as_mut()
+            .ok_or_else(|| AppError::msg("scratch missing after ensure"))?;
+
+        self.grow_mapped(
+            &mut scratch.x,
+            x_bytes,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+        )?;
+        self.grow_mapped(
+            &mut scratch.y,
+            y_bytes,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+        )?;
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(x.as_ptr(), scratch.x.ptr as *mut f32, x.len());
+            std::ptr::copy_nonoverlapping(
+                dims.as_ptr(),
+                scratch.u.ptr as *mut u32,
+                4,
+            );
+        }
 
         let x_info = [vk::DescriptorBufferInfo {
-            buffer: x_buf.buffer,
+            buffer: scratch.x.buffer,
             offset: 0,
-            range: x_buf.size,
+            range: x_bytes.max(4),
         }];
         let w_info = [vk::DescriptorBufferInfo {
             buffer: w_buffer,
@@ -250,52 +440,57 @@ impl VulkanContext {
             range: w_size,
         }];
         let y_info = [vk::DescriptorBufferInfo {
-            buffer: y_buf.buffer,
+            buffer: scratch.y.buffer,
             offset: 0,
-            range: y_buf.size,
+            range: y_bytes.max(4),
         }];
         let u_info = [vk::DescriptorBufferInfo {
-            buffer: u_buf.buffer,
+            buffer: scratch.u.buffer,
             offset: 0,
-            range: u_buf.size,
+            range: size_of::<[u32; 4]>() as u64,
         }];
         let writes = [
             vk::WriteDescriptorSet::default()
-                .dst_set(set)
+                .dst_set(scratch.set)
                 .dst_binding(0)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(&x_info),
             vk::WriteDescriptorSet::default()
-                .dst_set(set)
+                .dst_set(scratch.set)
                 .dst_binding(1)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(&w_info),
             vk::WriteDescriptorSet::default()
-                .dst_set(set)
+                .dst_set(scratch.set)
                 .dst_binding(2)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(&y_info),
             vk::WriteDescriptorSet::default()
-                .dst_set(set)
+                .dst_set(scratch.set)
                 .dst_binding(3)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .buffer_info(&u_info),
         ];
         unsafe { self.device.update_descriptor_sets(&writes, &[]) };
 
-        let alloc_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(self.command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let cmds = unsafe {
+        unsafe {
             self.device
-                .allocate_command_buffers(&alloc_info)
-                .map_err(|e| AppError::msg(format!("allocate_command_buffers: {e}")))?
-        };
-        let cmd = cmds[0];
+                .wait_for_fences(&[scratch.fence], true, 60_000_000_000)
+                .map_err(|e| AppError::msg(format!("wait_for_fences(reset): {e}")))?;
+            self.device
+                .reset_fences(&[scratch.fence])
+                .map_err(|e| AppError::msg(format!("reset_fences: {e}")))?;
+            self.device
+                .reset_command_buffer(scratch.cmd, vk::CommandBufferResetFlags::empty())
+                .map_err(|e| AppError::msg(format!("reset_command_buffer: {e}")))?;
+        }
+
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         let groups = (m * n).div_ceil(64);
+        let cmd = scratch.cmd;
+        let set = scratch.set;
+        let fence = scratch.fence;
         unsafe {
             self.device
                 .begin_command_buffer(cmd, &begin)
@@ -316,12 +511,7 @@ impl VulkanContext {
                 .map_err(|e| AppError::msg(format!("end_command_buffer: {e}")))?;
         }
 
-        let fence_info = vk::FenceCreateInfo::default();
-        let fence = unsafe {
-            self.device
-                .create_fence(&fence_info, None)
-                .map_err(|e| AppError::msg(format!("create_fence: {e}")))?
-        };
+        let cmds = [cmd];
         let submits = [vk::SubmitInfo::default().command_buffers(&cmds)];
         unsafe {
             self.device
@@ -332,38 +522,55 @@ impl VulkanContext {
                 .map_err(|e| AppError::msg(format!("wait_for_fences: {e}")))?;
         }
 
-        let out = self.download_f32(&y_buf, c_len)?;
-
+        let mut out = vec![0f32; c_len];
         unsafe {
-            self.device.destroy_fence(fence, None);
-            self.device
-                .free_command_buffers(self.command_pool, &cmds);
-            self.device
-                .free_descriptor_sets(self.descriptor_pool, &sets)
-                .ok();
+            std::ptr::copy_nonoverlapping(scratch.y.ptr as *const f32, out.as_mut_ptr(), c_len);
         }
-        self.destroy_buffer(x_buf);
-        self.destroy_buffer(y_buf);
-        self.destroy_buffer(u_buf);
         Ok(out)
     }
 
-    fn upload_storage(&self, data: &[f32]) -> Result<GpuBuffer> {
-        let bytes = std::mem::size_of_val(data) as u64;
-        let buf = self.alloc_buffer(
-            bytes,
-            vk::BufferUsageFlags::STORAGE_BUFFER,
+    fn alloc_mapped(&self, capacity: u64, usage: vk::BufferUsageFlags) -> Result<MappedScratch> {
+        let capacity = capacity.max(4);
+        let info = vk::BufferCreateInfo::default()
+            .size(capacity)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = unsafe {
+            self.device
+                .create_buffer(&info, None)
+                .map_err(|e| AppError::msg(format!("create_buffer: {e}")))?
+        };
+        let reqs = unsafe { self.device.get_buffer_memory_requirements(buffer) };
+        let memory_type = find_memory_type(
+            &self.instance,
+            self.physical,
+            reqs.memory_type_bits,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(reqs.size)
+            .memory_type_index(memory_type);
+        let memory = unsafe {
+            self.device
+                .allocate_memory(&alloc, None)
+                .map_err(|e| AppError::msg(format!("allocate_memory: {e}")))?
+        };
         unsafe {
-            let ptr = self
-                .device
-                .map_memory(buf.memory, 0, bytes, vk::MemoryMapFlags::empty())
-                .map_err(|e| AppError::msg(format!("map_memory: {e}")))?;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut f32, data.len());
-            self.device.unmap_memory(buf.memory);
+            self.device
+                .bind_buffer_memory(buffer, memory, 0)
+                .map_err(|e| AppError::msg(format!("bind_buffer_memory: {e}")))?;
         }
-        Ok(buf)
+        let ptr = unsafe {
+            self.device
+                .map_memory(memory, 0, capacity, vk::MemoryMapFlags::empty())
+                .map_err(|e| AppError::msg(format!("map_memory: {e}")))? as *mut u8
+        };
+        Ok(MappedScratch {
+            buffer,
+            memory,
+            capacity,
+            ptr,
+        })
     }
 
     fn upload_bytes(&self, data: &[u8]) -> Result<GpuBuffer> {
@@ -382,45 +589,6 @@ impl VulkanContext {
             self.device.unmap_memory(buf.memory);
         }
         Ok(buf)
-    }
-
-    fn upload_uniform(&self, dims: &[u32; 4]) -> Result<GpuBuffer> {
-        let bytes = size_of::<[u32; 4]>() as u64;
-        let buf = self.alloc_buffer(
-            bytes,
-            vk::BufferUsageFlags::UNIFORM_BUFFER,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
-        unsafe {
-            let ptr = self
-                .device
-                .map_memory(buf.memory, 0, bytes, vk::MemoryMapFlags::empty())
-                .map_err(|e| AppError::msg(format!("map_memory: {e}")))?;
-            std::ptr::copy_nonoverlapping(dims.as_ptr(), ptr as *mut u32, 4);
-            self.device.unmap_memory(buf.memory);
-        }
-        Ok(buf)
-    }
-
-    fn alloc_storage(&self, bytes: u64) -> Result<GpuBuffer> {
-        self.alloc_buffer(
-            bytes,
-            vk::BufferUsageFlags::STORAGE_BUFFER,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )
-    }
-
-    fn download_f32(&self, buf: &GpuBuffer, n: usize) -> Result<Vec<f32>> {
-        let mut out = vec![0f32; n];
-        unsafe {
-            let ptr = self
-                .device
-                .map_memory(buf.memory, 0, buf.size, vk::MemoryMapFlags::empty())
-                .map_err(|e| AppError::msg(format!("map_memory: {e}")))?;
-            std::ptr::copy_nonoverlapping(ptr as *const f32, out.as_mut_ptr(), n);
-            self.device.unmap_memory(buf.memory);
-        }
-        Ok(out)
     }
 
     fn alloc_buffer(
@@ -471,12 +639,29 @@ impl VulkanContext {
             self.device.free_memory(buf.memory, None);
         }
     }
+
+    fn destroy_mapped(&self, buf: MappedScratch) {
+        unsafe {
+            self.device.unmap_memory(buf.memory);
+            self.device.destroy_buffer(buf.buffer, None);
+            self.device.free_memory(buf.memory, None);
+        }
+    }
 }
 
 impl Drop for VulkanContext {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            if let Ok(mut scratch) = self.scratch.lock() {
+                if let Some(s) = scratch.take() {
+                    self.device.destroy_fence(s.fence, None);
+                    // Descriptor set / command buffer freed with pools.
+                    self.destroy_mapped(s.x);
+                    self.destroy_mapped(s.y);
+                    self.destroy_mapped(s.u);
+                }
+            }
             if let Ok(mut cache) = self.weight_cache.lock() {
                 for (_, buf) in cache.drain() {
                     self.device.destroy_buffer(buf.buffer, None);
