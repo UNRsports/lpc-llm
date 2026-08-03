@@ -23,7 +23,7 @@
 
 Implementation status against the spec “MoE support · delta-adapter driven · lightweight agent integration”.  
 Project theme: **efficient LLM execution and model creation under constrained resources**  
-Last updated: 2026-08-02
+Last updated: 2026-08-03
 
 ## English table of contents
 
@@ -50,6 +50,7 @@ Last updated: 2026-08-02
 | Extension / Phase 7 | Auto knowledge acquisition & user adaptation (Web + auto-train) | **Done** (conditionally feasible) |
 | Extension / Phase 8 | NVMe-resident project-map & overview memory | **Done** (conditionally feasible) |
 | Extension / Phase 9 | Compute device selection + Candle-stack Vulkan offload | **Done** (first landing) |
+| Extension / Phase 10 | Vulkan real speedup (quantized shaders + VRAM-resident hot weights) | **Not started** |
 
 **Available now:**  
 `lpc-llm run <model> --adapter <name>` (Hybrid LoRA),  
@@ -61,8 +62,10 @@ Last updated: 2026-08-02
 `lpc-llm search` / `knowledge list|purge` / `adapter auto-train` (Phase 7),  
 `lpc-llm project-map build|status|rebuild` / `run --project-map` / `--knowledge` / `--no-user-profile` (Phase 7–8),  
 On MoE GGUF: `experts.pack` + Top-K expert DMA (hybrid).  
-**Not available yet:** multi-GPU PPO in-process; optional hot-swap / inotify watch / 16GB regression bench.  
-**Phase 9 (landing):** `lpc-llm setup` (i18n Q&A) → `[ui]`/`[runtime]` in home `config_lpcllm`; `run --device`; Vulkan QMatMul offload (ash) with CPU fallback.
+`lpc-llm setup` / `run --device` (Phase 9; Vulkan first landing — often **not** faster than CPU yet).  
+**Not available yet:** multi-GPU PPO in-process; optional hot-swap / inotify watch / 16GB regression bench; Phase 10 quantized Vulkan GEMV.  
+**Phase 9 (landing):** setup → `[ui]`/`[runtime]` in home `config_lpcllm`; Vulkan path today = CPU dequant + f32 GEMM + H2D/D2H (GPU busy, decode often slower than `--device cpu`).  
+**Phase 10 (next):** GPU-side Q4_K-class dequant+GEMV; VRAM-resident hot quantized weights; CPU baseline for A/B.
 
 ---
 
@@ -269,6 +272,31 @@ Vulkan compute offload for quantized MatMul on the Candle inference stack (ash +
 - [x] QMatMul hot path: dequant (Candle `QTensor`) + Vulkan GEMM; unsupported → CPU `QMatMul::forward`
 - [x] Wire Hybrid / Eager load + ready banner (`Vulkan+pack+io_uring` / `CPU+…`)
 
+### Phase 10: Vulkan real speedup (quantized shaders + VRAM hot weights) — **Not started**
+
+Phase 9 proves the Vulkan path and may show GPU utilization, but decode often feels **no faster** (or slower) than Candle CPU: every QMatMul still does full CPU dequant → upload f32 weights → naive f32 GEMM → download.  
+**Goal:** make `--device vulkan` competitive with (then faster than) `--device cpu` for hybrid decode.  
+**Deps:** Phase 9 ash / SPIR-V stack + Hybrid hot-layer pin.
+
+#### 10.1 GPU-side quantized MatMul (stop per-call full dequant)
+
+- [ ] SPIR-V / WGSL shaders for **dequant + GEMV/GEMM** on common GGUF types (at least **Q4_K**; then Q5_K / Q8_0 as needed)
+- [ ] Keep weights **quantized on device**; do not CPU-dequantize the full matrix on every forward
+- [ ] Avoid uploading the entire f32 weight matrix each call (activation + tiny staging only, or resident buffers)
+- [ ] Soft-fallback to Candle CPU `QMatMul::forward` for unsupported dtypes (log once)
+
+#### 10.2 VRAM-resident hot quantized weights
+
+- [ ] When pinning hybrid hot layers, also upload quantized weight blobs into **VRAM** (budget vs `--ram-mib` / VRAM softcap)
+- [ ] Streamed (non-hot) layers: optional path later; first target is hot-resident path that dominates TTFT after warmup
+- [ ] Explicit teardown / reuse across turns (no leak across `/clear` or session end)
+
+#### 10.3 CPU baseline & measurement (A/B)
+
+- [ ] Document that **`--device cpu` may still be faster** until 10.1–10.2 land; use it as the comparison baseline
+- [ ] Simple A/B recipe: same model/flags, `--device cpu` vs `--device vulkan` (tokens/s or wall time for fixed prompt)
+- [ ] Optional: warn at startup when Vulkan path is the Phase-9 f32-dequant path (pre-10.1)
+
 ---
 
 ## 4. Spec section status
@@ -317,14 +345,15 @@ Vulkan compute offload for quantized MatMul on the Candle inference stack (ash +
 | LoRA side-path (attach at compute) | **Implemented** (DMA buffers non-destructive) |
 | Expert-unit index / dynamic DMA | **Implemented** (`experts.pack` + `PrefetchRing`) |
 | project-map node `io_uring` prefetch | **Implemented** (`map.bin` + `PrefetchRing`; buffered fallback) |
-| Vulkan QMatMul offload (Candle stack) | **Implemented** (Phase 9; ash + SPIR-V; CPU fallback) |
+| Vulkan QMatMul offload (Candle stack) | **Implemented** (Phase 9; ash + SPIR-V; CPU fallback; often slower than CPU decode) |
+| Vulkan Q4_K-class dequant+GEMV + VRAM hot weights | **Not started** (Phase 10) |
 | ΔW merge at CQE (weight rewrite) | Not adopted (side-path policy) |
 
 ---
 
 ## 5. Recommended next steps
 
-1. **Phase 9** — Finish setup wizard, device resolve, and Vulkan QMatMul offload (see checklist §Phase 9)
+1. **Phase 10** — GPU-side Q4_K dequant+GEMV; VRAM-resident hot quantized weights; A/B vs `--device cpu` (see checklist §Phase 10)
 2. **Phase 6 follow-ups** — Wire real cluster launchers / CUDA backends into `job.remote` and `$LPC_LLM_CONVERT_CMD`
 3. **(Optional)** In-process adapter hot-reload / mid-chat hot-swap (Phase 1 + 7.3 leftovers)
 4. **(Optional)** Distro / package install that ships system `config_lpcllm` with `install.mode = "system"`
@@ -345,7 +374,7 @@ Vulkan compute offload for quantized MatMul on the Candle inference stack (ash +
 
 仕様書「MoE 対応・差分アダプタ駆動・軽量エージェント統合」に対する実装状況。  
 プロジェクトテーマ: **限定的リソース下での LLM 効率化実行とモデル作成**  
-最終更新: 2026-08-02
+最終更新: 2026-08-03
 
 ## 日本語目次
 
@@ -372,6 +401,7 @@ Vulkan compute offload for quantized MatMul on the Candle inference stack (ash +
 | 拡張 / Phase 7 | 自動知識獲得 & ユーザー適応（Web + auto-train） | **完了**（条件付き可能） |
 | 拡張 / Phase 8 | NVMe 常駐 project-map & 俯瞰記憶 | **完了**（条件付き可能） |
 | 拡張 / Phase 9 | 計算デバイス選択 + Candle スタック Vulkan オフロード | **完了**（第一到達） |
+| 拡張 / Phase 10 | Vulkan 本格高速化（量子化シェーダ + VRAM ホット重み常駐） | **未着手** |
 
 **いま使えるもの:**  
 `lpc-llm run <model> --adapter <name>`（Hybrid LoRA）、  
@@ -383,8 +413,10 @@ Vulkan compute offload for quantized MatMul on the Candle inference stack (ash +
 `lpc-llm search` / `knowledge` / `adapter auto-train`（Phase 7）、  
 `lpc-llm project-map` / `run --project-map` / `--knowledge` / `--no-user-profile`（Phase 7–8）、  
 MoE GGUF では `experts.pack` + Top-K Expert DMA（hybrid）。  
-**まだ使えないもの:** プロセス内マルチ GPU PPO；任意のホットスワップ / inotify 監視 / 16GB 回帰ベンチ。  
-**Phase 9（到達目標）:** `lpc-llm setup`（i18n 一問一答）→ ホーム `config_lpcllm` の `[ui]`/`[runtime]`；`run --device`；Vulkan QMatMul オフロード（ash、CPU フォールバック）。
+`lpc-llm setup` / `run --device`（Phase 9；Vulkan 第一到達 — 現状 CPU より速くないことが多い）。  
+**まだ使えないもの:** プロセス内マルチ GPU PPO；任意のホットスワップ / inotify 監視 / 16GB 回帰ベンチ；Phase 10 量子化 Vulkan GEMV。  
+**Phase 9（到達）:** setup → ホーム `config_lpcllm` の `[ui]`/`[runtime]`；現行 Vulkan = CPU dequant + f32 GEMM + 転送（GPU は忙しいがデコードは `--device cpu` より遅いことが多い）。  
+**Phase 10（次）:** GPU 側 Q4_K 系 dequant+GEMV；ホット層量子化重みの VRAM 常駐；CPU との A/B 比較。
 
 ---
 
@@ -591,6 +623,31 @@ Candle 推論スタック上で量子化 MatMul を Vulkan（ash + SPIR-V）へ�
 - [x] QMatMul ホットパス: Candle `QTensor` で dequant + Vulkan GEMM；未対応は CPU `QMatMul::forward`
 - [x] Hybrid / Eager の load と ready 表示（`Vulkan+pack+io_uring` / `CPU+…`）
 
+### Phase 10: Vulkan 本格高速化（量子化シェーダ + VRAM ホット重み常駐） — **未着手**
+
+Phase 9 で Vulkan 経路と GPU 使用率は確認できるが、デコード体感は Candle CPU より速くない（遅い）ことが多い。現行は毎回 CPU でフル dequant → f32 重み転送 → 素朴 f32 GEMM → 結果を戻すため。  
+**目標:** `--device vulkan` を hybrid デコードで `--device cpu` と同等→上回る。  
+**依存:** Phase 9 の ash / SPIR-V スタック + Hybrid ホット層ピン。
+
+#### 10.1 GPU 側量子化 MatMul（毎回フル dequant / 全重み転送をやめる）
+
+- [ ] 主要 GGUF 型向け **dequant + GEMV/GEMM** の SPIR-V / WGSL シェーダ（まず **Q4_K**；必要なら Q5_K / Q8_0）
+- [ ] 重みは **デバイス上で量子化のまま**保持；フォワード毎に行列全体を CPU dequant しない
+- [ ] 毎回の f32 全重みアップロードを避ける（活性化＋小さな staging のみ、または常駐バッファ）
+- [ ] 未対応 dtype は Candle CPU `QMatMul::forward` へソフトフォールバック（ログは一度）
+
+#### 10.2 ホット層量子化重みの VRAM 常駐
+
+- [ ] Hybrid ホット層ピン時に、量子化重みブロブを **VRAM へも**載せる（`--ram-mib` / VRAM ソフトキャップと予算調整）
+- [ ] ストリーム（非ホット）層は後続；まずウォームアップ後 TTFT を支配するホット常駐経路を対象
+- [ ] ターン跨ぎ・`/clear`・セッション終了での明示的解放 / 再利用（リーク防止）
+
+#### 10.3 CPU ベースラインと比較測定（A/B）
+
+- [ ] 10.1–10.2 完了まで **`--device cpu` の方が速い可能性が高い**ことを文書化；比較基準として使う
+- [ ] 簡易 A/B: 同一モデル/フラグで `--device cpu` vs `--device vulkan`（固定プロンプトの tokens/s または壁時計）
+- [ ] （任意）Phase 9 の f32-dequant 経路のままのとき起動時に警告
+
 ---
 
 ## 4. 仕様書セクション別の対応状況
@@ -639,14 +696,15 @@ Candle 推論スタック上で量子化 MatMul を Vulkan（ash + SPIR-V）へ�
 | LoRA サイドパス（計算時アタッチ） | **実装済**（DMA バッファは非破壊） |
 | Expert 単位インデックス / 動的 DMA | **実装済**（`experts.pack` + `PrefetchRing`） |
 | project-map ノード単位 `io_uring` プレフェッチ | **実装済**（`map.bin` + `PrefetchRing`；バッファド可） |
-| Vulkan QMatMul オフロード（Candle スタック） | **実装済**（Phase 9；ash + SPIR-V；CPU フォールバック） |
+| Vulkan QMatMul オフロード（Candle スタック） | **実装済**（Phase 9；ash + SPIR-V；CPU フォールバック；デコードは CPU より遅いことが多い） |
+| Vulkan Q4_K 系 dequant+GEMV + VRAM ホット重み | **未着手**（Phase 10） |
 | CQE 時の ΔW マージ（重み書き換え） | 採用せず（サイドパス方針） |
 
 ---
 
 ## 5. 推奨する次工程
 
-1. **Phase 9** — セットアップウィザード・デバイス解決・Vulkan QMatMul オフロードを完了（工程 §Phase 9）
+1. **Phase 10** — GPU 側 Q4_K dequant+GEMV；ホット層量子化重みの VRAM 常駐；`--device cpu` との A/B（工程 §Phase 10）
 2. **Phase 6 フォロー** — `job.remote` / `$LPC_LLM_CONVERT_CMD` に実クラスタ・CUDA 変換を接続
 3. **（任意）** プロセス内アダプタホットリロード / 会話途中ホットスワップ（Phase 1 + 7.3 残り）
 4. **（任意）** `install.mode = "system"` の `/etc/lpc-llm/config_lpcllm` を同梱するパッケージ化
