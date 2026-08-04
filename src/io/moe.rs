@@ -259,7 +259,11 @@ pub fn slice_fused_expert(
     })
 }
 
-/// Slice a trailing-expert fused tensor `[…, n_expert]` (Gemma 4 `*_exps`).
+/// Slice a trailing-expert fused tensor (Gemma 4 `*_exps`).
+///
+/// GGUF stores expert as the last `ne` (outermost). Candle reverses dims, so the
+/// same tensor appears as `[n_expert, …]` in [`TensorLoc::shape`]. Accept either
+/// end so shape drops the expert axis while bytes stay `size / n_expert` chunks.
 pub fn slice_fused_expert_trailing(
     fused: &TensorLoc,
     expert_id: usize,
@@ -275,10 +279,12 @@ pub fn slice_fused_expert_trailing(
     }
     let per = fused.size_bytes / n_expert;
     let mut shape = fused.shape.clone();
-    if let Some(last) = shape.last_mut() {
-        if *last == n_expert {
-            shape.pop();
-        }
+    if shape.last().copied() == Some(n_expert) {
+        shape.pop();
+    } else if shape.first().copied() == Some(n_expert) {
+        shape.remove(0);
+    } else {
+        return None;
     }
     Some(TensorLoc {
         name: format!("blk.{layer_index}.ffn_{role}.{expert_id}.weight"),
@@ -290,9 +296,10 @@ pub fn slice_fused_expert_trailing(
     })
 }
 
-/// Split one expert's fused `gate_up` `[n_embd, 2*n_ff]` into gate + up halves.
+/// Split one expert's fused `gate_up` into gate + up halves (equal byte sizes).
 ///
-/// Assumes GGML layout with `ne[0]` contiguous and gate|up concatenated on `ne[1]`.
+/// Candle-reversed Gemma 4 stores `[2*n_ff, n_embd]` (prefer splitting dim 0).
+/// Unreversed layouts use `[n_embd, 2*n_ff]` (split dim 1 when dim 0 is odd).
 pub fn split_gate_up_loc(
     gate_up: &TensorLoc,
     layer_index: usize,
@@ -304,14 +311,18 @@ pub fn split_gate_up_loc(
     let half = gate_up.size_bytes / 2;
     let mut gate_shape = gate_up.shape.clone();
     let mut up_shape = gate_up.shape.clone();
-    // Expected `[n_embd, 2*n_ff]` → `[n_embd, n_ff]`.
     if gate_shape.len() >= 2 {
-        let ff2 = gate_shape[1];
-        if ff2 % 2 != 0 {
+        if gate_shape[0] % 2 == 0 {
+            let ff2 = gate_shape[0];
+            gate_shape[0] = ff2 / 2;
+            up_shape[0] = ff2 / 2;
+        } else if gate_shape[1] % 2 == 0 {
+            let ff2 = gate_shape[1];
+            gate_shape[1] = ff2 / 2;
+            up_shape[1] = ff2 / 2;
+        } else {
             return None;
         }
-        gate_shape[1] = ff2 / 2;
-        up_shape[1] = ff2 / 2;
     }
     let gate = TensorLoc {
         name: format!("blk.{layer_index}.ffn_gate.{expert_id}.weight"),
@@ -389,23 +400,46 @@ mod tests {
     #[test]
     fn slice_trailing_and_split_gate_up() {
         use candle_core::quantized::GgmlDType;
+        // Expert last in this synthetic shape (unreversed); after pop → [20, 10].
         let fused = TensorLoc {
             name: "blk.0.ffn_gate_up_exps.weight".into(),
             abs_offset: 0,
             size_bytes: 128 * 200,
             dtype: GgmlDType::F16,
-            shape: vec![10, 20, 128],
+            shape: vec![20, 10, 128],
             rel_offset: 0,
         };
         let e2 = slice_fused_expert_trailing(&fused, 2, 128, "gate_up", 0).unwrap();
         assert_eq!(e2.abs_offset, 2 * 200);
         assert_eq!(e2.size_bytes, 200);
-        assert_eq!(e2.shape, vec![10, 20]);
+        assert_eq!(e2.shape, vec![20, 10]);
         let (g, u) = split_gate_up_loc(&e2, 0, 2).unwrap();
         assert_eq!(g.size_bytes, 100);
         assert_eq!(u.size_bytes, 100);
         assert_eq!(g.shape, vec![10, 10]);
         assert_eq!(u.abs_offset, g.abs_offset + 100);
+    }
+
+    #[test]
+    fn gemma4_candle_reversed_gate_up_slice() {
+        use candle_core::quantized::GgmlDType;
+        // GGUF `[2816, 1408, 128]` → Candle reverses → `[128, 1408, 2816]`.
+        let fused = TensorLoc {
+            name: "blk.0.ffn_gate_up_exps.weight".into(),
+            abs_offset: 1000,
+            size_bytes: 128 * 1408 * 2816 * 2,
+            dtype: GgmlDType::F16,
+            shape: vec![128, 1408, 2816],
+            rel_offset: 0,
+        };
+        let e0 = slice_fused_expert_trailing(&fused, 0, 128, "gate_up", 0).unwrap();
+        assert_eq!(e0.shape, vec![1408, 2816]);
+        assert_eq!(e0.size_bytes, 1408 * 2816 * 2);
+        let (g, u) = split_gate_up_loc(&e0, 0, 0).unwrap();
+        assert_eq!(g.shape, vec![704, 2816]);
+        assert_eq!(u.shape, vec![704, 2816]);
+        assert_eq!(g.size_bytes, u.size_bytes);
+        assert_eq!(u.abs_offset, g.abs_offset + g.size_bytes as u64);
     }
 
     #[test]

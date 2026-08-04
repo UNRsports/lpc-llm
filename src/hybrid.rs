@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::Instant;
 
 use candle_core::quantized::{ggml_file, QMatMul, QTensor};
@@ -23,6 +23,7 @@ use crate::io::moe::{ExpertDmaPlan, MoeInfo};
 use crate::io::nvme::AsyncNvmeReader;
 use crate::io::pack::{ensure_experts_packed, ensure_packed, PackedExperts};
 use crate::io::prefetch::{PrefetchBufferManager, PrefetchRing};
+use crate::progress;
 
 const MAX_SEQ_LEN: usize = 4096;
 
@@ -132,7 +133,18 @@ impl Norm {
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        Ok(ops::rms_norm(xs, &self.weight, self.eps as f32)?)
+        // Candle `rms_norm` only accepts F32 (and matching weight dtype).
+        let xs = if xs.dtype() != DType::F32 {
+            xs.to_dtype(DType::F32)?
+        } else {
+            xs.clone()
+        };
+        let w = if self.weight.dtype() != DType::F32 {
+            self.weight.to_dtype(DType::F32)?
+        } else {
+            self.weight.clone()
+        };
+        Ok(ops::rms_norm(&xs, &w, self.eps as f32)?)
     }
 }
 
@@ -190,6 +202,8 @@ pub struct HybridEngine {
     /// Phase 9 compute backend (CPU / CUDA / Vulkan QMatMul offload).
     compute: ComputeContext,
     device_label: String,
+    /// When true, `forward_hidden` prints per-layer prefill progress on stderr.
+    report_prefill: bool,
 }
 
 /// Expert streaming state: packed plans + dedicated io_uring reader + ring.
@@ -215,6 +229,7 @@ impl HybridEngine {
         let mut map = GgufLayerMap::open(path).map_err(|e| AppError::msg(e.to_string()))?;
         let device = compute.device().clone();
         let device_label = format!("{}+pack+io_uring", compute.label());
+        let phases: u32 = if map.moe.is_some() { 5 } else { 4 };
         eprintln!("compute backend: {}", compute.label());
 
         if map.embedding_length == 0 || map.head_count == 0 {
@@ -226,6 +241,7 @@ impl HybridEngine {
         }
 
         // --- (大) pack rearrange (engine cache; GGUF in blobs/ untouched) ---
+        progress::phase(1, phases, "ensuring layer / expert packs …");
         let packed =
             ensure_packed(path, &map, pack_cache).map_err(|e| AppError::msg(e.to_string()))?;
         map.layers = packed.layers.clone();
@@ -273,6 +289,7 @@ impl HybridEngine {
             always_resident_est,
         );
 
+        progress::phase(2, phases, "allocating prefetch arenas / MoE ring …");
         let slot = packed.recommended_slot_bytes();
         let buffers = match PrefetchBufferManager::new(slot) {
             Ok(b) => b,
@@ -321,9 +338,18 @@ impl HybridEngine {
         let norm_loc = find_hot(&map.hot, "output_norm.weight")?;
         let out_loc = map.hot.iter().find(|t| t.name == "output.weight").cloned();
 
+        progress::phase(
+            3,
+            phases,
+            &format!(
+                "loading embeddings ({:.0} MiB quantized → dequant) …",
+                tok_loc.size_bytes as f64 / (1024.0 * 1024.0)
+            ),
+        );
         let tok_q = read_tensor_from_file(&mut file, tok_loc, &device)?;
         let emb_dim = map.embedding_length;
         // Large-vocab MoE (Gemma 4): keep embeddings in f16 to stay under --ram-mib.
+        progress::note("dequantizing token embeddings …");
         let emb_tensor = tok_q.dequantize(&device)?;
         let emb_tensor = if map.is_gemma4() || emb_tensor.elem_count() > 200_000_000 {
             emb_tensor.to_dtype(DType::F16)?
@@ -425,8 +451,13 @@ impl HybridEngine {
         let mut resident = Vec::with_capacity(n_layers);
         resident.resize_with(n_layers, || None);
         if hot_count > 0 {
-            eprintln!("pinning hot layers 0..{hot_count} into RAM …");
+            progress::phase(
+                4,
+                phases,
+                &format!("pinning hot layers 0..{hot_count} into RAM …"),
+            );
             let mut pack_file = File::open(&packed.pack_path)?;
+            let mut pin_prog = progress::Counter::start("pinned layer", hot_count);
             for i in 0..hot_count {
                 let plan = &packed.layers[i];
                 let mut buf = vec![0u8; plan.read_len];
@@ -437,10 +468,21 @@ impl HybridEngine {
                 // Zero pad remainder already in vec.
                 let layer = materialize_layer(plan, &buf, &map, &device)?;
                 resident[i] = Some(layer);
+                pin_prog.tick();
             }
+        } else {
+            progress::phase(4, phases, "no hot layers to pin (all streamed)");
         }
 
         let stream_count = n_layers.saturating_sub(hot_count);
+        progress::phase(
+            phases,
+            phases,
+            &format!(
+                "ready — arch={} layers={} hot={} stream={}",
+                map.architecture, n_layers, hot_count, stream_count
+            ),
+        );
         eprintln!(
             "hybrid: arch={} layers={} hot={} stream={} slot={} MiB softcap={:?}/{:?} pack={}",
             map.architecture,
@@ -495,6 +537,7 @@ impl HybridEngine {
             avg_compute_us: 0.0,
             compute,
             device_label,
+            report_prefill: false,
         })
     }
 
@@ -588,8 +631,34 @@ impl HybridEngine {
         let mut logits_processor = LogitsProcessor::new(42, Some(temperature), None);
         let eos = eos_ids(tokenizer);
 
+        let n_layers = self.packed_layers.len();
+        progress::phase(
+            1,
+            2,
+            &format!(
+                "prefill {} prompt tokens × {} layers{}",
+                tokens.len(),
+                n_layers,
+                if self.moe_runtime.is_some() {
+                    " (MoE Top-K DMA; first token can take minutes)"
+                } else {
+                    ""
+                }
+            ),
+        );
+        self.report_prefill = true;
+        let t_prefill = Instant::now();
         let input = Tensor::new(tokens.as_slice(), &self.device)?.unsqueeze(0)?;
         let mut logits = prepare_logits(self.forward(&input, 0)?)?;
+        self.report_prefill = false;
+        progress::phase(
+            2,
+            2,
+            &format!(
+                "prefill done in {:.1}s — generating up to {max_tokens} tokens",
+                t_prefill.elapsed().as_secs_f64()
+            ),
+        );
 
         let mut generated = String::new();
         let mut tokens_generated = 0usize;
@@ -668,7 +737,12 @@ impl HybridEngine {
         let (_b, seq_len) = x.dims2()?;
 
         let mut xs = self.embeddings.forward(x)?;
-        // Gemma/Gemma2: scale embeddings by √hidden.
+        // Embeddings may be stored as F16 to save RAM; Candle rms_norm / most
+        // matmuls expect F32 activations.
+        if xs.dtype() != DType::F32 {
+            xs = xs.to_dtype(DType::F32)?;
+        }
+        // Gemma/Gemma2/Gemma4: scale embeddings by √hidden.
         if self.map.is_gemma_family() {
             xs = (xs * (self.map.embedding_length as f64).sqrt())?;
         }
@@ -699,6 +773,10 @@ impl HybridEngine {
                     .ok_or_else(|| AppError::msg(format!("hot layer {i} missing")))?;
                 xs = self.forward_one_layer(i, &layer, &xs, mask.as_ref(), index_pos)?;
                 self.resident[i] = Some(layer);
+                if self.report_prefill {
+                    eprint!("\r  prefill layer {}/{} …", i + 1, n);
+                    let _ = std::io::stderr().flush();
+                }
                 continue;
             }
 
@@ -729,6 +807,10 @@ impl HybridEngine {
                 materialize_layer(&plan, buf.as_slice(), &self.map, &self.device)?
             };
             xs = self.forward_one_layer(i, &layer, &xs, mask.as_ref(), index_pos)?;
+            if self.report_prefill {
+                eprint!("\r  prefill layer {}/{} …", i + 1, n);
+                let _ = std::io::stderr().flush();
+            }
             let compute_us = t_compute.elapsed().as_micros() as f64;
 
             let wait_us = if self.reader.has_in_flight() {
@@ -743,6 +825,10 @@ impl HybridEngine {
             const A: f64 = 0.2;
             self.avg_compute_us = (1.0 - A) * self.avg_compute_us + A * compute_us;
             self.avg_wait_us = (1.0 - A) * self.avg_wait_us + A * wait_us;
+        }
+
+        if self.report_prefill {
+            eprintln!();
         }
 
         self.output_norm.forward(&xs)
@@ -1148,8 +1234,13 @@ impl HybridEngine {
         }
         // Gemma 4: V also gets RMSNorm (unparameterized) when present as separate proj.
         if self.map.is_gemma4() && layer.wv.is_some() {
+            let v_f32 = if v.dtype() != DType::F32 {
+                v.to_dtype(DType::F32)?
+            } else {
+                v
+            };
             let ones = Tensor::ones(head_dim, DType::F32, &self.device)?;
-            v = ops::rms_norm(&v, &ones, self.map.rms_norm_eps as f32)?;
+            v = ops::rms_norm(&v_f32, &ones, self.map.rms_norm_eps as f32)?;
         }
 
         let (rope_cos, rope_sin) = if sliding {
@@ -1532,8 +1623,8 @@ fn apply_rope_maybe_partial(
     partial_dims: Option<usize>,
 ) -> Result<Tensor> {
     let (_b, _h, seq_len, head_dim) = x.dims4()?;
-    let cos = cos.narrow(0, index_pos, seq_len)?;
-    let sin = sin.narrow(0, index_pos, seq_len)?;
+    let cos = cos.narrow(0, index_pos, seq_len)?.contiguous()?;
+    let sin = sin.narrow(0, index_pos, seq_len)?.contiguous()?;
     let x = x.contiguous()?;
     let n_rot = partial_dims.unwrap_or(head_dim).min(head_dim);
     if n_rot == 0 {
@@ -1551,8 +1642,12 @@ fn apply_rope_maybe_partial(
         let x_rot = x.narrow(3, 0, n_rot)?.contiguous()?;
         let x_pass = x.narrow(3, n_rot, head_dim - n_rot)?;
         let n_freq = n_rot / 2;
-        let cos_use = cos.narrow(1, 0, n_freq.min(cos.dim(1)?))?;
-        let sin_use = sin.narrow(1, 0, n_freq.min(sin.dim(1)?))?;
+        let cos_use = cos
+            .narrow(1, 0, n_freq.min(cos.dim(1)?))?
+            .contiguous()?;
+        let sin_use = sin
+            .narrow(1, 0, n_freq.min(sin.dim(1)?))?
+            .contiguous()?;
         let rotated = if neox {
             candle_nn::rotary_emb::rope(&x_rot, &cos_use, &sin_use)?
         } else {

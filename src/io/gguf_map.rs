@@ -369,10 +369,13 @@ impl GgufLayerMap {
             } else {
                 MoeLayout::PerExpert
             };
-            let expert_count = meta_expert_count
-                .max(max_expert_id.saturating_add(1))
-                .max(if saw_fused {
-                    // Infer from fused tensor dims when metadata missing.
+            let expert_count = if meta_expert_count > 1 {
+                // Prefer GGUF metadata. Never `max` with a tensor dim that may be
+                // `expert_feed_forward_length` (e.g. 704) — that blew Gemma 4 up to
+                // 704 "experts" per layer.
+                meta_expert_count
+            } else {
+                max_expert_id.saturating_add(1).max(if saw_fused {
                     fused_by_layer
                         .values()
                         .next()
@@ -380,7 +383,12 @@ impl GgufLayerMap {
                         .map(|(_, info)| {
                             let dims = info.shape.dims();
                             if layout == MoeLayout::FusedGateUpTrailing {
-                                dims.last().copied().unwrap_or(0)
+                                // Candle reverses GGUF dims; trailing expert becomes dims[0].
+                                dims.first()
+                                    .copied()
+                                    .filter(|&d| d > 1)
+                                    .or_else(|| dims.last().copied())
+                                    .unwrap_or(0)
                             } else {
                                 dims.first().copied().unwrap_or(0)
                             }
@@ -388,7 +396,8 @@ impl GgufLayerMap {
                         .unwrap_or(0)
                 } else {
                     0
-                });
+                })
+            };
             let expert_used = if meta_expert_used > 0 {
                 meta_expert_used
             } else if family == MoeFamily::Gemma4 {

@@ -509,6 +509,11 @@ impl ChatSession {
         self.backend.reset_state();
 
         let mut stdout = io::stdout();
+        // Prefill progress goes to stderr; keep the reply marker on stdout.
+        eprintln!(
+            "{} generating (prefill progress on stderr; tokens stream below) …",
+            style("·").cyan()
+        );
         print!("{} ", style("…").green());
         stdout.flush()?;
 

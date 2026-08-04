@@ -14,6 +14,7 @@ mod infer;
 mod io;
 mod job;
 mod knowledge;
+mod progress;
 mod project_map;
 mod pull;
 mod store;

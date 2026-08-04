@@ -14,9 +14,10 @@ use super::error::{IoError, Result};
 use super::gguf_map::{GgufLayerMap, LayerDmaPlan, TensorLoc};
 use super::moe::{ExpertDmaPlan, MoeInfo};
 use super::prefetch::{align_up, DIRECT_ALIGN};
+use crate::progress;
 
 const PACK_VERSION: u32 = 3;
-const EXPERT_PACK_VERSION: u32 = 1;
+const EXPERT_PACK_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PackMeta {
@@ -138,6 +139,10 @@ pub fn ensure_packed(gguf: &Path, map: &GgufLayerMap, cache_dir: &Path) -> Resul
                 && meta.source_mtime_unix == src_meta.1
                 && meta.layer_count == map.layers.len()
             {
+                progress::note(&format!(
+                    "layers.pack cache hit ({} layers)",
+                    map.layers.len()
+                ));
                 let layers = plans_from_meta(&meta, map)?;
                 return Ok(PackedWeights {
                     pack_path,
@@ -148,11 +153,10 @@ pub fn ensure_packed(gguf: &Path, map: &GgufLayerMap, cache_dir: &Path) -> Resul
         }
     }
 
-    eprintln!(
-        "packing {} layers → {} (engine cache; GGUF untouched)",
-        map.layers.len(),
-        pack_path.display()
-    );
+    progress::note(&format!(
+        "building layers.pack ({} layers, one-time; GGUF untouched)",
+        map.layers.len()
+    ));
     build_pack(gguf, map, &pack_path, &meta_path, src_meta)?;
     let meta = load_meta(&meta_path)?;
     let layers = plans_from_meta(&meta, map)?;
@@ -189,6 +193,11 @@ pub fn ensure_experts_packed(
                 && meta.expert_count_total == map.experts.len()
                 && meta.moe.expert_count == moe.expert_count
             {
+                progress::note(&format!(
+                    "experts.pack cache hit ({} experts, top-k={})",
+                    map.experts.len(),
+                    moe.expert_used_count
+                ));
                 let experts = expert_plans_from_meta(&meta, map)?;
                 return Ok(Some(PackedExperts {
                     pack_path,
@@ -200,11 +209,10 @@ pub fn ensure_experts_packed(
         }
     }
 
-    eprintln!(
-        "packing {} experts → {} (MoE sidecar; GGUF untouched)",
-        map.experts.len(),
-        pack_path.display()
-    );
+    progress::note(&format!(
+        "building experts.pack ({} experts, one-time; may take several minutes)",
+        map.experts.len()
+    ));
     build_expert_pack(gguf, map, &moe, &pack_path, &meta_path, src_meta)?;
     let meta = load_expert_meta(&meta_path)?;
     let experts = expert_plans_from_meta(&meta, map)?;
@@ -327,8 +335,9 @@ fn build_pack(
     let mut max_layer = 0usize;
     let mut layers_meta = Vec::with_capacity(map.layers.len());
     let mut scratch = Vec::new();
+    let mut prog = progress::Counter::start("packed layer", map.layers.len());
 
-    for (i, layer) in map.layers.iter().enumerate() {
+    for layer in map.layers.iter() {
         let pad = (DIRECT_ALIGN as u64 - (cursor % DIRECT_ALIGN as u64)) % DIRECT_ALIGN as u64;
         if pad > 0 {
             dst.write_all(&vec![0u8; pad as usize])?;
@@ -374,10 +383,7 @@ fn build_pack(
             payload_bytes: payload,
             tensors: tensors_meta,
         });
-
-        if (i + 1) % 4 == 0 || i + 1 == map.layers.len() {
-            eprintln!("  packed layer {}/{}", i + 1, map.layers.len());
-        }
+        prog.tick();
     }
 
     dst.sync_all()?;
@@ -434,8 +440,9 @@ fn build_expert_pack(
     let mut max_expert = 0usize;
     let mut experts_meta = Vec::with_capacity(map.experts.len());
     let mut scratch = Vec::new();
+    let mut prog = progress::Counter::start("packed expert", map.experts.len());
 
-    for (i, expert) in map.experts.iter().enumerate() {
+    for expert in map.experts.iter() {
         let pad = (DIRECT_ALIGN as u64 - (cursor % DIRECT_ALIGN as u64)) % DIRECT_ALIGN as u64;
         if pad > 0 {
             dst.write_all(&vec![0u8; pad as usize])?;
@@ -480,10 +487,7 @@ fn build_expert_pack(
             payload_bytes: payload,
             tensors: tensors_meta,
         });
-
-        if (i + 1) % 16 == 0 || i + 1 == map.experts.len() {
-            eprintln!("  packed expert {}/{}", i + 1, map.experts.len());
-        }
+        prog.tick();
     }
 
     dst.sync_all()?;
