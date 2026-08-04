@@ -8,8 +8,10 @@ use serde::{Deserialize, Serialize};
 pub enum PromptStyle {
     /// ChatML (`<|im_start|>…`) — SmolLM2, Qwen2.5, etc.
     ChatMl,
-    /// Gemma instruct turns.
+    /// Gemma 1/2/3 instruct turns (`<start_of_turn>`).
     Gemma,
+    /// Gemma 4 IT turns (`<|turn>…`).
+    Gemma4,
     /// Pass the user string through unchanged.
     Raw,
 }
@@ -56,6 +58,21 @@ impl ModelEntry {
                 s.push_str("<start_of_turn>user\n");
                 s.push_str(user);
                 s.push_str("<end_of_turn>\n<start_of_turn>model\n");
+                s
+            }
+            PromptStyle::Gemma4 => {
+                // Bartowski / llama.cpp Gemma 4 IT chat template (text-only; no thought channel).
+                let mut s = String::from("<bos>");
+                for (u, a) in history {
+                    s.push_str("<|turn>user\n");
+                    s.push_str(u);
+                    s.push_str("<turn|>\n<|turn>model\n");
+                    s.push_str(a);
+                    s.push_str("<turn|>\n");
+                }
+                s.push_str("<|turn>user\n");
+                s.push_str(user);
+                s.push_str("<turn|>\n<|turn>model\n");
                 s
             }
             PromptStyle::Raw => {
@@ -145,6 +162,18 @@ pub fn catalog() -> Vec<ModelEntry> {
             approx_size: "~16.5 GB".into(),
             min_ram_hint: "~20 GB (--hybrid streams layers; raise --ram-mib to pin more)".into(),
             prompt_style: PromptStyle::Gemma,
+        },
+        ModelEntry {
+            name: "gemma4:26b-a4b".into(),
+            display: "Gemma 4 26B-A4B Instruct MoE (Q4_K_M)".into(),
+            hf_repo: "bartowski/google_gemma-4-26B-A4B-it-GGUF".into(),
+            gguf_file: "google_gemma-4-26B-A4B-it-Q4_K_M.gguf".into(),
+            // google/gemma-4 is gated; unsloth mirrors tokenizer.json
+            tokenizer_repo: "unsloth/gemma-4-26B-A4B-it".into(),
+            approx_size: "~17.0 GB disk (Q4_K_M); ~3.8B active / 128 experts Top-8 + shared".into(),
+            min_ram_hint: "~16 GB (--hybrid --ram-mib 16384; experts on NVMe, cores+Top-K in RAM)"
+                .into(),
+            prompt_style: PromptStyle::Gemma4,
         },
         ModelEntry {
             name: "qwen2.5:1.5b".into(),

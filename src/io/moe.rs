@@ -1,11 +1,13 @@
 //! MoE expert taxonomy + DMA plans for hybrid streaming.
 //!
-//! Two on-disk GGUF layouts are recognized:
+//! On-disk GGUF layouts recognized:
 //! - **PerExpert** (Mixtral / llama.cpp): `blk.N.ffn_{gate,up,down}.E.weight`
 //! - **FusedExps** (Qwen-MoE etc.): `blk.N.ffn_{gate,up,down}_exps.weight` `[E, …]`
+//! - **FusedGateUp** (Gemma 4): `ffn_gate_up_exps` `[…, E]` + `ffn_down_exps` `[…, E]`
+//!   with a dense shared expert (`ffn_gate/up/down`) resident in `layers.pack`.
 //!
 //! Router (`ffn_gate_inp`) stays with the dense layer core in `layers.pack`.
-//! Experts are rearranged into `experts.pack` for on-demand Top-K DMA.
+//! Routed experts are rearranged into `experts.pack` for on-demand Top-K DMA.
 
 use serde::{Deserialize, Serialize};
 
@@ -18,8 +20,10 @@ use super::prefetch::{align_up, DIRECT_ALIGN};
 pub enum MoeLayout {
     /// One set of gate/up/down tensors per expert index.
     PerExpert,
-    /// Fused `[n_expert, …]` tensors (`*_exps.weight`).
+    /// Fused `[n_expert, …]` tensors (`*_exps.weight`), expert dim leading.
     FusedExps,
+    /// Gemma 4: fused `ffn_gate_up_exps` + `ffn_down_exps`, expert dim trailing.
+    FusedGateUpTrailing,
 }
 
 /// MoE metadata extracted from GGUF (or inferred from tensor names).
@@ -30,6 +34,9 @@ pub struct MoeInfo {
     pub expert_used_count: usize,
     /// Architecture family hint for gating quirks.
     pub family: MoeFamily,
+    /// Dense shared-expert FFN present alongside routed experts (Gemma 4).
+    #[serde(default)]
+    pub has_shared_expert: bool,
 }
 
 /// Coarse arch fork used by the hybrid MoE forward path.
@@ -39,13 +46,16 @@ pub enum MoeFamily {
     Mixtral,
     QwenMoe,
     DeepSeek,
+    Gemma4,
     Unknown,
 }
 
 impl MoeFamily {
     pub fn from_architecture(arch: &str) -> Self {
         let a = arch.to_ascii_lowercase();
-        if a.contains("mixtral") || a == "llama" {
+        if a.contains("gemma4") || a == "gemma4" {
+            Self::Gemma4
+        } else if a.contains("mixtral") || a == "llama" {
             // llama.expert_count > 0 ⇒ Mixtral-style in practice
             Self::Mixtral
         } else if a.contains("qwen") {
@@ -99,6 +109,10 @@ pub fn classify_block_suffix(suffix: &str) -> BlockTensorKind {
     if suffix == "ffn_gate_inp.weight" || suffix.starts_with("ffn_gate_inp.") {
         return BlockTensorKind::Router;
     }
+    // Expert *scales* stay with the layer core (tiny; needed at routing time).
+    if suffix.ends_with("_exps.scale") || suffix.contains("_exps.scale") {
+        return BlockTensorKind::Core;
+    }
     if is_fused_expert_suffix(suffix) || is_per_expert_suffix(suffix).is_some() {
         return BlockTensorKind::Expert;
     }
@@ -108,7 +122,10 @@ pub fn classify_block_suffix(suffix: &str) -> BlockTensorKind {
 pub fn is_fused_expert_suffix(suffix: &str) -> bool {
     matches!(
         suffix,
-        "ffn_gate_exps.weight" | "ffn_up_exps.weight" | "ffn_down_exps.weight"
+        "ffn_gate_exps.weight"
+            | "ffn_up_exps.weight"
+            | "ffn_down_exps.weight"
+            | "ffn_gate_up_exps.weight"
     )
 }
 
@@ -130,6 +147,7 @@ pub fn fused_role(suffix: &str) -> Option<&'static str> {
         "ffn_gate_exps.weight" => Some("gate"),
         "ffn_up_exps.weight" => Some("up"),
         "ffn_down_exps.weight" => Some("down"),
+        "ffn_gate_up_exps.weight" => Some("gate_up"),
         _ => None,
     }
 }
@@ -241,6 +259,79 @@ pub fn slice_fused_expert(
     })
 }
 
+/// Slice a trailing-expert fused tensor `[…, n_expert]` (Gemma 4 `*_exps`).
+pub fn slice_fused_expert_trailing(
+    fused: &TensorLoc,
+    expert_id: usize,
+    n_expert: usize,
+    role: &str,
+    layer_index: usize,
+) -> Option<TensorLoc> {
+    if n_expert == 0 || expert_id >= n_expert {
+        return None;
+    }
+    if fused.size_bytes % n_expert != 0 {
+        return None;
+    }
+    let per = fused.size_bytes / n_expert;
+    let mut shape = fused.shape.clone();
+    if let Some(last) = shape.last_mut() {
+        if *last == n_expert {
+            shape.pop();
+        }
+    }
+    Some(TensorLoc {
+        name: format!("blk.{layer_index}.ffn_{role}.{expert_id}.weight"),
+        abs_offset: fused.abs_offset + (expert_id * per) as u64,
+        size_bytes: per,
+        dtype: fused.dtype,
+        shape,
+        rel_offset: 0,
+    })
+}
+
+/// Split one expert's fused `gate_up` `[n_embd, 2*n_ff]` into gate + up halves.
+///
+/// Assumes GGML layout with `ne[0]` contiguous and gate|up concatenated on `ne[1]`.
+pub fn split_gate_up_loc(
+    gate_up: &TensorLoc,
+    layer_index: usize,
+    expert_id: usize,
+) -> Option<(TensorLoc, TensorLoc)> {
+    if gate_up.size_bytes % 2 != 0 {
+        return None;
+    }
+    let half = gate_up.size_bytes / 2;
+    let mut gate_shape = gate_up.shape.clone();
+    let mut up_shape = gate_up.shape.clone();
+    // Expected `[n_embd, 2*n_ff]` → `[n_embd, n_ff]`.
+    if gate_shape.len() >= 2 {
+        let ff2 = gate_shape[1];
+        if ff2 % 2 != 0 {
+            return None;
+        }
+        gate_shape[1] = ff2 / 2;
+        up_shape[1] = ff2 / 2;
+    }
+    let gate = TensorLoc {
+        name: format!("blk.{layer_index}.ffn_gate.{expert_id}.weight"),
+        abs_offset: gate_up.abs_offset,
+        size_bytes: half,
+        dtype: gate_up.dtype,
+        shape: gate_shape,
+        rel_offset: 0,
+    };
+    let up = TensorLoc {
+        name: format!("blk.{layer_index}.ffn_up.{expert_id}.weight"),
+        abs_offset: gate_up.abs_offset + half as u64,
+        size_bytes: half,
+        dtype: gate_up.dtype,
+        shape: up_shape,
+        rel_offset: 0,
+    };
+    Some((gate, up))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,11 +352,16 @@ mod tests {
             classify_block_suffix("attn_q.weight"),
             BlockTensorKind::Core
         );
+        assert_eq!(
+            classify_block_suffix("ffn_down_exps.scale"),
+            BlockTensorKind::Core
+        );
     }
 
     #[test]
     fn classify_fused_names() {
         assert!(is_fused_expert_suffix("ffn_gate_exps.weight"));
+        assert!(is_fused_expert_suffix("ffn_gate_up_exps.weight"));
         assert_eq!(
             classify_block_suffix("ffn_down_exps.weight"),
             BlockTensorKind::Expert
@@ -288,5 +384,33 @@ mod tests {
         assert_eq!(e3.size_bytes, 100);
         assert_eq!(e3.shape, vec![10, 5]);
         assert_eq!(e3.name, "blk.0.ffn_gate.3.weight");
+    }
+
+    #[test]
+    fn slice_trailing_and_split_gate_up() {
+        use candle_core::quantized::GgmlDType;
+        let fused = TensorLoc {
+            name: "blk.0.ffn_gate_up_exps.weight".into(),
+            abs_offset: 0,
+            size_bytes: 128 * 200,
+            dtype: GgmlDType::F16,
+            shape: vec![10, 20, 128],
+            rel_offset: 0,
+        };
+        let e2 = slice_fused_expert_trailing(&fused, 2, 128, "gate_up", 0).unwrap();
+        assert_eq!(e2.abs_offset, 2 * 200);
+        assert_eq!(e2.size_bytes, 200);
+        assert_eq!(e2.shape, vec![10, 20]);
+        let (g, u) = split_gate_up_loc(&e2, 0, 2).unwrap();
+        assert_eq!(g.size_bytes, 100);
+        assert_eq!(u.size_bytes, 100);
+        assert_eq!(g.shape, vec![10, 10]);
+        assert_eq!(u.abs_offset, g.abs_offset + 100);
+    }
+
+    #[test]
+    fn gemma4_family_detect() {
+        assert_eq!(MoeFamily::from_architecture("gemma4"), MoeFamily::Gemma4);
+        assert_eq!(MoeFamily::from_architecture("gemma3"), MoeFamily::Unknown);
     }
 }

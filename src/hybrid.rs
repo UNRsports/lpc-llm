@@ -96,13 +96,28 @@ enum FeedForward {
     Dense(Mlp),
     MoE {
         router: QMatMul,
+        /// Gemma 4: `ffn_gate_inp.scale` (elementwise before router).
+        router_scale: Option<Tensor>,
+        /// Gemma 4 shared expert (dense `ffn_gate/up/down`); absent on Mixtral/Qwen.
+        shared: Option<Mlp>,
+        /// Gemma 4: `pre_ffw_norm_2` before routed experts.
+        pre_ffw_norm_2: Option<Norm>,
+        /// Gemma 4: `post_ffw_norm_1` after shared expert.
+        post_ffw_norm_1: Option<Norm>,
+        /// Gemma 4: `post_ffw_norm_2` after routed experts.
+        post_ffw_norm_2: Option<Norm>,
+        /// Per-expert down scales (`ffn_down_exps.scale`), length = n_expert.
+        expert_down_scales: Option<Vec<f32>>,
         n_expert_used: usize,
         use_gelu: bool,
+        /// Special Gemma 4 router: rms_norm(attn_out)/sqrt(n) * scale → logits.
+        gemma4_router: bool,
     },
 }
 
 /// RMSNorm. GGUF Gemma weights are already converted to full scale `(1+δ)`
 /// by the HF→GGUF exporter, so we always multiply by `w` (never `1+w` again).
+#[derive(Clone)]
 struct Norm {
     weight: Tensor,
     eps: f64,
@@ -124,15 +139,18 @@ impl Norm {
 struct LayerLive {
     wq: QMatMul,
     wk: QMatMul,
-    wv: QMatMul,
+    /// Absent on some Gemma 4 global layers (`attention_k_eq_v`).
+    wv: Option<QMatMul>,
     wo: QMatMul,
     attn_norm: Norm,
     ffn_norm: Norm,
     post_attention_norm: Option<Norm>,
     post_ffw_norm: Option<Norm>,
-    /// Gemma 3 QK-Norm (per-head dim).
+    /// Gemma 3/4 QK-Norm (per-head dim).
     attn_q_norm: Option<Norm>,
     attn_k_norm: Option<Norm>,
+    /// Gemma 4 `layer_output_scale`.
+    layer_output_scale: Option<Tensor>,
     ff: FeedForward,
 }
 
@@ -221,7 +239,24 @@ impl HybridEngine {
             map.moe = Some(pe.moe.clone());
         }
 
-        let slot = packed.recommended_slot_bytes();
+        // Estimate always-resident bytes (embeddings dequantized below; use Q size ×2 as f16 floor).
+        let emb_q_bytes = map
+            .hot
+            .iter()
+            .find(|t| t.name == "token_embd.weight")
+            .map(|t| t.size_bytes)
+            .unwrap_or(0);
+        // f16 dequant of large emb ≈ 2× Q8 / roughly vocab*dim*2; use max(q, rough f16).
+        let emb_f16_est = map.embedding_length.saturating_mul(262_144).saturating_mul(2);
+        let always_resident_est = emb_q_bytes
+            .saturating_mul(2)
+            .max(if map.is_gemma4() {
+                emb_f16_est
+            } else {
+                emb_q_bytes
+            })
+            .saturating_add(64 * 1024 * 1024); // norms / lm_head / KV headroom beyond the 512 MiB reserve
+
         let hot_count = choose_hot_layers(
             map.layers.len(),
             packed.max_layer_bytes,
@@ -230,10 +265,15 @@ impl HybridEngine {
             config.adapter_resident_bytes,
             packed_experts
                 .as_ref()
-                .map(|p| p.recommended_slot_bytes().saturating_mul(p.moe.expert_used_count.max(2)))
+                .map(|p| {
+                    p.recommended_slot_bytes()
+                        .saturating_mul(p.moe.expert_used_count.max(2))
+                })
                 .unwrap_or(0),
+            always_resident_est,
         );
 
+        let slot = packed.recommended_slot_bytes();
         let buffers = match PrefetchBufferManager::new(slot) {
             Ok(b) => b,
             Err(e) => {
@@ -283,7 +323,19 @@ impl HybridEngine {
 
         let tok_q = read_tensor_from_file(&mut file, tok_loc, &device)?;
         let emb_dim = map.embedding_length;
-        let embeddings = Embedding::new(tok_q.dequantize(&device)?, emb_dim);
+        // Large-vocab MoE (Gemma 4): keep embeddings in f16 to stay under --ram-mib.
+        let emb_tensor = tok_q.dequantize(&device)?;
+        let emb_tensor = if map.is_gemma4() || emb_tensor.elem_count() > 200_000_000 {
+            emb_tensor.to_dtype(DType::F16)?
+        } else {
+            emb_tensor
+        };
+        let emb_resident = emb_tensor.elem_count()
+            * match emb_tensor.dtype() {
+                DType::F16 | DType::BF16 => 2,
+                _ => 4,
+            };
+        let embeddings = Embedding::new(emb_tensor, emb_dim);
         let output_norm = Norm::from_qtensor(
             read_tensor_from_file(&mut file, norm_loc, &device)?,
             map.rms_norm_eps,
@@ -295,10 +347,10 @@ impl HybridEngine {
 
         let (cos, sin) =
             precompute_rope(map.head_dim.max(map.rope_dim), map.rope_freq_base, &device)?;
-        let (cos_local, sin_local) = if map.is_gemma3() {
+        let (cos_local, sin_local) = if map.is_gemma3() || map.is_gemma4() {
             let local_base = map.rope_freq_base_local.unwrap_or(10_000.0);
-            let (c, s) =
-                precompute_rope(map.head_dim.max(map.rope_dim), local_base, &device)?;
+            let local_dim = map.head_dim_local.unwrap_or(map.head_dim);
+            let (c, s) = precompute_rope(local_dim, local_base, &device)?;
             (Some(c), Some(s))
         } else {
             (None, None)
@@ -308,32 +360,52 @@ impl HybridEngine {
 
         if map.has_vision_tensors() {
             eprintln!(
-                "warning: GGUF includes vision/projector tensors — Phase 11 text-only; \
+                "warning: GGUF includes vision/projector tensors — Phase 12 text-only; \
                  image input is not implemented (language weights still run)"
             );
         }
-        if map.is_gemma3() {
+        if map.is_gemma3() || map.is_gemma4() {
             let n_local = map.layer_is_sliding.iter().filter(|&&s| s).count();
             let n_global = n_layers.saturating_sub(n_local);
+            let label = if map.is_gemma4() { "gemma4" } else { "gemma3" };
             eprintln!(
-                "gemma3: sliding_window={:?} pattern={} local_layers={n_local} global_layers={n_global} \
-                 rope_global={} rope_local={}",
+                "{label}: sliding_window={:?} local_layers={n_local} global_layers={n_global} \
+                 rope_global={} rope_local={} head_dim={}/{:?}",
                 map.sliding_window,
-                if map.sliding_window_pattern >= 2 {
-                    map.sliding_window_pattern
-                } else {
-                    6
-                },
                 map.rope_freq_base,
-                map.rope_freq_base_local.unwrap_or(10_000.0)
+                map.rope_freq_base_local.unwrap_or(10_000.0),
+                map.head_dim,
+                map.head_dim_local
             );
-            if n_layers >= 40 {
+            if map.is_gemma4() {
+                if let Some(ref moe) = map.moe {
+                    eprintln!(
+                        "gemma4 MoE: experts={} top-k={} shared={} layout={:?} \
+                         target resident ≤ --ram-mib (experts on NVMe)",
+                        moe.expert_count,
+                        moe.expert_used_count,
+                        moe.has_shared_expert,
+                        moe.layout
+                    );
+                }
+                eprintln!(
+                    "hint: gemma4:26b-a4b — prefer `--hybrid --ram-mib 16384`; \
+                     ctx capped at {MAX_SEQ_LEN} for this build (full 256K later)"
+                );
+            } else if n_layers >= 40 {
                 eprintln!(
                     "hint: gemma3 large — prefer `--ram-mib 16384`+ (or `--hot-layers N`) so \
                      fewer layers stream from NVMe; ctx capped at {MAX_SEQ_LEN} for this build"
                 );
             }
         }
+
+        let emb_mib = emb_resident as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "hybrid resident estimate: emb≈{emb_mib:.0} MiB + hot_layers={hot_count} \
+             + 2×slot + MoE ring (budget {} MiB)",
+            config.ram_budget_mib
+        );
 
         let mut lora = vec![LayerLora::default(); n_layers];
         if let Some(set) = adapter {
@@ -388,9 +460,9 @@ impl HybridEngine {
             );
         }
         if let Some(sw) = map.sliding_window {
-            if map.is_gemma3() {
+            if map.is_gemma3() || map.is_gemma4() {
                 eprintln!(
-                    "hybrid: sliding_window={sw} (Gemma3 local layers; global layers use full causal)"
+                    "hybrid: sliding_window={sw} (Gemma local layers; global layers use full causal)"
                 );
             } else {
                 eprintln!("hybrid: sliding_window={sw} (short prompts use full causal mask)");
@@ -694,29 +766,202 @@ impl HybridEngine {
         let x = (attn + residual)?;
 
         let residual = &x;
-        let x = layer.ffn_norm.forward(&x)?;
         let x = {
             let lora = self.lora.get(layer_idx);
             match &layer.ff {
-                FeedForward::Dense(mlp) => mlp.forward(&self.compute, &x, lora)?,
+                FeedForward::Dense(mlp) => {
+                    let x = layer.ffn_norm.forward(residual)?;
+                    mlp.forward(&self.compute, &x, lora)?
+                }
+                FeedForward::MoE {
+                    gemma4_router: true,
+                    ..
+                } => self.forward_moe_gemma4(layer_idx, layer, residual)?,
                 FeedForward::MoE {
                     router,
                     n_expert_used,
                     use_gelu,
-                } => self.forward_moe(
-                    layer_idx,
-                    router,
-                    *n_expert_used,
-                    *use_gelu,
-                    &x,
-                )?,
+                    gemma4_router: false,
+                    ..
+                } => {
+                    let x = layer.ffn_norm.forward(residual)?;
+                    self.forward_moe(layer_idx, router, *n_expert_used, *use_gelu, &x)?
+                }
             }
         };
         let x = match &layer.post_ffw_norm {
             Some(n) => n.forward(&x)?,
             None => x,
         };
-        Ok((x + residual)?)
+        let mut out = (x + residual)?;
+        if let Some(scale) = &layer.layer_output_scale {
+            out = out.broadcast_mul(scale)?;
+        }
+        Ok(out)
+    }
+
+    /// Gemma 4 MoE: shared dense expert ∥ Top-K routed experts (llama.cpp gemma4 graph).
+    fn forward_moe_gemma4(
+        &mut self,
+        layer_idx: usize,
+        layer: &LayerLive,
+        attn_out: &Tensor,
+    ) -> Result<Tensor> {
+        let (
+            shared,
+            router,
+            router_scale,
+            pre_ffw_norm_2,
+            post_ffw_norm_1,
+            post_ffw_norm_2,
+            down_scales,
+            n_expert_used,
+            use_gelu,
+        ) = match &layer.ff {
+            FeedForward::MoE {
+                router,
+                router_scale,
+                shared: Some(shared),
+                pre_ffw_norm_2,
+                post_ffw_norm_1,
+                post_ffw_norm_2,
+                expert_down_scales,
+                n_expert_used,
+                use_gelu,
+                gemma4_router: true,
+            } => (
+                // Clone MLP handles (QMatMul is Arc-backed / cheap).
+                Mlp {
+                    gate: shared.gate.clone(),
+                    up: shared.up.clone(),
+                    down: shared.down.clone(),
+                    use_gelu: shared.use_gelu,
+                },
+                router.clone(),
+                router_scale.clone(),
+                pre_ffw_norm_2.clone(),
+                post_ffw_norm_1.clone(),
+                post_ffw_norm_2.clone(),
+                expert_down_scales.clone(),
+                *n_expert_used,
+                *use_gelu,
+            ),
+            _ => {
+                return Err(AppError::msg(
+                    "forward_moe_gemma4: not a Gemma4 MoE layer with shared expert",
+                ))
+            }
+        };
+        let ffn_norm = Norm {
+            weight: layer.ffn_norm.weight.clone(),
+            eps: layer.ffn_norm.eps,
+        };
+
+        // Shared expert path.
+        let mut cur_mlp = ffn_norm.forward(attn_out)?;
+        cur_mlp = shared.forward(&self.compute, &cur_mlp, None)?;
+        if let Some(n) = &post_ffw_norm_1 {
+            cur_mlp = n.forward(&cur_mlp)?;
+        }
+
+        // Routed experts path.
+        let mut cur_moe = match &pre_ffw_norm_2 {
+            Some(n) => n.forward(attn_out)?,
+            None => attn_out.clone(),
+        };
+
+        let (b_size, seq_len, hidden_dim) = attn_out.dims3()?;
+        let flat = attn_out.reshape(((), hidden_dim))?;
+        let ones = Tensor::ones(hidden_dim, DType::F32, &self.device)?;
+        let mut tmp = ops::rms_norm(&flat, &ones, self.map.rms_norm_eps as f32)?;
+        let scale = 1.0f64 / (hidden_dim as f64).sqrt();
+        tmp = (tmp * scale)?;
+        if let Some(rs) = &router_scale {
+            tmp = tmp.broadcast_mul(rs)?;
+        }
+        let router_logits = self.compute.qmatmul(&router, &tmp)?;
+        let routing = ops::softmax_last_dim(&router_logits)?;
+        let routing_vec = routing.to_vec2::<f32>()?;
+
+        let n_expert = routing_vec.first().map(|r| r.len()).unwrap_or(0);
+        let mut top_x: Vec<Vec<u32>> = vec![Vec::new(); n_expert];
+        let mut selected_rws: Vec<Vec<f32>> = vec![Vec::new(); n_expert];
+        let hints = self.expert_prefetch_hints.clone();
+
+        for (row_idx, rw) in routing_vec.iter().enumerate() {
+            let mut dst: Vec<u32> = (0..rw.len() as u32).collect();
+            dst.sort_by(|&i, &j| {
+                let mut wi = rw[i as usize];
+                let mut wj = rw[j as usize];
+                if hints.contains(&(i as usize)) {
+                    wi *= 1.05;
+                }
+                if hints.contains(&(j as usize)) {
+                    wj *= 1.05;
+                }
+                wj.total_cmp(&wi)
+            });
+            let mut sum = 0f32;
+            for &expert_idx in dst.iter().take(n_expert_used) {
+                sum += rw[expert_idx as usize];
+            }
+            let norm = if sum > 0.0 { sum } else { 1.0 };
+            for &expert_idx in dst.iter().take(n_expert_used) {
+                let expert_idx = expert_idx as usize;
+                top_x[expert_idx].push(row_idx as u32);
+                selected_rws[expert_idx].push(rw[expert_idx] / norm);
+            }
+        }
+
+        let xs_flat = cur_moe.reshape(((), hidden_dim))?;
+        let mut ys = xs_flat.zeros_like()?;
+        let active: Vec<usize> = top_x
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| if v.is_empty() { None } else { Some(i) })
+            .collect();
+
+        for (ai, &expert_id) in active.iter().enumerate() {
+            let slot = ai
+                % self
+                    .moe_runtime
+                    .as_ref()
+                    .map(|m| m.ring.len())
+                    .unwrap_or(2);
+            if let Some(&next_id) = active.get(ai + 1) {
+                let next_slot = (ai + 1)
+                    % self
+                        .moe_runtime
+                        .as_ref()
+                        .map(|m| m.ring.len())
+                        .unwrap_or(2);
+                self.dma_expert(layer_idx, next_id, next_slot)?;
+            }
+            let mlp = self.load_expert_mlp(layer_idx, expert_id, slot, use_gelu)?;
+            let row_ids = &top_x[expert_id];
+            if row_ids.is_empty() {
+                continue;
+            }
+            let index = Tensor::new(row_ids.as_slice(), &self.device)?;
+            let indexed = xs_flat.index_select(&index, 0)?;
+            let mut out = mlp.forward(&self.compute, &indexed, None)?;
+            if let Some(ref scales) = down_scales {
+                if let Some(&s) = scales.get(expert_id) {
+                    out = (out * f64::from(s))?;
+                }
+            }
+            let rw = Tensor::new(selected_rws[expert_id].as_slice(), &self.device)?
+                .reshape((row_ids.len(), 1))?;
+            let weighted = out.broadcast_mul(&rw)?;
+            ys = ys.index_add(&index, &weighted, 0)?;
+        }
+
+        cur_moe = ys.reshape((b_size, seq_len, hidden_dim))?;
+        if let Some(n) = &post_ffw_norm_2 {
+            cur_moe = n.forward(&cur_moe)?;
+        }
+
+        Ok((cur_mlp + cur_moe)?)
     }
 
     /// Gating → Top-K → expert DMA from `experts.pack` → weighted combine.
@@ -865,8 +1110,8 @@ impl HybridEngine {
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _n_embd) = x.dims3()?;
         let n_head = self.map.head_count;
-        let n_kv = self.map.head_count_kv;
-        let head_dim = self.map.head_dim;
+        let n_kv = self.map.head_count_kv_for_layer(layer_idx);
+        let head_dim = self.map.head_dim_for_layer(layer_idx);
         let sliding = self.map.layer_sliding(layer_idx);
         let window = self.map.sliding_window.unwrap_or(0);
 
@@ -874,7 +1119,10 @@ impl HybridEngine {
             let lora = self.lora.get(layer_idx);
             let q = qmm(&self.compute, &layer.wq, lora.and_then(|l| l.q.as_ref()), x)?;
             let k = qmm(&self.compute, &layer.wk, lora.and_then(|l| l.k.as_ref()), x)?;
-            let v = qmm(&self.compute, &layer.wv, lora.and_then(|l| l.v.as_ref()), x)?;
+            let v = match &layer.wv {
+                Some(wv) => qmm(&self.compute, wv, lora.and_then(|l| l.v.as_ref()), x)?,
+                None => k.clone(), // Gemma 4 attention_k_eq_v
+            };
             (q, k, v)
         };
 
@@ -886,17 +1134,22 @@ impl HybridEngine {
             .reshape((b_sz, seq_len, n_kv, head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
-        let v = v
+        let mut v = v
             .reshape((b_sz, seq_len, n_kv, head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
 
-        // Gemma 3: QK-Norm before RoPE (replaces Gemma 2 attn softcap).
+        // Gemma 3/4: QK-Norm before RoPE (replaces Gemma 2 attn softcap).
         if let Some(n) = &layer.attn_q_norm {
             q = n.forward(&q)?;
         }
         if let Some(n) = &layer.attn_k_norm {
             k = n.forward(&k)?;
+        }
+        // Gemma 4: V also gets RMSNorm (unparameterized) when present as separate proj.
+        if self.map.is_gemma4() && layer.wv.is_some() {
+            let ones = Tensor::ones(head_dim, DType::F32, &self.device)?;
+            v = ops::rms_norm(&v, &ones, self.map.rms_norm_eps as f32)?;
         }
 
         let (rope_cos, rope_sin) = if sliding {
@@ -907,8 +1160,27 @@ impl HybridEngine {
         } else {
             (&self.cos, &self.sin)
         };
-        let q = apply_rope(&q, rope_cos, rope_sin, index_pos, self.map.is_gemma_family())?;
-        let k = apply_rope(&k, rope_cos, rope_sin, index_pos, self.map.is_gemma_family())?;
+        let rope_dims = if sliding {
+            None
+        } else {
+            self.map.rope_dim_global
+        };
+        let q = apply_rope_maybe_partial(
+            &q,
+            rope_cos,
+            rope_sin,
+            index_pos,
+            self.map.is_gemma_family(),
+            rope_dims,
+        )?;
+        let k = apply_rope_maybe_partial(
+            &k,
+            rope_cos,
+            rope_sin,
+            index_pos,
+            self.map.is_gemma_family(),
+            rope_dims,
+        )?;
 
         let (mut k, mut v) = match &self.kv_cache[layer_idx] {
             None => (k, v),
@@ -934,8 +1206,12 @@ impl HybridEngine {
         let k = repeat_kv(k, n_head / n_kv.max(1))?;
         let v = repeat_kv(v, n_head / n_kv.max(1))?;
 
-        let mut att = (q.matmul(&k.t()?)? / (head_dim as f64).sqrt())?;
-        // Gemma 2 softcap only when present (Gemma 3 uses QK-Norm instead).
+        let scale = self
+            .map
+            .attention_scale
+            .unwrap_or(1.0 / (head_dim as f64).sqrt());
+        let mut att = (q.matmul(&k.t()?)? * scale)?;
+        // Gemma 2 softcap only when present (Gemma 3/4 use QK-Norm instead).
         if let Some(sc) = self.map.attn_logit_softcapping {
             att = ((att / sc)?.tanh()? * sc)?;
         }
@@ -1002,6 +1278,7 @@ fn choose_hot_layers(
     override_hot: Option<usize>,
     adapter_resident_bytes: usize,
     expert_ring_bytes: usize,
+    always_resident_bytes: usize,
 ) -> usize {
     if let Some(h) = override_hot {
         return h.min(n_layers);
@@ -1010,12 +1287,14 @@ fn choose_hot_layers(
         return 0;
     }
     let budget = budget_mib.saturating_mul(1024 * 1024);
-    // Reserve two prefetch slots + ~512 MiB headroom (KV / runtime) + adapter + MoE ring.
+    // Reserve two prefetch slots + ~512 MiB headroom (KV / runtime) + adapter + MoE ring
+    // + always-resident emb/lm_head.
     let reserve = layer_bytes
         .saturating_mul(2)
         .saturating_add(512 * 1024 * 1024)
         .saturating_add(adapter_resident_bytes)
-        .saturating_add(expert_ring_bytes);
+        .saturating_add(expert_ring_bytes)
+        .saturating_add(always_resident_bytes);
     let hot_budget = budget.saturating_sub(reserve);
     let by_ram = hot_budget / layer_bytes;
     // Keep as many layers resident as the RAM budget allows. The old hard
@@ -1049,6 +1328,12 @@ fn build_layer_live(
         let loc = require_tensor(plan, suffix)?;
         Ok(qtensor_from_loc(loc, dma, device)?)
     };
+    let opt_q = |suffix: &str| -> Result<Option<QTensor>> {
+        match try_tensor(plan, suffix) {
+            Some(loc) => Ok(Some(qtensor_from_loc(loc, dma, device)?)),
+            None => Ok(None),
+        }
+    };
     let opt_norm = |suffix: &str| -> Result<Option<Norm>> {
         match try_tensor(plan, suffix) {
             Some(loc) => Ok(Some(Norm::from_qtensor(
@@ -1059,24 +1344,61 @@ fn build_layer_live(
         }
     };
 
-    let ff = if try_tensor(plan, "ffn_gate.weight").is_some() {
+    let ff = if try_tensor(plan, "ffn_gate_inp.weight").is_some() {
+        let n_used = map
+            .moe
+            .as_ref()
+            .map(|m| m.expert_used_count)
+            .unwrap_or(2);
+        let gemma4 = map.is_gemma4()
+            || map
+                .moe
+                .as_ref()
+                .map(|m| m.family == crate::io::moe::MoeFamily::Gemma4)
+                .unwrap_or(false);
+        let shared = if try_tensor(plan, "ffn_gate.weight").is_some() {
+            Some(Mlp {
+                gate: QMatMul::from_qtensor(q("ffn_gate.weight")?)?,
+                down: QMatMul::from_qtensor(q("ffn_down.weight")?)?,
+                up: QMatMul::from_qtensor(q("ffn_up.weight")?)?,
+                use_gelu: gemma,
+            })
+        } else {
+            None
+        };
+        let router_scale = match try_tensor(plan, "ffn_gate_inp.scale") {
+            Some(loc) => {
+                let t = qtensor_from_loc(loc, dma, device)?.dequantize(device)?;
+                Some(t)
+            }
+            None => None,
+        };
+        let expert_down_scales = match try_tensor(plan, "ffn_down_exps.scale") {
+            Some(loc) => {
+                let t = qtensor_from_loc(loc, dma, device)?.dequantize(device)?;
+                Some(t.flatten_all()?.to_vec1::<f32>()?)
+            }
+            None => None,
+        };
+        FeedForward::MoE {
+            router: QMatMul::from_qtensor(q("ffn_gate_inp.weight")?)?,
+            router_scale,
+            shared,
+            pre_ffw_norm_2: opt_norm("pre_ffw_norm_2.weight")?,
+            post_ffw_norm_1: opt_norm("post_ffw_norm_1.weight")?,
+            post_ffw_norm_2: opt_norm("post_ffw_norm_2.weight")?,
+            expert_down_scales,
+            n_expert_used: n_used,
+            use_gelu: gemma,
+            gemma4_router: gemma4,
+        }
+    } else if try_tensor(plan, "ffn_gate.weight").is_some() {
         FeedForward::Dense(Mlp {
             gate: QMatMul::from_qtensor(q("ffn_gate.weight")?)?,
             down: QMatMul::from_qtensor(q("ffn_down.weight")?)?,
             up: QMatMul::from_qtensor(q("ffn_up.weight")?)?,
             use_gelu: gemma,
         })
-    } else if try_tensor(plan, "ffn_gate_inp.weight").is_some() {
-        let n_used = map
-            .moe
-            .as_ref()
-            .map(|m| m.expert_used_count)
-            .unwrap_or(2);
-        FeedForward::MoE {
-            router: QMatMul::from_qtensor(q("ffn_gate_inp.weight")?)?,
-            n_expert_used: n_used,
-            use_gelu: gemma,
-        }
     } else {
         return Err(AppError::msg(format!(
             "layer {} has neither dense FFN nor MoE router (ffn_gate / ffn_gate_inp)",
@@ -1084,10 +1406,22 @@ fn build_layer_live(
         )));
     };
 
+    let wv = match opt_q("attn_v.weight")? {
+        Some(t) => Some(QMatMul::from_qtensor(t)?),
+        None => None,
+    };
+    let layer_output_scale = match try_tensor(plan, "layer_output_scale.weight") {
+        Some(loc) => {
+            let t = qtensor_from_loc(loc, dma, device)?.dequantize(device)?;
+            Some(t)
+        }
+        None => None,
+    };
+
     Ok(LayerLive {
         wq: QMatMul::from_qtensor(q("attn_q.weight")?)?,
         wk: QMatMul::from_qtensor(q("attn_k.weight")?)?,
-        wv: QMatMul::from_qtensor(q("attn_v.weight")?)?,
+        wv,
         wo: QMatMul::from_qtensor(q("attn_output.weight")?)?,
         attn_norm: Norm::from_qtensor(q("attn_norm.weight")?, map.rms_norm_eps)?,
         ffn_norm: Norm::from_qtensor(q("ffn_norm.weight")?, map.rms_norm_eps)?,
@@ -1095,6 +1429,7 @@ fn build_layer_live(
         post_ffw_norm: opt_norm("post_ffw_norm.weight")?,
         attn_q_norm: opt_norm("attn_q_norm.weight")?,
         attn_k_norm: opt_norm("attn_k_norm.weight")?,
+        layer_output_scale,
         ff,
     })
 }
@@ -1177,6 +1512,7 @@ fn precompute_rope(head_dim: usize, freq_base: f32, device: &Device) -> Result<(
     Ok((idx_theta.cos()?, idx_theta.sin()?))
 }
 
+#[allow(dead_code)]
 fn apply_rope(
     x: &Tensor,
     cos: &Tensor,
@@ -1184,16 +1520,45 @@ fn apply_rope(
     index_pos: usize,
     neox: bool,
 ) -> Result<Tensor> {
-    let (_b, _h, seq_len, _) = x.dims4()?;
+    apply_rope_maybe_partial(x, cos, sin, index_pos, neox, None)
+}
+
+fn apply_rope_maybe_partial(
+    x: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    index_pos: usize,
+    neox: bool,
+    partial_dims: Option<usize>,
+) -> Result<Tensor> {
+    let (_b, _h, seq_len, head_dim) = x.dims4()?;
     let cos = cos.narrow(0, index_pos, seq_len)?;
     let sin = sin.narrow(0, index_pos, seq_len)?;
     let x = x.contiguous()?;
-    if neox {
-        // Gemma / Gemma2: rotate-half (Neox) RoPE.
-        Ok(candle_nn::rotary_emb::rope(&x, &cos, &sin)?)
+    let n_rot = partial_dims.unwrap_or(head_dim).min(head_dim);
+    if n_rot == 0 {
+        return Ok(x);
+    }
+    if n_rot == head_dim {
+        // Gemma / Gemma2: rotate-half (Neox) RoPE; llama-family: interleaved.
+        if neox {
+            Ok(candle_nn::rotary_emb::rope(&x, &cos, &sin)?)
+        } else {
+            Ok(candle_nn::rotary_emb::rope_i(&x, &cos, &sin)?)
+        }
     } else {
-        // Llama-family GGUF: interleaved pairs.
-        Ok(candle_nn::rotary_emb::rope_i(&x, &cos, &sin)?)
+        // Partial RoPE (Gemma 4 global): rotate first `n_rot` dims only.
+        let x_rot = x.narrow(3, 0, n_rot)?.contiguous()?;
+        let x_pass = x.narrow(3, n_rot, head_dim - n_rot)?;
+        let n_freq = n_rot / 2;
+        let cos_use = cos.narrow(1, 0, n_freq.min(cos.dim(1)?))?;
+        let sin_use = sin.narrow(1, 0, n_freq.min(sin.dim(1)?))?;
+        let rotated = if neox {
+            candle_nn::rotary_emb::rope(&x_rot, &cos_use, &sin_use)?
+        } else {
+            candle_nn::rotary_emb::rope_i(&x_rot, &cos_use, &sin_use)?
+        };
+        Ok(Tensor::cat(&[&rotated, &x_pass], 3)?)
     }
 }
 
@@ -1215,6 +1580,8 @@ fn eos_ids(tokenizer: &Tokenizer) -> Vec<u32> {
         "<|end|>",
         "<end_of_turn>",
         "<|im_end|>",
+        "<turn|>",
+        "<eos>",
     ];
     let mut ids = Vec::new();
     for c in CANDIDATES {

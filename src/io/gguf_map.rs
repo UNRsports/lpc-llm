@@ -16,8 +16,8 @@ use candle_core::Device;
 use super::error::{IoError, Result};
 use super::moe::{
     build_expert_plans_from_locs, classify_block_suffix, fused_role, is_fused_expert_suffix,
-    is_per_expert_suffix, slice_fused_expert, split_block_name, BlockTensorKind, ExpertDmaPlan,
-    MoeFamily, MoeInfo, MoeLayout,
+    is_per_expert_suffix, slice_fused_expert, slice_fused_expert_trailing, split_block_name,
+    split_gate_up_loc, BlockTensorKind, ExpertDmaPlan, MoeFamily, MoeInfo, MoeLayout,
 };
 use super::prefetch::{align_up, DIRECT_ALIGN};
 
@@ -68,13 +68,22 @@ pub struct GgufLayerMap {
     /// Final logit softcap (Gemma2); `None` = disabled.
     pub final_logit_softcapping: Option<f64>,
     pub sliding_window: Option<usize>,
-    /// Gemma 3: period of local/global interleave (e.g. 6 ⇒ 5 local + 1 global).
-    /// `0` means unused (non-gemma3 or explicit per-layer vector only).
+    /// Gemma 3/4: period of local/global interleave (e.g. 6 ⇒ 5 local + 1 global).
+    /// `0` means unused (no pattern / explicit per-layer vector only).
+    #[allow(dead_code)]
     pub sliding_window_pattern: usize,
-    /// Per-layer: `true` = local sliding-window attention (Gemma 3).
+    /// Per-layer: `true` = local sliding-window attention (Gemma 3/4).
     pub layer_is_sliding: Vec<bool>,
-    /// Local-attention RoPE base (Gemma 3); `None` ⇒ reuse `rope_freq_base`.
+    /// Local-attention RoPE base (Gemma 3/4 SWA); `None` ⇒ reuse `rope_freq_base`.
     pub rope_freq_base_local: Option<f32>,
+    /// Gemma 4 SWA head dim (`attention.key_length_swa`); `None` ⇒ use `head_dim`.
+    pub head_dim_local: Option<usize>,
+    /// Gemma 4: per-layer KV head counts (global layers often use fewer).
+    pub head_count_kv_per_layer: Vec<usize>,
+    /// Gemma 4: attention score scale (`1.0` = no `1/sqrt(d)`). `None` ⇒ classic scale.
+    pub attention_scale: Option<f64>,
+    /// Gemma 4 global RoPE: rotate only this many dims (`partial_rotary`); `None` ⇒ full head.
+    pub rope_dim_global: Option<usize>,
     pub tensor_data_offset: u64,
     pub layers: Vec<LayerDmaPlan>,
     pub hot: Vec<TensorLoc>,
@@ -92,12 +101,33 @@ impl GgufLayerMap {
     pub fn is_gemma_family(&self) -> bool {
         matches!(
             self.architecture.as_str(),
-            "gemma" | "gemma2" | "gemma3"
+            "gemma" | "gemma2" | "gemma3" | "gemma4"
         )
     }
 
     pub fn is_gemma3(&self) -> bool {
         self.architecture.eq_ignore_ascii_case("gemma3")
+    }
+
+    pub fn is_gemma4(&self) -> bool {
+        self.architecture.eq_ignore_ascii_case("gemma4")
+    }
+
+    /// Effective attention head dim for a layer (SWA vs global on Gemma 4).
+    pub fn head_dim_for_layer(&self, layer_idx: usize) -> usize {
+        if self.layer_sliding(layer_idx) {
+            self.head_dim_local.unwrap_or(self.head_dim)
+        } else {
+            self.head_dim
+        }
+    }
+
+    /// Effective KV head count for a layer.
+    pub fn head_count_kv_for_layer(&self, layer_idx: usize) -> usize {
+        self.head_count_kv_per_layer
+            .get(layer_idx)
+            .copied()
+            .unwrap_or(self.head_count_kv)
     }
 
     /// True when the GGUF also carries vision / multimodal projector weights.
@@ -211,8 +241,30 @@ impl GgufLayerMap {
             .map(|v| v as usize)
             .filter(|v| *v > 0);
 
-        let rope_freq_base_local =
-            md_f32_arch(&content, &architecture, "rope.local.freq_base").filter(|v| *v > 0.0);
+        let rope_freq_base_local = md_f32_arch(&content, &architecture, "rope.freq_base_swa")
+            .or_else(|| md_f32_arch(&content, &architecture, "rope.local.freq_base"))
+            .filter(|v| *v > 0.0);
+
+        let head_dim_local = md_u32_arch(&content, &architecture, "attention.key_length_swa")
+            .map(|v| v as usize)
+            .filter(|v| *v > 0);
+
+        let attention_scale = if architecture.eq_ignore_ascii_case("gemma4") {
+            // llama.cpp: Gemma4 uses self.scaling = 1.0 (no classic 1/sqrt(d)).
+            Some(1.0f64)
+        } else {
+            None
+        };
+
+        // Global layers: partial rotary (HF partial_rotary_factor=0.25 → 512*0.25=128).
+        let rope_dim_global = if architecture.eq_ignore_ascii_case("gemma4") {
+            let full = md_u32_arch(&content, &architecture, "rope.dimension_count")
+                .map(|v| v as usize)
+                .unwrap_or(head_dim);
+            Some((full / 4).max(1))
+        } else {
+            None
+        };
 
         let sliding_window_pattern = md_u32_arch(
             &content,
@@ -228,6 +280,15 @@ impl GgufLayerMap {
             sliding_window_pattern,
             md_bool_array_arch(&content, &architecture, "attention.sliding_window_pattern"),
         );
+
+        let head_count_kv_per_layer = md_u32_array_arch(
+            &content,
+            &architecture,
+            "attention.head_count_kv",
+        )
+        .map(|v| v.into_iter().map(|x| x as usize).collect::<Vec<_>>())
+        .filter(|v| v.len() == block_count)
+        .unwrap_or_else(|| vec![head_count_kv; block_count]);
 
         let tensor_data_offset = content.tensor_data_offset;
 
@@ -248,13 +309,25 @@ impl GgufLayerMap {
         let mut hot_infos: Vec<(String, TensorInfo)> = Vec::new();
         let mut saw_per_expert = false;
         let mut saw_fused = false;
+        let mut saw_gate_up = false;
         let mut max_expert_id = 0usize;
+        let mut saw_shared_dense_ffn = false;
 
         for (name, info) in &content.tensor_infos {
             if let Some((layer_idx, suffix)) = split_block_name(name) {
+                if suffix == "ffn_gate.weight" {
+                    saw_shared_dense_ffn = true;
+                }
                 match classify_block_suffix(suffix) {
                     BlockTensorKind::Expert => {
-                        if is_fused_expert_suffix(suffix) {
+                        if suffix == "ffn_gate_up_exps.weight" {
+                            saw_gate_up = true;
+                            saw_fused = true;
+                            fused_by_layer
+                                .entry(layer_idx)
+                                .or_default()
+                                .push((name.clone(), clone_tensor_info(info)));
+                        } else if is_fused_expert_suffix(suffix) {
                             saw_fused = true;
                             fused_by_layer
                                 .entry(layer_idx)
@@ -288,7 +361,10 @@ impl GgufLayerMap {
         }
 
         let moe = if saw_per_expert || saw_fused || meta_expert_count > 1 {
-            let layout = if saw_fused && !saw_per_expert {
+            let family = MoeFamily::from_architecture(&architecture);
+            let layout = if saw_gate_up {
+                MoeLayout::FusedGateUpTrailing
+            } else if saw_fused && !saw_per_expert {
                 MoeLayout::FusedExps
             } else {
                 MoeLayout::PerExpert
@@ -296,27 +372,39 @@ impl GgufLayerMap {
             let expert_count = meta_expert_count
                 .max(max_expert_id.saturating_add(1))
                 .max(if saw_fused {
-                    // Infer from first fused tensor's leading dim when metadata missing.
+                    // Infer from fused tensor dims when metadata missing.
                     fused_by_layer
                         .values()
                         .next()
                         .and_then(|v| v.first())
-                        .map(|(_, info)| info.shape.dims().first().copied().unwrap_or(0))
+                        .map(|(_, info)| {
+                            let dims = info.shape.dims();
+                            if layout == MoeLayout::FusedGateUpTrailing {
+                                dims.last().copied().unwrap_or(0)
+                            } else {
+                                dims.first().copied().unwrap_or(0)
+                            }
+                        })
                         .unwrap_or(0)
                 } else {
                     0
                 });
             let expert_used = if meta_expert_used > 0 {
                 meta_expert_used
+            } else if family == MoeFamily::Gemma4 {
+                8.min(expert_count.max(1))
             } else {
                 2.min(expert_count.max(1))
             };
+            let has_shared = family == MoeFamily::Gemma4
+                || (saw_shared_dense_ffn && (saw_fused || saw_per_expert));
             if expert_count > 1 {
                 Some(MoeInfo {
                     layout,
                     expert_count,
                     expert_used_count: expert_used.min(expert_count),
-                    family: MoeFamily::from_architecture(&architecture),
+                    family,
+                    has_shared_expert: has_shared,
                 })
             } else {
                 None
@@ -327,7 +415,7 @@ impl GgufLayerMap {
 
         // Expand fused experts into per-expert logical locs before planning.
         if let Some(ref info) = moe {
-            if info.layout == MoeLayout::FusedExps {
+            if info.layout == MoeLayout::FusedExps || info.layout == MoeLayout::FusedGateUpTrailing {
                 for (layer_idx, fused_tensors) in &fused_by_layer {
                     for (name, tinfo) in fused_tensors {
                         let size = tensor_nbytes(tinfo)?;
@@ -345,7 +433,42 @@ impl GgufLayerMap {
                             rel_offset: 0,
                         };
                         for eid in 0..info.expert_count {
-                            if let Some(slice) = slice_fused_expert(
+                            if role == "gate_up" {
+                                let Some(gate_up) = slice_fused_expert_trailing(
+                                    &fused_loc,
+                                    eid,
+                                    info.expert_count,
+                                    "gate_up",
+                                    *layer_idx,
+                                ) else {
+                                    continue;
+                                };
+                                if let Some((gate, up)) =
+                                    split_gate_up_loc(&gate_up, *layer_idx, eid)
+                                {
+                                    fused_slices
+                                        .entry((*layer_idx, eid))
+                                        .or_default()
+                                        .push(gate);
+                                    fused_slices
+                                        .entry((*layer_idx, eid))
+                                        .or_default()
+                                        .push(up);
+                                }
+                            } else if info.layout == MoeLayout::FusedGateUpTrailing {
+                                if let Some(slice) = slice_fused_expert_trailing(
+                                    &fused_loc,
+                                    eid,
+                                    info.expert_count,
+                                    role,
+                                    *layer_idx,
+                                ) {
+                                    fused_slices
+                                        .entry((*layer_idx, eid))
+                                        .or_default()
+                                        .push(slice);
+                                }
+                            } else if let Some(slice) = slice_fused_expert(
                                 &fused_loc,
                                 eid,
                                 info.expert_count,
@@ -440,6 +563,10 @@ impl GgufLayerMap {
             sliding_window_pattern,
             layer_is_sliding,
             rope_freq_base_local,
+            head_dim_local,
+            head_count_kv_per_layer,
+            attention_scale,
+            rope_dim_global,
             tensor_data_offset,
             layers,
             hot,
@@ -576,7 +703,7 @@ fn md_f32_arch(ct: &gguf_file::Content, arch: &str, suffix: &str) -> Option<f32>
     md_f32(ct, &format!("{arch}.{suffix}"))
 }
 
-/// Bool array metadata (Gemma 3 may store per-layer sliding flags this way).
+/// Bool array metadata (Gemma 3/4 may store per-layer sliding flags this way).
 fn md_bool_array_arch(
     ct: &gguf_file::Content,
     arch: &str,
@@ -602,7 +729,35 @@ fn md_bool_array_arch(
     }
 }
 
-/// Build per-layer sliding flags for Gemma 3 (5 local : 1 global by default).
+fn md_u32_array_arch(
+    ct: &gguf_file::Content,
+    arch: &str,
+    suffix: &str,
+) -> Option<Vec<u32>> {
+    let key = format!("{arch}.{suffix}");
+    let v = ct.metadata.get(&key)?;
+    match v {
+        gguf_file::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let n = item
+                    .to_u32()
+                    .ok()
+                    .or_else(|| {
+                        item.to_i32()
+                            .ok()
+                            .and_then(|i| if i >= 0 { Some(i as u32) } else { None })
+                    })
+                    .or_else(|| item.to_u64().ok().and_then(|u| u32::try_from(u).ok()))?;
+                out.push(n);
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Build per-layer sliding flags for Gemma 3/4 (5 local : 1 global by default).
 pub fn build_layer_is_sliding(
     architecture: &str,
     n_layers: usize,
@@ -614,10 +769,11 @@ pub fn build_layer_is_sliding(
             return flags;
         }
     }
-    if !architecture.eq_ignore_ascii_case("gemma3") {
+    let arch = architecture.to_ascii_lowercase();
+    if arch != "gemma3" && arch != "gemma4" {
         return vec![false; n_layers];
     }
-    // Default: 5 local + 1 global (period 6), matching llama.cpp / Gemma 3 report.
+    // Default: 5 local + 1 global (period 6), matching llama.cpp / Gemma reports.
     let period = if pattern_period >= 2 {
         pattern_period
     } else {
@@ -695,5 +851,11 @@ mod tests {
     fn non_gemma3_no_sliding_flags() {
         let flags = build_layer_is_sliding("gemma2", 8, 6, None);
         assert!(flags.iter().all(|&s| !s));
+    }
+
+    #[test]
+    fn gemma4_default_sliding_pattern() {
+        let flags = build_layer_is_sliding("gemma4", 6, 0, None);
+        assert_eq!(flags, vec![true, true, true, true, true, false]);
     }
 }

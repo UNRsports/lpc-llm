@@ -160,6 +160,7 @@ config_lpcllm.example
 | `gemma3:4b` | Gemma 3 4B Instruct Q4_K_M | ~2.5 GB | hybrid (Phase 11 ladder) |
 | `gemma3:12b` | Gemma 3 12B Instruct Q4_K_M | ~7.3 GB | hybrid |
 | `gemma3:27b` | Gemma 3 27B Instruct Q4_K_M | ~16.5 GB | **Phase 11 target** (`--hybrid`, raise `--ram-mib`) |
+| `gemma4:26b-a4b` | Gemma 4 26B-A4B MoE Instruct Q4_K_M | ~17.0 GB disk; ~3.8B active | **Phase 12** (`--hybrid --ram-mib 16384`; experts on NVMe) |
 | `qwen2.5:1.5b` | Qwen2.5 1.5B Instruct Q4_K_M | ~1.1 GB | enable with `--hybrid` |
 | `phi3:mini` | Phi-3 Mini 4K Instruct Q4_K_M | ~2.2 GB | enable with `--hybrid` |
 
@@ -228,7 +229,12 @@ Fetch (skips re-download if blobs already exist):
 ```bash
 lpc-llm pull smollm2:360m    # smoke / light
 lpc-llm pull gemma2:2b
+lpc-llm pull gemma4:26b-a4b  # Phase 12 MoE (~17 GB); independent of other models
 ```
+
+Each catalog entry is a **separate model module** under `~/.local/share/lpc-llm/blobs/<hf-repo>/`.
+`pull` only writes that model's blobs (resume via `.part`); it does not touch another model's
+weights or require stopping an in-flight `run` of a different model.
 
 Success example (reuse):
 
@@ -256,6 +262,7 @@ lpc-llm pull gemma2:2b
 ```bash
 lpc-llm run gemma2:2b
 lpc-llm run gemma2:2b --hybrid --ram-mib 4096
+lpc-llm run gemma4:26b-a4b --hybrid --ram-mib 16384   # Phase 12 MoE
 lpc-llm run smollm2:360m
 lpc-llm run smollm2:360m --adapter my-lora
 lpc-llm run gemma2:2b --agent
@@ -679,6 +686,7 @@ config_lpcllm.example
 | `gemma3:4b` | Gemma 3 4B Instruct Q4_K_M | ~2.5 GB | hybrid（Phase 11 ラダー） |
 | `gemma3:12b` | Gemma 3 12B Instruct Q4_K_M | ~7.3 GB | hybrid |
 | `gemma3:27b` | Gemma 3 27B Instruct Q4_K_M | ~16.5 GB | **Phase 11 目標**（`--hybrid`、`--ram-mib` を上げる） |
+| `gemma4:26b-a4b` | Gemma 4 26B-A4B MoE Instruct Q4_K_M | ディスク ~17.0 GB；活性 ~3.8B | **Phase 12**（`--hybrid --ram-mib 16384`；Expert は NVMe） |
 | `qwen2.5:1.5b` | Qwen2.5 1.5B Instruct Q4_K_M | ~1.1 GB | `--hybrid` で有効 |
 | `phi3:mini` | Phi-3 Mini 4K Instruct Q4_K_M | ~2.2 GB | `--hybrid` で有効 |
 
@@ -740,8 +748,13 @@ cargo build --release
 lpc-llm list
 lpc-llm pull smollm2:360m    # 軽量スモーク
 lpc-llm pull gemma2:2b
+lpc-llm pull gemma4:26b-a4b  # Phase 12 MoE（~17 GB；他モデルと独立）
 lpc-llm show gemma2:2b
 ```
+
+カタログの各エントリは `~/.local/share/lpc-llm/blobs/<hf-repo>/` 下の**独立したモデルモジュール**です。
+`pull` はそのモデルの blobs だけを書き込み（`.part` でレジューム）、別モデルの重みには触れません。
+別モデルの `run` 中でも並行してダウンロードできます。
 
 成功例（再利用）:
 
