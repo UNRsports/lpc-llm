@@ -4,7 +4,7 @@
 //! 3. Double-buffer the rest via io_uring while computing
 //! 4. Track I/O vs compute to keep overlap healthy
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::Instant;
@@ -76,6 +76,75 @@ impl Mlp {
         let rhs = qmm(compute, &self.up, lora.and_then(|l| l.up.as_ref()), xs)?;
         let mid = (lhs * rhs)?;
         qmm(compute, &self.down, lora.and_then(|l| l.down.as_ref()), &mid)
+    }
+
+    fn warm_q4k(&self, compute: &ComputeContext) {
+        compute.warm_q4k(&self.gate);
+        compute.warm_q4k(&self.up);
+        compute.warm_q4k(&self.down);
+    }
+
+    fn clone_handles(&self) -> Self {
+        Self {
+            gate: self.gate.clone(),
+            up: self.up.clone(),
+            down: self.down.clone(),
+            use_gelu: self.use_gelu,
+        }
+    }
+}
+
+/// RAM LRU of materialized MoE experts — avoids re-reading `experts.pack` every token.
+struct ExpertLru {
+    map: HashMap<(usize, usize), Mlp>,
+    order: VecDeque<(usize, usize)>,
+    capacity: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl ExpertLru {
+    fn new(capacity: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            capacity: capacity.max(1),
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn get(&mut self, key: (usize, usize)) -> Option<Mlp> {
+        if !self.map.contains_key(&key) {
+            self.misses = self.misses.saturating_add(1);
+            return None;
+        }
+        self.hits = self.hits.saturating_add(1);
+        if let Some(pos) = self.order.iter().position(|k| *k == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key);
+        self.map.get(&key).map(|m| m.clone_handles())
+    }
+
+    fn insert(&mut self, key: (usize, usize), mlp: Mlp) {
+        if self.map.contains_key(&key) {
+            if let Some(pos) = self.order.iter().position(|k| *k == key) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(key);
+            self.map.insert(key, mlp);
+            return;
+        }
+        while self.map.len() >= self.capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(key);
+        self.map.insert(key, mlp);
     }
 }
 
@@ -204,6 +273,8 @@ pub struct HybridEngine {
     device_label: String,
     /// When true, `forward_hidden` prints per-layer prefill progress on stderr.
     report_prefill: bool,
+    /// MoE expert MLP LRU (RAM); survives KV resets across chat turns.
+    expert_cache: ExpertLru,
 }
 
 /// Expert streaming state: packed plans + dedicated io_uring reader + ring.
@@ -467,11 +538,32 @@ impl HybridEngine {
                 pack_file.read_exact(&mut buf[..n])?;
                 // Zero pad remainder already in vec.
                 let layer = materialize_layer(plan, &buf, &map, &device)?;
+                warm_layer_q4k(&compute, &layer);
                 resident[i] = Some(layer);
                 pin_prog.tick();
             }
         } else {
             progress::phase(4, phases, "no hot layers to pin (all streamed)");
+        }
+
+        let expert_slot_bytes = moe_runtime
+            .as_ref()
+            .map(|m| m.packed.recommended_slot_bytes())
+            .unwrap_or(4 * 1024 * 1024);
+        let expert_cache_cap = choose_expert_cache_cap(
+            config.ram_budget_mib,
+            always_resident_est,
+            hot_count,
+            packed.max_layer_bytes,
+            expert_slot_bytes,
+            moe_runtime.is_some(),
+        );
+        if moe_runtime.is_some() {
+            progress::note(&format!(
+                "MoE expert RAM cache capacity={expert_cache_cap} (~{:.0} MiB); \
+                 first turn warms cache, later turns reuse",
+                expert_cache_cap as f64 * expert_slot_bytes as f64 / (1024.0 * 1024.0)
+            ));
         }
 
         let stream_count = n_layers.saturating_sub(hot_count);
@@ -538,6 +630,7 @@ impl HybridEngine {
             compute,
             device_label,
             report_prefill: false,
+            expert_cache: ExpertLru::new(expert_cache_cap),
         })
     }
 
@@ -651,14 +744,25 @@ impl HybridEngine {
         let input = Tensor::new(tokens.as_slice(), &self.device)?.unsqueeze(0)?;
         let mut logits = prepare_logits(self.forward(&input, 0)?)?;
         self.report_prefill = false;
+        let prefill_s = t_prefill.elapsed().as_secs_f64();
         progress::phase(
             2,
             2,
             &format!(
-                "prefill done in {:.1}s — generating up to {max_tokens} tokens",
-                t_prefill.elapsed().as_secs_f64()
+                "prefill done in {prefill_s:.1}s — generating up to {max_tokens} tokens \
+                 (expert cache {}/{} hits={}/misses={})",
+                self.expert_cache.map.len(),
+                self.expert_cache.capacity,
+                self.expert_cache.hits,
+                self.expert_cache.misses
             ),
         );
+        if cfg!(debug_assertions) && prefill_s > 30.0 {
+            eprintln!(
+                "hint: debug build is slow — use `cargo build --release` and \
+                 `./target/release/lpc-llm run …` for conversation-speed decode"
+            );
+        }
 
         let mut generated = String::new();
         let mut tokens_generated = 0usize;
@@ -1171,6 +1275,10 @@ impl HybridEngine {
         slot: usize,
         use_gelu: bool,
     ) -> Result<Mlp> {
+        let key = (layer_idx, expert_id);
+        if let Some(cached) = self.expert_cache.get(key) {
+            return Ok(cached);
+        }
         // Ensure this expert is in the ring slot.
         self.dma_expert(layer_idx, expert_id, slot)?;
         let rt = self
@@ -1183,7 +1291,10 @@ impl HybridEngine {
             ))
         })?;
         let dma = rt.ring.get(slot)?.as_slice();
-        materialize_expert_mlp(plan, dma, &self.device, use_gelu)
+        let mlp = materialize_expert_mlp(plan, dma, &self.device, use_gelu)?;
+        mlp.warm_q4k(&self.compute);
+        self.expert_cache.insert(key, mlp.clone_handles());
+        Ok(mlp)
     }
 
     fn forward_attn(
@@ -1392,6 +1503,50 @@ fn choose_hot_layers(
     // cap of 8 forced NVMe streaming on small models (e.g. gemma2:2b) and
     // dominated latency even when --ram-mib had headroom.
     by_ram.min(n_layers)
+}
+
+/// How many MoE experts to keep materialized in RAM under `--ram-mib`.
+fn choose_expert_cache_cap(
+    budget_mib: usize,
+    always_resident_bytes: usize,
+    hot_count: usize,
+    layer_bytes: usize,
+    expert_slot_bytes: usize,
+    has_moe: bool,
+) -> usize {
+    if !has_moe || expert_slot_bytes == 0 {
+        return 1;
+    }
+    let budget = budget_mib.saturating_mul(1024 * 1024);
+    let pinned = always_resident_bytes
+        .saturating_add(hot_count.saturating_mul(layer_bytes))
+        .saturating_add(512 * 1024 * 1024)
+        .saturating_add(expert_slot_bytes.saturating_mul(8));
+    let spare = budget.saturating_sub(pinned);
+    // Leave ~2 GiB OS/KV headroom inside the spare.
+    let for_cache = spare.saturating_sub(2 * 1024 * 1024 * 1024);
+    let cap = for_cache / expert_slot_bytes;
+    cap.clamp(64, 2048)
+}
+
+fn warm_layer_q4k(compute: &ComputeContext, layer: &LayerLive) {
+    compute.warm_q4k(&layer.wq);
+    compute.warm_q4k(&layer.wk);
+    if let Some(ref wv) = layer.wv {
+        compute.warm_q4k(wv);
+    }
+    compute.warm_q4k(&layer.wo);
+    match &layer.ff {
+        FeedForward::Dense(mlp) => mlp.warm_q4k(compute),
+        FeedForward::MoE {
+            router, shared, ..
+        } => {
+            compute.warm_q4k(router);
+            if let Some(s) = shared {
+                s.warm_q4k(compute);
+            }
+        }
+    }
 }
 
 fn try_tensor<'a>(plan: &'a LayerDmaPlan, suffix: &str) -> Option<&'a TensorLoc> {

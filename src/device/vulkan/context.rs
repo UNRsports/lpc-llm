@@ -15,7 +15,8 @@ use crate::error::{AppError, Result};
 const SPIRV_Q4K: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/q4k_gemv.spv"));
 
 /// Cap cached weight buffers so streamed (rebuilt) tensors cannot grow VRAM forever.
-const MAX_WEIGHT_CACHE: usize = 384;
+/// MoE keeps many Top-K expert Q4_K mats hot across turns — allow a larger set.
+const MAX_WEIGHT_CACHE: usize = 768;
 
 /// Below this batch size, Candle CPU Q4_K is usually faster than H2D+dispatch+D2H
 /// unless the weight is already resident in the VRAM cache.
@@ -161,6 +162,25 @@ impl VulkanContext {
     /// True when the naive GPU GEMV path beat Candle-style CPU on a small probe.
     pub fn gpu_gemv_worthwhile(&self) -> bool {
         self.gpu_gemv_worthwhile
+    }
+
+    /// Upload a Q4_K weight into the VRAM cache without running GEMV.
+    /// Enables small-batch decode to hit GPU on the next `qmatmul`.
+    pub fn warm_q4k(&self, w: &QMatMul) -> Result<()> {
+        if !self.gpu_gemv_worthwhile {
+            return Ok(());
+        }
+        let QMatMul::QTensor(qt) = w else {
+            return Ok(());
+        };
+        if qt.dtype() != GgmlDType::Q4K {
+            return Ok(());
+        }
+        let key = Arc::as_ptr(qt) as usize;
+        let w_bytes = qt
+            .data()
+            .map_err(|e| AppError::msg(format!("QTensor data: {e}")))?;
+        self.ensure_weight(key, w_bytes.as_ref())
     }
 
     fn microbench_gpu_vs_cpu(&self) -> Result<bool> {

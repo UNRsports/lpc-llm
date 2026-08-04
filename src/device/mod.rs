@@ -112,4 +112,19 @@ impl ComputeContext {
         }
         Ok(w.forward(x)?)
     }
+
+    /// Best-effort: pin a Q4_K weight in VRAM so small-batch GEMV can use the GPU.
+    pub fn warm_q4k(&self, w: &QMatMul) {
+        #[cfg(feature = "vulkan")]
+        if let Some(ref vk) = self.vulkan {
+            if let Err(e) = vk.warm_q4k(w) {
+                let msg = e.to_string();
+                if !msg.starts_with("vulkan-skip:") {
+                    eprintln!("warning: Vulkan warm_q4k failed ({e})");
+                }
+            }
+        }
+        #[cfg(not(feature = "vulkan"))]
+        let _ = w;
+    }
 }
