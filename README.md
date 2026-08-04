@@ -95,9 +95,11 @@ Private data must not live in the git tree. Repo `data/train/` is gitignored as 
 ### Memory / I/O model (hybrid)
 
 ```text
-[ embeddings + norm + lm_head ]     resident (read directly from blobs)
-[ hot layers 0 .. H-1 ]             pinned in RAM (within budget, default max 8)
-[ Prefetch A | Prefetch B ]         2× pack-layer DMA (io_uring)
+[ embeddings + norm + lm_head ]     resident (read directly from blobs; Gemma 4 emb as F16)
+[ hot layers 0 .. H-1 ]             pinned in RAM (from --ram-mib; no hard cap of 8)
+[ Prefetch A | Prefetch B ]         2× pack-layer DMA (io_uring) when stream > 0
+[ MoE experts.pack Top-K ]          NVMe DMA + RAM LRU cache (survives chat turns)
+[ Q4_K on Vulkan (optional) ]       VRAM cache for hot + warmed expert mats
 [ KV cache ]                        grows with context
 ```
 
@@ -107,6 +109,8 @@ Tuning levers (perceived impact):
 |------|------|------|
 | Pack layout + double buffer | High | `{gguf} → cache/.../layers.pack`, 1 DMA per layer |
 | Hot resident ratio | Medium–high | `--ram-mib` / `--hot-layers` |
+| MoE expert RAM LRU + VRAM warm | High (decode) | avoid re-reading `experts.pack` every token |
+| **`cargo build --release`** | **Very high** | debug builds make MoE prefill minutes-long |
 | Chunked continuation after token cap | Medium | `--max-tokens`, REPL `/more` |
 | Chunk-size micro-tuning | Low | DMA window align at pack time, I/O wait EMA |
 
@@ -160,7 +164,7 @@ config_lpcllm.example
 | `gemma3:4b` | Gemma 3 4B Instruct Q4_K_M | ~2.5 GB | hybrid (Phase 11 ladder) |
 | `gemma3:12b` | Gemma 3 12B Instruct Q4_K_M | ~7.3 GB | hybrid |
 | `gemma3:27b` | Gemma 3 27B Instruct Q4_K_M | ~16.5 GB | **Phase 11 target** (`--hybrid`, raise `--ram-mib`) |
-| `gemma4:26b-a4b` | Gemma 4 26B-A4B MoE Instruct Q4_K_M | ~17.0 GB disk; ~3.8B active | **Phase 12** (`--hybrid --ram-mib 16384`; experts on NVMe) |
+| `gemma4:26b-a4b` | Gemma 4 26B-A4B MoE Instruct Q4_K_M | ~17.0 GB disk; ~3.8B active | **Phase 12 verified** (`--hybrid --ram-mib 16384 --device vulkan`; **use release**) |
 | `qwen2.5:1.5b` | Qwen2.5 1.5B Instruct Q4_K_M | ~1.1 GB | enable with `--hybrid` |
 | `phi3:mini` | Phi-3 Mini 4K Instruct Q4_K_M | ~2.2 GB | enable with `--hybrid` |
 
@@ -262,7 +266,9 @@ lpc-llm pull gemma2:2b
 ```bash
 lpc-llm run gemma2:2b
 lpc-llm run gemma2:2b --hybrid --ram-mib 4096
-lpc-llm run gemma4:26b-a4b --hybrid --ram-mib 16384   # Phase 12 MoE
+# Phase 12 MoE — prefer a release binary (debug prefill can take minutes)
+cargo build --release
+./target/release/lpc-llm run gemma4:26b-a4b --hybrid --ram-mib 16384 --device vulkan
 lpc-llm run smollm2:360m
 lpc-llm run smollm2:360m --adapter my-lora
 lpc-llm run gemma2:2b --agent
@@ -275,16 +281,23 @@ lpc-llm run
 lpc-llm          # menu
 ```
 
-First hybrid run builds the pack (may take minutes; GGUF is not modified):
+First hybrid run builds packs (may take minutes; GGUF is not modified). Startup prints numbered phases (`[1/5]…[5/5]`), pack cache hits, pin/prefill counters, and MoE expert-cache stats:
 
 ```text
-packing 26 layers → ~/.local/share/lpc-llm/cache/packs/gemma2_2b/0.1.0/layers.pack
+[1/5] ensuring layer / expert packs …
+  · layers.pack cache hit (30 layers)
+  · experts.pack cache hit (3840 experts, top-k=8)
 …
-✓ ready on CPU+pack+io_uring (gemma2)
+[5/5] ready — arch=gemma4 layers=30 hot=30 stream=0
+✓ ready on Vulkan+pack+io_uring (gemma4)
 >>>
+… [1/2] prefill N tokens × 30 layers …
+[2/2] prefill done in Xs — generating … (expert cache … hits=…/misses=…)
 ```
 
 `mlock failed ... using unlocked arenas` is a warning; inference continues (raise `ulimit -l` if needed).
+
+**Gemma 4 MoE notes:** routed experts live in `experts.pack` (~15 GiB sidecar). The engine keeps a RAM LRU of materialized experts and warms Q4_K weights into Vulkan VRAM when `--device vulkan`. First turn still pays cold DMA; later turns reuse the cache. Always prefer `./target/release/lpc-llm` for this model.
 
 ### 4. Training data placement
 
@@ -482,7 +495,12 @@ lpc-llm io --help
 | Garbage like `Jove Jove…` | Possibly an old binary. `unset CARGO_TARGET_DIR && cargo build --release`, then use `./target/release/lpc-llm` |
 | `mlock failed` | Warning only. Optionally `ulimit -l unlimited` (depends on privileges) |
 | Downloads every time | Check `~/.local/share/lpc-llm/blobs`. Migrating from old `~/.local/share/l3m`: rename / symlink |
-| Pack is slow | First run only. Delete `cache/packs` to regenerate |
+| Pack is slow | First run only. Delete `cache/packs/<model>/` to regenerate (e.g. after expert-pack version bump) |
+| `gemma4` prefill takes minutes | Use **release** build; first turn warms expert RAM/VRAM cache — later turns are much faster |
+| GPU looks unused | Vulkan only accelerates **Q4_K already in VRAM**; cold experts / Q8_0 / attention stay on CPU until warmed |
+| `unsupported dtype for rmsnorm F16` | Fixed on current main (activations cast to F32); rebuild |
+| `cos has to be contiguous in rope` | Fixed on current main; rebuild |
+| Segfault in `materialize_expert_mlp` | Need experts.pack **v3+** (Candle-reversed expert dims). Delete `cache/packs/gemma4_26b-a4b/` and rerun |
 | `--from file not found` | Place corpora under `train_dir` (`lpc-llm config get train_dir`) or pass a real path. See [`data/README.md`](data/README.md) |
 | `adapter … not found` | Run `adapter create` successfully first, or `adapter list` / check `~/.local/share/lpc-llm/adapters/` |
 | HF 401 | `HF_TOKEN` and license acceptance |
@@ -621,9 +639,11 @@ Ollama に依存しない、**純 Rust のローカル LLM プレイヤー**で�
 ### メモリ・I/O モデル（hybrid）
 
 ```text
-[ embeddings + norm + lm_head ]     常駐 (blobs から直接読込)
-[ hot layers 0 .. H-1 ]             RAM 固定（予算内、既定最大 8）
-[ Prefetch A | Prefetch B ]         2× pack 層 DMA（io_uring）
+[ embeddings + norm + lm_head ]     常駐（blobs から直接；Gemma 4 emb は F16）
+[ hot layers 0 .. H-1 ]             RAM 固定（`--ram-mib` 由来；硬上限 8 は撤廃済）
+[ Prefetch A | Prefetch B ]         2× pack 層 DMA（io_uring；stream>0 時）
+[ MoE experts.pack Top-K ]          NVMe DMA + RAM LRU キャッシュ（会話ターン間で保持）
+[ Q4_K on Vulkan（任意） ]          ホット層 + warm 済み Expert を VRAM キャッシュ
 [ KV cache ]                        コンテキストに応じて成長
 ```
 
@@ -633,6 +653,8 @@ Ollama に依存しない、**純 Rust のローカル LLM プレイヤー**で�
 |------|------|------|
 | パック再配置 + ダブルバッファ | 大 | `{gguf} → cache/.../layers.pack`、層ごと 1 DMA |
 | ホット常駐比率 | 中〜大 | `--ram-mib` / `--hot-layers` |
+| MoE Expert RAM LRU + VRAM warm | 大（デコード） | 毎トークンの `experts.pack` 再読込を避ける |
+| **`cargo build --release`** | **非常に大** | debug だと MoE prefill が分単位になりやすい |
 | トークン上限後の続き生成 | 中 | `--max-tokens`、REPL の `/more` |
 | チャンクサイズ微調整 | 小 | pack 時の DMA 窓アライン、I/O wait EMA |
 
@@ -686,7 +708,7 @@ config_lpcllm.example
 | `gemma3:4b` | Gemma 3 4B Instruct Q4_K_M | ~2.5 GB | hybrid（Phase 11 ラダー） |
 | `gemma3:12b` | Gemma 3 12B Instruct Q4_K_M | ~7.3 GB | hybrid |
 | `gemma3:27b` | Gemma 3 27B Instruct Q4_K_M | ~16.5 GB | **Phase 11 目標**（`--hybrid`、`--ram-mib` を上げる） |
-| `gemma4:26b-a4b` | Gemma 4 26B-A4B MoE Instruct Q4_K_M | ディスク ~17.0 GB；活性 ~3.8B | **Phase 12**（`--hybrid --ram-mib 16384`；Expert は NVMe） |
+| `gemma4:26b-a4b` | Gemma 4 26B-A4B MoE Instruct Q4_K_M | ディスク ~17.0 GB；活性 ~3.8B | **Phase 12 検証済**（`--hybrid --ram-mib 16384 --device vulkan`；**release 必須**） |
 | `qwen2.5:1.5b` | Qwen2.5 1.5B Instruct Q4_K_M | ~1.1 GB | `--hybrid` で有効 |
 | `phi3:mini` | Phi-3 Mini 4K Instruct Q4_K_M | ~2.2 GB | `--hybrid` で有効 |
 
@@ -776,6 +798,9 @@ lpc-llm pull gemma2:2b
 ```bash
 lpc-llm run gemma2:2b
 lpc-llm run gemma2:2b --hybrid --ram-mib 4096
+# Phase 12 MoE — release バイナリ推奨（debug の prefill は分単位になり得る）
+cargo build --release
+./target/release/lpc-llm run gemma4:26b-a4b --hybrid --ram-mib 16384 --device vulkan
 lpc-llm run smollm2:360m
 lpc-llm run smollm2:360m --adapter my-lora
 lpc-llm run gemma2:2b --agent
@@ -789,15 +814,23 @@ lpc-llm
 ```
 
 初回 hybrid では pack 生成が走ります（数分かかることがあります。GGUF は変更しません）。
+起動時は段階ログ（`[1/5]…[5/5]`）、pack キャッシュ hit、pin / prefill カウンタ、MoE expert キャッシュ統計を stderr に出します。
 
 ```text
-packing 26 layers → ~/.local/share/lpc-llm/cache/packs/gemma2_2b/0.1.0/layers.pack
+[1/5] ensuring layer / expert packs …
+  · layers.pack cache hit (30 layers)
+  · experts.pack cache hit (3840 experts, top-k=8)
 …
-✓ ready on CPU+pack+io_uring (gemma2)
+[5/5] ready — arch=gemma4 layers=30 hot=30 stream=0
+✓ ready on Vulkan+pack+io_uring (gemma4)
 >>>
+… [1/2] prefill N tokens × 30 layers …
+[2/2] prefill done in Xs — generating … (expert cache … hits=…/misses=…)
 ```
 
 `mlock failed ... using unlocked arenas` は警告です。推論は継続します（必要なら `ulimit -l` を上げる）。
+
+**Gemma 4 MoE メモ:** ルーテッド Expert は `experts.pack`（約 15 GiB サイドカー）。エンジンは materialize 済み Expert の RAM LRU を持ち、`--device vulkan` 時は Q4_K を VRAM に warm します。1 通目はコールド DMA、2 通目以降はキャッシュ再利用。本モデルは必ず `./target/release/lpc-llm` を使ってください。
 
 ### 4. 学習用データの設置場所
 
@@ -982,7 +1015,12 @@ lpc-llm io --help
 | `Jove Jove…` などゴミ出力 | 古いバイナリの可能性。`unset CARGO_TARGET_DIR && cargo build --release` 後に `./target/release/lpc-llm` を使う |
 | `mlock failed` | 警告のみ。必要なら `ulimit -l unlimited`（権限による） |
 | 毎回ダウンロードされる | `~/.local/share/lpc-llm/blobs` を確認。旧 `~/.local/share/l3m` から移行する場合は rename / symlink |
-| pack が遅い | 初回のみ。`cache/packs` を消せば再生成される |
+| pack が遅い | 初回のみ。`cache/packs/<model>/` を消せば再生成（Expert pack 版上げ後など） |
+| `gemma4` の prefill が分単位 | **release** ビルドを使う。1 通目で Expert RAM/VRAM を暖機し、2 通目以降が速い |
+| GPU が使われないように見える | Vulkan は **VRAM 上の Q4_K** のみ加速。コールド Expert / Q8_0 / attention は warm まで CPU |
+| `unsupported dtype for rmsnorm F16` | 現行ソースで修正済（活性化を F32 化）。再ビルド |
+| `cos has to be contiguous in rope` | 現行ソースで修正済。再ビルド |
+| `materialize_expert_mlp` で segfault | experts.pack **v3+** が必要（Candle 次元反転対応）。`cache/packs/gemma4_26b-a4b/` を消して再実行 |
 | `--from file not found` | コーパスを `train_dir`（`lpc-llm config get train_dir`）に置くか実在パスを渡す。[`data/README.md`](data/README.md) |
 | `adapter … not found` | 先に `adapter create` を成功させる。`adapter list` / `~/.local/share/lpc-llm/adapters/` を確認 |
 | HF 401 | `HF_TOKEN` とライセンス同意 |
