@@ -8,6 +8,9 @@ pub use resolve::{
     detect_cuda, detect_vulkan, resolve_backend, ComputeBackendKind, ResolvedBackend,
 };
 
+#[cfg(feature = "vulkan")]
+pub use vulkan::DeviceAct;
+
 use std::sync::Arc;
 
 use candle_core::quantized::QMatMul;
@@ -56,8 +59,8 @@ impl ComputeContext {
                 Ok(ctx) => {
                     if ctx.gpu_gemv_worthwhile() {
                         eprintln!(
-                            "compute: Vulkan Q4_K ready — prefill uploads+fused submit; \
-                             decode uses warmed VRAM weights only (experts → CPU parallel)"
+                            "compute: Vulkan Q4_K/Q6_K ready — fused submits; \
+                             MoE gate/up fused when VRAM-cached (Q8_0 downs → CPU)"
                         );
                     } else {
                         eprintln!(
@@ -130,6 +133,63 @@ impl ComputeContext {
             out.push(w.forward(x)?);
         }
         Ok(out)
+    }
+
+    /// Independent GEMVs with **per-op** activations (fused GPU submit; MoE downs).
+    pub fn qmatmul_multi_xs(&self, pairs: &[(&QMatMul, &Tensor)]) -> Result<Vec<Tensor>> {
+        if pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+        #[cfg(feature = "vulkan")]
+        if let Some(ref vk) = self.vulkan {
+            if vk.should_try_gpu(pairs[0].1) {
+                match vk.qmatmul_multi_xs(pairs) {
+                    Ok(t) => return Ok(t),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if !msg.starts_with("vulkan-skip:") {
+                            eprintln!("warning: Vulkan QMatMul(xs) fell back to CPU ({e})");
+                        }
+                    }
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(pairs.len());
+        for &(w, x) in pairs {
+            out.push(w.forward(x)?);
+        }
+        Ok(out)
+    }
+
+    /// Shared-activation fused GEMVs via [`DeviceAct`] (one upload; D2H after submit).
+    #[cfg(feature = "vulkan")]
+    pub fn qmatmul_multi_act(
+        &self,
+        ws: &[&QMatMul],
+        act: &DeviceAct,
+    ) -> Result<Vec<Tensor>> {
+        if ws.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(ref vk) = self.vulkan {
+            match vk.qmatmul_multi_act(ws, act) {
+                Ok(acts) => {
+                    let mut outs = Vec::with_capacity(acts.len());
+                    for a in acts {
+                        outs.push(a.to_tensor()?);
+                    }
+                    return Ok(outs);
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.starts_with("vulkan-skip:") {
+                        eprintln!("warning: Vulkan QMatMul(act) fell back to CPU ({e})");
+                    }
+                }
+            }
+        }
+        let x = act.to_tensor()?;
+        self.qmatmul_multi(ws, &x)
     }
 
     #[allow(dead_code)]

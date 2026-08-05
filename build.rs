@@ -26,6 +26,7 @@ fn main() {
     println!("cargo:rerun-if-changed=shaders/gemm_f32.wgsl");
     println!("cargo:rerun-if-changed=shaders/q4k_gemv.wgsl");
     println!("cargo:rerun-if-changed=shaders/q6k_gemv.wgsl");
+    println!("cargo:rerun-if-changed=shaders/q8_0_gemv.wgsl");
     compile_wgsl(
         "gemm_f32.wgsl",
         include_str!("shaders/gemm_f32.wgsl"),
@@ -40,5 +41,10 @@ fn main() {
         "q6k_gemv.wgsl",
         include_str!("shaders/q6k_gemv.wgsl"),
         "q6k_gemv.spv",
+    );
+    compile_wgsl(
+        "q8_0_gemv.wgsl",
+        include_str!("shaders/q8_0_gemv.wgsl"),
+        "q8_0_gemv.spv",
     );
 }

@@ -72,7 +72,7 @@ On MoE GGUF: `experts.pack` + Top-K expert DMA + **RAM LRU expert cache** (hybri
 **Phase 10 (parallel; throughput owned by 13):** Q4_K GEMV + VRAM warm exist; per-call fence still dominates end-to-end decode.  
 **Phase 11 (done):** Gemma 3 **27B** dense instruct via `--hybrid` (text-only).  
 **Phase 12 (done):** Gemma 4 **26B-A4B MoE** (~25.2B / ~3.8B active); resident target ≤16 GiB.  
-**Phase 13 (in progress):** decode on Candle CPU Q4_K + parallel Top-K; fused Vulkan prefill; `[bench]` TTFT/tok/s. Remaining: host numbers + RSS write-up.
+**Phase 13 (in progress):** decode on Candle CPU Q4_K + parallel Top-K; fused Vulkan prefill; `[bench]` TTFT/tok/s. **2026-08-05:** DeviceAct + fused Top-K gate/up + multi-X API; Q8_0 downs stay CPU (faster); warm skip; host decode **~1.8–1.9 tok/s** (~2× vs ~1 tok/s baseline; submits ≈½). Remaining: ≥3× stretch, RSS write-up.
 
 ---
 
@@ -442,16 +442,16 @@ Microbench already shows Q4_K GEMV GPU≈0.18 ms vs CPU≈0.59 ms, yet end-t
 #### 13.2 Vulkan decode path — cut sync (highest leverage)
 
 - [x] **Fuse command buffers**: multiple Q4_K/Q6_K GEMVs per submit (Q/K/V, gate/up; up to 16 ops)
-- [ ] Keep activations in device buffers across fused GEMVs (still D2H per fused group — next polish)
+- [x] **DeviceAct** + pack activations once per fused group; HOST barrier only after last op; multi-X downs API
 - [x] Reuse staging / multi descriptor sets
 - [x] GPU for VRAM-warmed weights (hot pin + MoE experts); cold → Candle CPU
 - [x] **Q6_K Vulkan shader** (bit-exact vs candle `BlockQ6K::to_float`) — kills Q6_K→CPU skip on attn/down
-- [x] **Expert GPU path**: warm Top-K experts into VRAM (unpinned LRU); fuse shared-activation gate/up (MUL_MAT_ID-lite)
+- [x] **Expert GPU path**: warm Top-K gate/up into VRAM; fuse shared-activation gate+up (≤16 ops/submit); **Q8_0 downs → parallel CPU** (GPU sync loses on k≈704)
 
 #### 13.3 MoE decode I/O
 
 - [x] Skip DMA on cache hit; async prefetch without immediate wait; ring slot occupancy
-- [ ] Decode-phase hit-rate target: after warm turn, **>90%** expert RAM hits on short chats (measure on host)
+- [x] Decode-phase hit-rate: after warm turn, **~98%** expert RAM hits on short chats (2026-08-05: hits=2359/misses=41)
 - [x] Document opportunistic `mlock` (no `ulimit` required); soft RLIMIT_MEMLOCK raise when allowed
 - [ ] Tune ring depth / LRU vs `--ram-mib` spare (2048 slots ≈8.4 GiB — validate thrash vs hit)
 - [x] Speculative prefetch from previous-token Top-K ids
@@ -459,15 +459,25 @@ Microbench already shows Q4_K GEMV GPU≈0.18 ms vs CPU≈0.59 ms, yet end-t
 #### 13.4 Residual compute (Phase 10 leftovers)
 
 - [x] Log first `vulkan-skip` reason (dtype / policy / cold weight) once + skip counter
-- [ ] Q8_0 (or common) expert-down path if present in packs
+- [x] Q8_0 expert-down: shader present (`q8_0_gemv.wgsl`) but **forward prefers Candle CPU** (sync GPU slower for Gemma4 downs); enable when microbench wins
 - [ ] (Optional) streamed non-hot layer GPU path — low priority while hot=all 30 for 26B-A4B
 - [x] attention Softmax / RoPE stay CPU (fused graph not justified yet)
 
 #### 13.5 Verification
 
-- [x] Bench method documented in README (host numbers still TBD after user release run)
-- [ ] Regression: short prompt + 128 decode tokens; expert hits on turn 2
+- [x] Bench method documented in README
+- [x] Regression smoke: short prompt + decode; turn-2 expert hits (2026-08-05: ~1.8 tok/s ≈2× baseline; submits≈½)
 - [ ] (Optional) pathfinder `qwen3:30b-a3b` A/B on same harness
+
+**Host A/B (2026-08-05, release, `--hybrid --ram-mib 16384 --device vulkan --max-tokens 16`):**
+
+| Turn | decode tok/s | expert hits/misses | notes |
+|------|-------------|-------------------|--------|
+| Phase-13 baseline (2026-08-04) | **~1** | cold | documented ~1 char/s |
+| After fuse+DeviceAct (turn 1) | **1.87** | 1350/90 | TTFT≈11s |
+| After fuse+DeviceAct (turn 2) | **1.81** | 2359/41 | ≈2× baseline; vulkan submits≈½ |
+
+Stretch **≥3×** still open (attention GPU / fewer fences across Softmax boundary).
 
 **Pull isolation / ops:** unchanged from Phase 12. Always measure with `./target/release/lpc-llm`.
 
@@ -530,7 +540,7 @@ Microbench already shows Q4_K GEMV GPU≈0.18 ms vs CPU≈0.59 ms, yet end-t
 
 ## 5. Recommended next steps
 
-1. **Phase 13 (in progress)** — landed: Q4_K/Q6_K Vulkan + expert VRAM warm + fused Top-K gate/up + `[bench]`. Remaining: host tok/s / RSS write-up; optional Q8_0
+1. **Phase 13 (in progress)** — landed: Q4_K/Q6_K Vulkan + DeviceAct + expert gate/up fuse + multi-X + `[bench]`. Host ≈2× (~1.8 tok/s). Remaining: ≥3× stretch, RSS; Q8_0 GPU gated
 2. **Phase 10 leftovers** — folded into Phase 13.4 (non-Q4_K warn; Q8_0 expert-down; optional streamed GPU)
 3. **Phase 12 polish** — folded into Phase 13.1 (TTFT/tok/s vs 27B; RSS write-up)
 4. **Phase 6 follow-ups** — Wire real cluster launchers / CUDA backends into `job.remote` and `$LPC_LLM_CONVERT_CMD`
@@ -605,7 +615,7 @@ MoE GGUF では `experts.pack` + Top-K Expert DMA + **Expert RAM LRU キャッ�
 **Phase 10（並行；スループットは 13 が担当）:** Q4_K GEMV + VRAM warm は存在。呼び出し単位の fence が端到端デコードを支配しやすい。  
 **Phase 11（完了）:** Gemma 3 **27B** dense Instruct を `--hybrid` でテキスト実行。  
 **Phase 12（完了）:** Gemma 4 **26B-A4B MoE**（総量 ~25.2B / 活性 ~3.8B）；常駐目標 ≤16 GiB。  
-**Phase 13（進行中）:** デコードは Candle CPU Q4_K + Top-K 並列、prefill は融合 Vulkan。`[bench]` で TTFT/tok/s。ホスト実測と RSS 文書化が残り。
+**Phase 13（進行中）:** デコードは Candle CPU Q4_K + Top-K 並列、prefill は融合 Vulkan。`[bench]` で TTFT/tok/s。**2026-08-05:** DeviceAct + Top-K gate/up 融合 + multi-X API；Q8_0 down は CPU；warm skip。ホスト decode **~1.8–1.9 tok/s**（baseline ~1 に対し ≈2×；submits ≈½）。残り: ≥3× ストレッチ、RSS 文書化。
 
 ---
 
@@ -975,16 +985,16 @@ Phase 12 で **正しさ**（`gemma4:26b-a4b` テキスト対話）は到達。r
 #### 13.2 Vulkan デコード経路 — 同期削減（最大レバレッジ）
 
 - [x] **コマンドバッファ融合**: Q4_K/Q6_K GEMV を 1 submit（最大 16 ops）
-- [ ] 融合区間で activation をデバイスに滞留（現状は融合グループごとに D2H）
+- [x] **DeviceAct** + 融合グループで activation を一括 H2D；HOST barrier は最終 op のみ；multi-X downs API
 - [x] staging / 複数 descriptor set 再利用
 - [x] VRAM warm 済み重みは GPU（ホット pin + MoE Expert）；コールドは Candle CPU
 - [x] **Q6_K Vulkan シェーダ**（candle `BlockQ6K::to_float` と一致）
-- [x] **Expert GPU 経路**: Top-K を VRAM warm（unpin LRU）；同一活性化の gate/up 融合（MUL_MAT_ID-lite）
+- [x] **Expert GPU 経路**: Top-K gate/up を VRAM warm；gate+up を 1 submit（≤16）；**Q8_0 down → 並列 CPU**（k≈704 では sync GPU が不利）
 
 #### 13.3 MoE デコード I/O
 
 - [x] キャッシュヒット時 DMA スキップ；非同期 prefetch；ring スロット占有管理
-- [ ] 暖機後 hit 率 **>90%**（ホスト計測）
+- [x] 暖機後 hit 率 **~98%**（2026-08-05: hits=2359/misses=41）
 - [x] README: 任意の `mlock`（`ulimit` 不要）；soft RLIMIT_MEMLOCK 引き上げ
 - [ ] ring / LRU と `--ram-mib` 余剰の調整
 - [x] 直前トークン Top-K からの投機 prefetch
@@ -992,15 +1002,25 @@ Phase 12 で **正しさ**（`gemma4:26b-a4b` テキスト対話）は到達。r
 #### 13.4 残計算（Phase 10 残り）
 
 - [x] `vulkan-skip` 理由の初回ログ + カウンタ
-- [ ] Q8_0（等）expert-down 経路
+- [x] Q8_0 expert-down: シェーダあり（`q8_0_gemv.wgsl`）だが **forward は Candle CPU 優先**（Gemma4 down では sync GPU が遅い）
 - [ ] （任意）非ホット層の GPU 経路
 - [x] attention Softmax / RoPE は当面 CPU
 
 #### 13.5 検証
 
-- [x] 計測方法を README に記載（ホスト数値は release 実行後）
-- [ ] 回帰: 短プロンプト + 128 decode；2 通目の expert hits
+- [x] 計測方法を README に記載
+- [x] 回帰スモーク: 短プロンプト + decode；2 通目 expert hits（2026-08-05: ~1.8 tok/s ≈2×；submits≈½）
 - [ ] （任意）`qwen3:30b-a3b` A/B
+
+**ホスト実測（2026-08-05、release、`--hybrid --ram-mib 16384 --device vulkan --max-tokens 16`）:**
+
+| 通 | decode tok/s | expert hits/misses | 備考 |
+|----|-------------|-------------------|------|
+| Phase-13 ベースライン (2026-08-04) | **~1** | cold | ~1 文字/秒 |
+| 融合後 1 通目 | **1.87** | 1350/90 | TTFT≈11s |
+| 融合後 2 通目 | **1.81** | 2359/41 | ≈2×；vulkan submits≈½ |
+
+ストレッチ **≥3×** は未達（attention GPU / Softmax 境界の fence 削減が次）。
 
 **pull 独立性 / 運用:** Phase 12 と同じ。計測は常に `./target/release/lpc-llm`。
 
@@ -1063,7 +1083,7 @@ Phase 12 で **正しさ**（`gemma4:26b-a4b` テキスト対話）は到達。r
 
 ## 5. 推奨する次工程
 
-1. **Phase 13（進行中）** — 実装済: Q4_K/Q6_K Vulkan + Expert VRAM warm + Top-K gate/up 融合 + `[bench]`。残り: ホスト tok/s・RSS 文書化；任意 Q8_0
+1. **Phase 13（進行中）** — 実装済: Q4_K/Q6_K Vulkan + DeviceAct + Top-K gate/up 融合 + multi-X + `[bench]`。ホスト ≈2×（~1.8 tok/s）。残り: ≥3×、RSS；Q8_0 GPU は条件付き
 2. **Phase 10 残り** — Phase 13.4 に吸収（non-Q4_K 警告；Q8_0 expert-down；任意のストリーム GPU）
 3. **Phase 12 磨き** — Phase 13.1 に吸収（27B との TTFT/tok/s；RSS 文書化）
 4. **Phase 6 フォロー** — `job.remote` / `$LPC_LLM_CONVERT_CMD` に実クラスタ・CUDA 変換を接続

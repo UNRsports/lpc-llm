@@ -92,7 +92,14 @@ impl Mlp {
     }
 
     /// Upload expert weights to VRAM without pinning (LRU-evictable).
+    /// Skips when gate/up/down are already VRAM-resident (avoids redundant uploads).
     fn warm_expert_gpu(&self, compute: &ComputeContext) {
+        if compute.weight_cached(&self.gate)
+            && compute.weight_cached(&self.up)
+            && compute.weight_cached(&self.down)
+        {
+            return;
+        }
         compute.warm_quant(&self.gate, false);
         compute.warm_quant(&self.up, false);
         compute.warm_quant(&self.down, false);
@@ -1706,25 +1713,11 @@ fn run_moe_jobs_parallel(
         return Ok(Vec::new());
     }
 
-    // MUL_MAT_ID-lite: when every expert is VRAM-warmed and shares one activation
-    // (decode Top-K), fuse gate/up GEMVs across experts in few GPU submits.
-    let all_gpu = jobs.iter().all(|(_, mlp, _, _, _)| {
-        compute.weight_cached(&mlp.gate)
-            && compute.weight_cached(&mlp.up)
-            && compute.weight_cached(&mlp.down)
-    });
-    if all_gpu {
-        if let Some(outs) = try_moe_jobs_fused_gpu(compute, jobs)? {
-            return Ok(outs);
-        }
-        let mut outs = Vec::with_capacity(jobs.len());
-        for (_, mlp, _, _, indexed) in jobs {
-            outs.push(mlp.forward(compute, indexed, None)?);
-        }
+    // Fuse Q4_K gate/up on GPU when warmed; Q8_0 downs stay parallel CPU.
+    if let Some(outs) = try_moe_jobs_fused_gpu(compute, jobs)? {
         return Ok(outs);
     }
 
-    // Experts not fully VRAM-cached — parallel Candle CPU.
     if jobs.len() == 1 {
         let (_, mlp, _, _, indexed) = &jobs[0];
         return Ok(vec![mlp.forward(compute, indexed, None)?]);
@@ -1768,22 +1761,70 @@ fn try_moe_jobs_fused_gpu(
     if !shared {
         return Ok(None);
     }
+    // Gate/up must be VRAM-cached (Q4_K). Downs are often Q8_0 → CPU.
+    let gate_up_gpu = jobs.iter().all(|(_, mlp, _, _, _)| {
+        compute.weight_cached(&mlp.gate) && compute.weight_cached(&mlp.up)
+    });
+    if !gate_up_gpu {
+        return Ok(None);
+    }
     let xs = &jobs[0].4;
-    let gate_ws: Vec<&QMatMul> = jobs.iter().map(|(_, mlp, _, _, _)| &mlp.gate).collect();
-    let up_ws: Vec<&QMatMul> = jobs.iter().map(|(_, mlp, _, _, _)| &mlp.up).collect();
-    let gates = compute.qmatmul_multi(&gate_ws, xs)?;
-    let ups = compute.qmatmul_multi(&up_ws, xs)?;
-    let mut outs = Vec::with_capacity(jobs.len());
+    let n = jobs.len();
+    let mut gate_up_ws: Vec<&QMatMul> = Vec::with_capacity(n * 2);
+    for (_, mlp, _, _, _) in jobs {
+        gate_up_ws.push(&mlp.gate);
+    }
+    for (_, mlp, _, _, _) in jobs {
+        gate_up_ws.push(&mlp.up);
+    }
+    #[cfg(feature = "vulkan")]
+    let gate_ups = {
+        let act = crate::device::DeviceAct::from_tensor(xs)?;
+        compute.qmatmul_multi_act(&gate_up_ws, &act)?
+    };
+    #[cfg(not(feature = "vulkan"))]
+    let gate_ups = compute.qmatmul_multi(&gate_up_ws, xs)?;
+    let gates = &gate_ups[..n];
+    let ups = &gate_ups[n..];
+    let mut mids = Vec::with_capacity(n);
     for (i, (_, mlp, _, _, _)) in jobs.iter().enumerate() {
         let lhs = if mlp.use_gelu {
             gates[i].gelu()?
         } else {
             candle_nn::ops::silu(&gates[i])?
         };
-        let mid = (lhs * &ups[i])?;
-        outs.push(qmm(compute, &mlp.down, None, &mid)?);
+        mids.push((lhs * &ups[i])?);
     }
-    Ok(Some(outs))
+
+    let downs_gpu = jobs
+        .iter()
+        .all(|(_, mlp, _, _, _)| compute.weight_cached(&mlp.down));
+    if downs_gpu {
+        let down_pairs: Vec<(&QMatMul, &Tensor)> = jobs
+            .iter()
+            .zip(mids.iter())
+            .map(|((_, mlp, _, _, _), mid)| (&mlp.down, mid))
+            .collect();
+        return Ok(Some(compute.qmatmul_multi_xs(&down_pairs)?));
+    }
+
+    // Parallel CPU downs (Q8_0 on Gemma4 Q4_K_M).
+    std::thread::scope(|scope| {
+        let mut joins = Vec::with_capacity(n);
+        for (i, (_, mlp, _, _, _)) in jobs.iter().enumerate() {
+            let mid = &mids[i];
+            let down = &mlp.down;
+            joins.push(scope.spawn(move || -> Result<Tensor> { Ok(down.forward(mid)?) }));
+        }
+        let mut outs = Vec::with_capacity(joins.len());
+        for join in joins {
+            let piece = join
+                .join()
+                .map_err(|_| AppError::msg("MoE down worker panicked"))?;
+            outs.push(piece?);
+        }
+        Ok(Some(outs))
+    })
 }
 
 fn try_tensor<'a>(plan: &'a LayerDmaPlan, suffix: &str) -> Option<&'a TensorLoc> {

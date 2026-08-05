@@ -12,21 +12,94 @@ use candle_core::{DType, Device as CandleDevice, Tensor};
 
 use super::q4k::{self, pack_constant_q4k, BLOCK_Q4K_SIZE, QK_K};
 use super::q6k::BLOCK_Q6K_SIZE;
+use super::q8_0::{BLOCK_Q8_0_SIZE, QK8_0};
 use crate::error::{AppError, Result};
 
 const SPIRV_Q4K: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/q4k_gemv.spv"));
 const SPIRV_Q6K: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/q6k_gemv.spv"));
+const SPIRV_Q8_0: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/q8_0_gemv.spv"));
 
 /// Cap cached weight buffers. Hot (pinned) + recent experts.
 const MAX_WEIGHT_CACHE: usize = 4096;
 
-/// Max independent GEMVs recorded into one submit (Top-8 gates, Q/K/V, …).
+/// Max independent GEMVs recorded into one submit (Top-8 gates+ups=16, Q/K/V, …).
 const FUSED_MAX_OPS: usize = 16;
+
+/// Host-side f32 activation prepared for a fused GPU submit.
+/// Keeps shape metadata so callers can avoid repeated `Tensor` reshape/`to_vec1`
+/// when packing many GEMVs; the GPU path uploads once per fused group and only
+/// downloads after the whole submit (DeviceAct = deferred D2H boundary).
+#[derive(Clone, Debug)]
+pub struct DeviceAct {
+    data: Vec<f32>,
+    m: u32,
+    k: u32,
+    /// Logical dims of the original tensor (last dim = k).
+    dims: Vec<usize>,
+}
+
+impl DeviceAct {
+    pub fn from_tensor(x: &Tensor) -> Result<Self> {
+        let x_f32 = x.to_dtype(DType::F32)?;
+        let dims = x_f32.dims().to_vec();
+        if dims.is_empty() {
+            return Err(AppError::msg("DeviceAct: empty input"));
+        }
+        let k = *dims.last().unwrap();
+        let m: usize = dims[..dims.len() - 1].iter().product::<usize>().max(1);
+        let data = x_f32.reshape((m, k))?.flatten_all()?.to_vec1::<f32>()?;
+        Ok(Self {
+            data,
+            m: m as u32,
+            k: k as u32,
+            dims,
+        })
+    }
+
+    pub fn m(&self) -> u32 {
+        self.m
+    }
+
+    pub fn k(&self) -> u32 {
+        self.k
+    }
+
+    pub fn data(&self) -> &[f32] {
+        &self.data
+    }
+
+    pub fn dims(&self) -> &[usize] {
+        &self.dims
+    }
+
+    pub fn to_tensor(&self) -> Result<Tensor> {
+        Tensor::from_vec(self.data.clone(), self.dims.as_slice(), &CandleDevice::Cpu)
+            .map_err(|e| AppError::msg(e.to_string()))
+    }
+
+    fn from_flat(data: Vec<f32>, m: u32, n: u32, template_dims: &[usize]) -> Result<Self> {
+        let mut dims = template_dims.to_vec();
+        if dims.is_empty() {
+            dims = vec![m as usize, n as usize];
+        } else {
+            *dims.last_mut().unwrap() = n as usize;
+        }
+        Ok(Self {
+            data,
+            m,
+            k: n,
+            dims,
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QuantKind {
     Q4K,
     Q6K,
+    /// Shader wired; currently unused on forward (CPU preferred for Q8_0 downs).
+    #[allow(dead_code)]
+    Q8_0,
 }
 
 impl QuantKind {
@@ -34,6 +107,9 @@ impl QuantKind {
         match dt {
             GgmlDType::Q4K => Some(Self::Q4K),
             GgmlDType::Q6K => Some(Self::Q6K),
+            // Q8_0 shader exists, but for Gemma4 expert/shared *downs* (k≈704)
+            // Candle CPU MatMul beats host-synchronized GPU GEMV. Keep CPU.
+            GgmlDType::Q8_0 => None,
             _ => None,
         }
     }
@@ -42,6 +118,14 @@ impl QuantKind {
         match self {
             Self::Q4K => BLOCK_Q4K_SIZE,
             Self::Q6K => BLOCK_Q6K_SIZE,
+            Self::Q8_0 => BLOCK_Q8_0_SIZE,
+        }
+    }
+
+    fn qk(self) -> usize {
+        match self {
+            Self::Q4K | Self::Q6K => QK_K,
+            Self::Q8_0 => QK8_0,
         }
     }
 
@@ -49,6 +133,7 @@ impl QuantKind {
         match self {
             Self::Q4K => "Q4_K",
             Self::Q6K => "Q6_K",
+            Self::Q8_0 => "Q8_0",
         }
     }
 }
@@ -96,6 +181,7 @@ pub struct VulkanContext {
     physical: vk::PhysicalDevice,
     pipeline_q4k: QuantPipeline,
     pipeline_q6k: QuantPipeline,
+    pipeline_q8_0: QuantPipeline,
     pipeline_layout: vk::PipelineLayout,
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
@@ -152,6 +238,7 @@ impl VulkanContext {
         let pipeline_layout = create_pipeline_layout(&device, descriptor_set_layout)?;
         let shader_q4k = create_shader(&device, SPIRV_Q4K)?;
         let shader_q6k = create_shader(&device, SPIRV_Q6K)?;
+        let shader_q8_0 = create_shader(&device, SPIRV_Q8_0)?;
         let pipeline_q4k = QuantPipeline {
             shader: shader_q4k,
             pipeline: create_compute_pipeline(&device, pipeline_layout, shader_q4k)?,
@@ -159,6 +246,10 @@ impl VulkanContext {
         let pipeline_q6k = QuantPipeline {
             shader: shader_q6k,
             pipeline: create_compute_pipeline(&device, pipeline_layout, shader_q6k)?,
+        };
+        let pipeline_q8_0 = QuantPipeline {
+            shader: shader_q8_0,
+            pipeline: create_compute_pipeline(&device, pipeline_layout, shader_q8_0)?,
         };
 
         let pool_sizes = [
@@ -199,6 +290,7 @@ impl VulkanContext {
             physical,
             pipeline_q4k,
             pipeline_q6k,
+            pipeline_q8_0,
             pipeline_layout,
             descriptor_set_layout,
             descriptor_pool,
@@ -216,8 +308,8 @@ impl VulkanContext {
         ctx.gpu_gemv_worthwhile = ctx.microbench_gpu_vs_cpu().unwrap_or(false);
         if ctx.gpu_gemv_worthwhile {
             eprintln!(
-                "compute: GPU Q4_K/Q6_K for VRAM-warmed weights (hot layers + MoE experts); \
-                 expect higher GPU% when experts stay cached"
+                "compute: GPU Q4_K/Q6_K for VRAM-warmed weights (hot + MoE gate/up); \
+                 Q8_0 downs stay on Candle CPU (faster than sync GPU)"
             );
         }
         Ok(ctx)
@@ -352,90 +444,177 @@ impl VulkanContext {
                 "vulkan-skip: GPU GEMV disabled on this device",
             ));
         }
-
-        let x_f32 = x.to_dtype(DType::F32)?;
-        let x_dims = x_f32.dims().to_vec();
-        if x_dims.is_empty() {
-            return Err(AppError::msg("Vulkan quant GEMV: empty input"));
+        let act = DeviceAct::from_tensor(x)?;
+        let acts = self.qmatmul_multi_act(ws, &act)?;
+        let mut outs = Vec::with_capacity(acts.len());
+        for a in acts {
+            outs.push(a.to_tensor()?);
         }
-        let last = *x_dims.last().unwrap();
-        let m: usize = x_dims[..x_dims.len() - 1].iter().product::<usize>().max(1);
-        // Forward path never uploads: only warm_* fills VRAM.
+        Ok(outs)
+    }
 
+    /// Same as `qmatmul_multi` but keeps results as [`DeviceAct`] (caller downloads once).
+    pub fn qmatmul_multi_act(&self, ws: &[&QMatMul], act: &DeviceAct) -> Result<Vec<DeviceAct>> {
+        if ws.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut guards = Vec::with_capacity(ws.len());
         let mut metas: Vec<(usize, u32, u32, QuantKind)> = Vec::with_capacity(ws.len());
         for w in ws {
-            let QMatMul::QTensor(qt) = w else {
-                self.log_skip("weight already dequantized (Tensor/F16)");
-                return Err(AppError::msg(
-                    "vulkan-skip: weight already dequantized (Tensor/F16)",
-                ));
-            };
-            let Some(kind) = QuantKind::from_dtype(qt.dtype()) else {
-                self.log_skip(&format!("dtype {:?} (Q4_K/Q6_K only)", qt.dtype()));
-                return Err(AppError::msg(format!(
-                    "vulkan-skip: dtype {:?} (Q4_K/Q6_K only)",
-                    qt.dtype()
-                )));
-            };
-            let (n, k) = qt
-                .shape()
-                .dims2()
-                .map_err(|e| AppError::msg(e.to_string()))?;
-            if !k.is_multiple_of(QK_K) {
-                self.log_skip(&format!("k={k} not multiple of {QK_K}"));
-                return Err(AppError::msg(format!(
-                    "vulkan-skip: k={k} not multiple of {QK_K}"
-                )));
-            }
-            if last != k {
-                return Err(AppError::msg(format!(
-                    "Vulkan {} shape mismatch: x last={last} k={k}",
-                    kind.name()
-                )));
-            }
-            let key = Arc::as_ptr(qt) as usize;
-            let cached = self
-                .weight_cache
-                .lock()
-                .map_err(|_| AppError::msg("weight cache lock poisoned"))?
-                .contains_key(&key);
-            if !cached {
-                self.log_skip("weight not VRAM-cached (CPU; cold)");
-                return Err(AppError::msg(
-                    "vulkan-skip: weight not VRAM-cached (CPU; cold)",
-                ));
-            }
-            let w_bytes = qt
-                .data()
-                .map_err(|e| AppError::msg(format!("QTensor data: {e}")))?;
-            let expect = n * (k / QK_K) * kind.block_size();
-            if w_bytes.as_ref().len() != expect {
-                return Err(AppError::msg(format!(
-                    "{} byte len {} != expected {expect}",
-                    kind.name(),
-                    w_bytes.as_ref().len()
-                )));
-            }
-            guards.push(w_bytes);
-            metas.push((key, n as u32, k as u32, kind));
+            let (key, n, k, kind, guard) = self.prepare_one_gemv(w, act.k() as usize)?;
+            guards.push(guard);
+            metas.push((key, n, k, kind));
         }
-
-        let a_flat = x_f32.reshape((m, last))?.flatten_all()?.to_vec1::<f32>()?;
         let prepared: Vec<(usize, &[u8], u32, u32, QuantKind)> = metas
             .iter()
             .zip(guards.iter())
             .map(|(&(key, n, k, kind), g)| (key, g.as_ref(), n, k, kind))
             .collect();
-        let chunks = self.quant_gemm_gpu_multi(&prepared, m as u32, &a_flat)?;
+        let x_refs: Vec<&[f32]> = (0..prepared.len()).map(|_| act.data()).collect();
+        let chunks = self.quant_gemm_gpu_multi_xs(&prepared, &x_refs)?;
         let mut outs = Vec::with_capacity(chunks.len());
         for (i, c_flat) in chunks.into_iter().enumerate() {
-            let n = metas[i].1 as usize;
-            let mut out_dims = x_dims.clone();
-            *out_dims.last_mut().unwrap() = n;
-            outs.push(Tensor::from_vec(c_flat, out_dims, &CandleDevice::Cpu)?);
+            let n = metas[i].1;
+            outs.push(DeviceAct::from_flat(c_flat, act.m(), n, act.dims())?);
         }
         Ok(outs)
+    }
+
+    /// Independent GEMVs with **per-op activations** (one submit; MoE expert downs).
+    pub fn qmatmul_multi_xs(&self, pairs: &[(&QMatMul, &Tensor)]) -> Result<Vec<Tensor>> {
+        if pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !self.should_try_gpu(pairs[0].1) {
+            self.log_skip("GPU GEMV disabled on this device");
+            return Err(AppError::msg(
+                "vulkan-skip: GPU GEMV disabled on this device",
+            ));
+        }
+        let acts: Vec<DeviceAct> = pairs
+            .iter()
+            .map(|(_, x)| DeviceAct::from_tensor(x))
+            .collect::<Result<Vec<_>>>()?;
+        let ws: Vec<&QMatMul> = pairs.iter().map(|(w, _)| *w).collect();
+        let out_acts = self.qmatmul_multi_xs_act(&ws, &acts)?;
+        let mut outs = Vec::with_capacity(out_acts.len());
+        for a in out_acts {
+            outs.push(a.to_tensor()?);
+        }
+        Ok(outs)
+    }
+
+    /// Per-op [`DeviceAct`] inputs → fused submit → [`DeviceAct`] outputs (D2H deferred to caller).
+    pub fn qmatmul_multi_xs_act(
+        &self,
+        ws: &[&QMatMul],
+        acts: &[DeviceAct],
+    ) -> Result<Vec<DeviceAct>> {
+        if ws.len() != acts.len() {
+            return Err(AppError::msg(format!(
+                "qmatmul_multi_xs_act: {} weights vs {} activations",
+                ws.len(),
+                acts.len()
+            )));
+        }
+        if ws.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut guards = Vec::with_capacity(ws.len());
+        let mut metas: Vec<(usize, u32, u32, QuantKind)> = Vec::with_capacity(ws.len());
+        for (i, w) in ws.iter().enumerate() {
+            let act = &acts[i];
+            let (key, n, k, kind, guard) = self.prepare_one_gemv(w, act.k() as usize)?;
+            let expect_x = (act.m() as usize).saturating_mul(k as usize);
+            if act.data().len() != expect_x {
+                return Err(AppError::msg(format!(
+                    "DeviceAct len {} != m*k={expect_x}",
+                    act.data().len()
+                )));
+            }
+            guards.push(guard);
+            metas.push((key, n, k, kind));
+        }
+        let prepared: Vec<(usize, &[u8], u32, u32, QuantKind)> = metas
+            .iter()
+            .zip(guards.iter())
+            .map(|(&(key, n, k, kind), g)| (key, g.as_ref(), n, k, kind))
+            .collect();
+        let x_refs: Vec<&[f32]> = acts.iter().map(|a| a.data()).collect();
+        let chunks = self.quant_gemm_gpu_multi_xs(&prepared, &x_refs)?;
+        let mut outs = Vec::with_capacity(chunks.len());
+        for (i, c_flat) in chunks.into_iter().enumerate() {
+            let n = metas[i].1;
+            outs.push(DeviceAct::from_flat(
+                c_flat,
+                acts[i].m(),
+                n,
+                acts[i].dims(),
+            )?);
+        }
+        Ok(outs)
+    }
+
+    /// Validate weight + pull QTensor bytes; weight must already be VRAM-cached.
+    fn prepare_one_gemv<'a>(
+        &self,
+        w: &'a QMatMul,
+        x_last: usize,
+    ) -> Result<(usize, u32, u32, QuantKind, std::borrow::Cow<'a, [u8]>)> {
+        let QMatMul::QTensor(qt) = w else {
+            self.log_skip("weight already dequantized (Tensor/F16)");
+            return Err(AppError::msg(
+                "vulkan-skip: weight already dequantized (Tensor/F16)",
+            ));
+        };
+        let Some(kind) = QuantKind::from_dtype(qt.dtype()) else {
+            self.log_skip(&format!("dtype {:?} (Q4_K/Q6_K GPU; Q8_0→CPU)", qt.dtype()));
+            return Err(AppError::msg(format!(
+                "vulkan-skip: dtype {:?} (Q4_K/Q6_K GPU; Q8_0→CPU)",
+                qt.dtype()
+            )));
+        };
+        let (n, k) = qt
+            .shape()
+            .dims2()
+            .map_err(|e| AppError::msg(e.to_string()))?;
+        let qk = kind.qk();
+        if !k.is_multiple_of(qk) {
+            self.log_skip(&format!("k={k} not multiple of {qk}"));
+            return Err(AppError::msg(format!(
+                "vulkan-skip: k={k} not multiple of {qk}"
+            )));
+        }
+        if x_last != k {
+            return Err(AppError::msg(format!(
+                "Vulkan {} shape mismatch: x last={x_last} k={k}",
+                kind.name()
+            )));
+        }
+        let key = Arc::as_ptr(qt) as usize;
+        let cached = self
+            .weight_cache
+            .lock()
+            .map_err(|_| AppError::msg("weight cache lock poisoned"))?
+            .contains_key(&key);
+        if !cached {
+            self.log_skip("weight not VRAM-cached (CPU; cold)");
+            return Err(AppError::msg(
+                "vulkan-skip: weight not VRAM-cached (CPU; cold)",
+            ));
+        }
+        let w_bytes = qt
+            .data()
+            .map_err(|e| AppError::msg(format!("QTensor data: {e}")))?;
+        let expect = n * (k / kind.qk()) * kind.block_size();
+        if w_bytes.as_ref().len() != expect {
+            return Err(AppError::msg(format!(
+                "{} byte len {} != expected {expect}",
+                kind.name(),
+                w_bytes.as_ref().len()
+            )));
+        }
+        Ok((key, n as u32, k as u32, kind, w_bytes))
     }
 
     fn touch_lru(lru: &mut VecDeque<usize>, key: usize) {
@@ -612,10 +791,10 @@ impl VulkanContext {
         m: u32,
         x: &[f32],
     ) -> Result<Vec<f32>> {
-        let mut outs = self.quant_gemm_gpu_multi(
+        let _ = m;
+        let mut outs = self.quant_gemm_gpu_multi_xs(
             &[(key, w_bytes, n, k, QuantKind::Q4K)],
-            m,
-            x,
+            &[x],
         )?;
         outs.pop().ok_or_else(|| AppError::msg("gpu gemm empty"))
     }
@@ -630,29 +809,72 @@ impl VulkanContext {
         m: u32,
         x: &[f32],
     ) -> Result<Vec<f32>> {
-        let mut outs = self.quant_gemm_gpu_multi(
+        let _ = m;
+        let mut outs = self.quant_gemm_gpu_multi_xs(
             &[(key, w_bytes, n, k, QuantKind::Q6K)],
-            m,
-            x,
+            &[x],
         )?;
         outs.pop().ok_or_else(|| AppError::msg("gpu gemm empty"))
     }
 
+    /// Shared-activation fused GEMVs (all ops read the same `x`).
+    #[allow(dead_code)]
     fn quant_gemm_gpu_multi(
         &self,
         ops: &[(usize, &[u8], u32, u32, QuantKind)],
         m: u32,
         x: &[f32],
     ) -> Result<Vec<Vec<f32>>> {
+        let _ = m;
+        let x_refs: Vec<&[f32]> = (0..ops.len()).map(|_| x).collect();
+        self.quant_gemm_gpu_multi_xs(ops, &x_refs)
+    }
+
+    /// Fused GEMVs with **per-op** activations packed into one submit.
+    /// `xs[i].len()` must equal `m_i * k_i` where `m_i = xs[i].len() / k_i`.
+    fn quant_gemm_gpu_multi_xs(
+        &self,
+        ops: &[(usize, &[u8], u32, u32, QuantKind)],
+        xs: &[&[f32]],
+    ) -> Result<Vec<Vec<f32>>> {
         if ops.is_empty() {
             return Ok(Vec::new());
         }
+        if ops.len() != xs.len() {
+            return Err(AppError::msg(format!(
+                "quant_gemm_gpu_multi_xs: {} ops vs {} xs",
+                ops.len(),
+                xs.len()
+            )));
+        }
         if ops.len() > FUSED_MAX_OPS {
             let mut all = Vec::new();
-            for chunk in ops.chunks(FUSED_MAX_OPS) {
-                all.extend(self.quant_gemm_gpu_multi(chunk, m, x)?);
+            for (chunk_ops, chunk_xs) in ops.chunks(FUSED_MAX_OPS).zip(xs.chunks(FUSED_MAX_OPS)) {
+                all.extend(self.quant_gemm_gpu_multi_xs(chunk_ops, chunk_xs)?);
             }
             return Ok(all);
+        }
+
+        let ms: Vec<u32> = ops
+            .iter()
+            .zip(xs.iter())
+            .map(|(&(_, _, _, k, _), x)| {
+                let k = k as usize;
+                if k == 0 || !x.len().is_multiple_of(k) {
+                    0
+                } else {
+                    (x.len() / k) as u32
+                }
+            })
+            .collect();
+        for (i, &m) in ms.iter().enumerate() {
+            if m == 0 {
+                return Err(AppError::msg(format!(
+                    "Vulkan GEMV op {i}: x len {} not multiple of k={}",
+                    xs[i].len(),
+                    ops[i].3
+                )));
+            }
         }
 
         let _guard = self
@@ -670,20 +892,21 @@ impl VulkanContext {
                 .map_err(|_| AppError::msg("weight cache lock poisoned"))?;
             let mut out = Vec::with_capacity(ops.len());
             for &(key, _, _, _, _) in ops {
-                let w_buf = cache
-                    .get(&key)
-                    .ok_or_else(|| {
-                        AppError::msg("vulkan-skip: weight cache miss after ensure")
-                    })?;
+                let w_buf = cache.get(&key).ok_or_else(|| {
+                    AppError::msg("vulkan-skip: weight cache miss after ensure")
+                })?;
                 out.push((w_buf.buffer, w_buf.size));
             }
             out
         };
 
-        let x_bytes = (x.len() * size_of::<f32>()) as u64;
+        let x_lens: Vec<usize> = xs.iter().map(|x| x.len()).collect();
+        let x_total: usize = x_lens.iter().sum();
+        let x_bytes = (x_total * size_of::<f32>()) as u64;
         let y_elems: Vec<usize> = ops
             .iter()
-            .map(|&(_, _, n, _, _)| (m as usize) * (n as usize))
+            .zip(ms.iter())
+            .map(|(&(_, _, n, _, _), &m)| (m as usize) * (n as usize))
             .collect();
         let y_total: usize = y_elems.iter().sum();
         let y_bytes = (y_total * size_of::<f32>()) as u64;
@@ -713,8 +936,19 @@ impl VulkanContext {
             vk::BufferUsageFlags::UNIFORM_BUFFER,
         )?;
 
+        // Pack all activations contiguously (one H2D for the fused group).
+        let mut x_off_elems = 0usize;
+        let mut x_offsets = Vec::with_capacity(ops.len());
         unsafe {
-            std::ptr::copy_nonoverlapping(x.as_ptr(), scratch.x.ptr as *mut f32, x.len());
+            for (i, x) in xs.iter().enumerate() {
+                x_offsets.push(x_off_elems);
+                std::ptr::copy_nonoverlapping(
+                    x.as_ptr(),
+                    (scratch.x.ptr as *mut f32).add(x_off_elems),
+                    x.len(),
+                );
+                x_off_elems += x_lens[i];
+            }
         }
 
         let mut y_off_elems = 0usize;
@@ -725,6 +959,7 @@ impl VulkanContext {
             [vk::DescriptorBufferInfo; 1],
         )> = Vec::with_capacity(ops.len());
         for (i, &(_, _, n, k, _)) in ops.iter().enumerate() {
+            let m = ms[i];
             let dims = [n, k, m, 0u32];
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -733,12 +968,13 @@ impl VulkanContext {
                     4,
                 );
             }
+            let x_op_bytes = (x_lens[i] * size_of::<f32>()) as u64;
             let y_op_bytes = (y_elems[i] * size_of::<f32>()) as u64;
             writes_storage.push((
                 [vk::DescriptorBufferInfo {
                     buffer: scratch.x.buffer,
-                    offset: 0,
-                    range: x_bytes.max(4),
+                    offset: (x_offsets[i] * size_of::<f32>()) as u64,
+                    range: x_op_bytes.max(4),
                 }],
                 [vk::DescriptorBufferInfo {
                     buffer: w_bufs[i].0,
@@ -812,6 +1048,7 @@ impl VulkanContext {
         let sets: Vec<vk::DescriptorSet> = scratch.sets[..ops.len()].to_vec();
         let ns: Vec<u32> = ops.iter().map(|op| op.2).collect();
         let kinds: Vec<QuantKind> = ops.iter().map(|op| op.4).collect();
+        let last = ops.len().saturating_sub(1);
         unsafe {
             self.device
                 .begin_command_buffer(cmd, &begin)
@@ -820,6 +1057,7 @@ impl VulkanContext {
                 let pipeline = match kinds[i] {
                     QuantKind::Q4K => self.pipeline_q4k.pipeline,
                     QuantKind::Q6K => self.pipeline_q6k.pipeline,
+                    QuantKind::Q8_0 => self.pipeline_q8_0.pipeline,
                 };
                 self.device
                     .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
@@ -831,17 +1069,27 @@ impl VulkanContext {
                     &[sets[i]],
                     &[],
                 );
-                let groups = (m * ns[i]).div_ceil(64);
+                let groups = (ms[i] * ns[i]).div_ceil(64);
                 self.device.cmd_dispatch(cmd, groups, 1, 1);
+                // Between ops: shader→shader only. HOST after the last op (one D2H).
+                let (dst_access, dst_stage) = if i == last {
+                    (
+                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::HOST_READ,
+                        vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::HOST,
+                    )
+                } else {
+                    (
+                        vk::AccessFlags::SHADER_READ,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                    )
+                };
                 let barrier = vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(
-                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::HOST_READ,
-                    );
+                    .dst_access_mask(dst_access);
                 self.device.cmd_pipeline_barrier(
                     cmd,
                     vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::HOST,
+                    dst_stage,
                     vk::DependencyFlags::empty(),
                     &[barrier],
                     &[],
@@ -882,7 +1130,7 @@ impl VulkanContext {
         Ok(outs)
     }
 
-    // --- end quant_gemm_gpu_multi ---
+    // --- end quant_gemm_gpu_multi_xs ---
 
     fn alloc_mapped(&self, capacity: u64, usage: vk::BufferUsageFlags) -> Result<MappedScratch> {
         let capacity = capacity.max(4);
@@ -1036,6 +1284,7 @@ impl Drop for VulkanContext {
                 .destroy_descriptor_pool(self.descriptor_pool, None);
             self.device.destroy_pipeline(self.pipeline_q4k.pipeline, None);
             self.device.destroy_pipeline(self.pipeline_q6k.pipeline, None);
+            self.device.destroy_pipeline(self.pipeline_q8_0.pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
             self.device
@@ -1044,6 +1293,8 @@ impl Drop for VulkanContext {
                 .destroy_shader_module(self.pipeline_q4k.shader, None);
             self.device
                 .destroy_shader_module(self.pipeline_q6k.shader, None);
+            self.device
+                .destroy_shader_module(self.pipeline_q8_0.shader, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
