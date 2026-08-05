@@ -1,15 +1,59 @@
-//! Double-buffer (ping-pong) prefetch arena backed by anonymous `mmap` + `mlock`.
+//! Double-buffer (ping-pong) prefetch arena backed by anonymous `mmap`.
 //!
 //! Why this design:
 //! - **mmap (anonymous)**: obtains page-aligned virtual memory suitable for `O_DIRECT`
 //!   DMA (device/driver typically require 512/4096-byte address & length alignment).
-//! - **mlock**: pins pages in physical RAM so the reclaim path cannot swap them out
-//!   mid-inference — critical under a hard 16 GiB RAM budget where the OS would
-//!   otherwise reclaim idle weight pages.
+//! - **mlock (optional)**: when `RLIMIT_MEMLOCK` already covers the arenas, pages are
+//!   pinned so reclaim cannot swap them mid-inference. Default path never requires
+//!   `ulimit` / CAP_IPC_LOCK — unlocked arenas are correct for `O_DIRECT`.
 
 use memmap2::{MmapMut, MmapOptions};
 
 use super::error::{IoError, Result};
+
+/// Soft-raise `RLIMIT_MEMLOCK` to its hard cap when that helps (no user action).
+/// Never prints hints about `ulimit` — unlocked arenas are the normal fallback.
+pub fn try_raise_memlock_limit() {
+    unsafe {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut lim) != 0 {
+            return;
+        }
+        if lim.rlim_cur < lim.rlim_max {
+            lim.rlim_cur = lim.rlim_max;
+            let _ = libc::setrlimit(libc::RLIMIT_MEMLOCK, &lim);
+        }
+    }
+}
+
+/// Current effective memlock budget in bytes (`None` = unlimited).
+fn memlock_budget_bytes() -> Option<u64> {
+    unsafe {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut lim) != 0 {
+            return Some(0);
+        }
+        if lim.rlim_cur == libc::RLIM_INFINITY {
+            None
+        } else {
+            Some(lim.rlim_cur as u64)
+        }
+    }
+}
+
+/// True when the process may `mlock` `need_bytes` without raising privileges.
+fn memlock_covers(need_bytes: usize) -> bool {
+    match memlock_budget_bytes() {
+        None => true,
+        Some(budget) => budget >= need_bytes as u64,
+    }
+}
 
 /// Logical block size commonly required by `O_DIRECT` on NVMe (4 KiB pages).
 pub const DIRECT_ALIGN: usize = 4096;
@@ -40,8 +84,6 @@ impl PrefetchBuffer {
         let mut locked = false;
         if lock {
             // SAFETY: `map` owns a valid anonymous mapping of `capacity` bytes.
-            // mlock requires a readable/writable region; failure is usually
-            // RLIMIT_MEMLOCK rather than an invalid pointer.
             let rc = unsafe { libc::mlock(map.as_ptr().cast(), map.len()) };
             if rc != 0 {
                 return Err(IoError::Mlock(capacity, std::io::Error::last_os_error()));
@@ -49,7 +91,8 @@ impl PrefetchBuffer {
             locked = true;
         }
 
-        // First-touch: fault pages in now so the critical path avoids major faults.
+        // First-touch: fault pages in now so the critical path avoids major faults
+        // even without mlock.
         map.fill(0);
 
         Ok(Self {
@@ -125,18 +168,35 @@ pub struct PrefetchBufferManager {
 }
 
 impl PrefetchBufferManager {
-    /// Allocate and `mlock` `slot_bytes` × 2 anonymous regions.
-    ///
-    /// `slot_bytes` must be a multiple of [`DIRECT_ALIGN`]. Under a 16 GiB
-    /// host budget, 2 GiB × 2 (= 4 GiB) leaves headroom for KV-cache, runtime,
-    /// and the OS; raise `ulimit -l` accordingly before calling.
+    /// Allocate arenas for hybrid DMA. Pins with `mlock` only when the process
+    /// already has enough `RLIMIT_MEMLOCK`; otherwise uses unlocked mmap.
+    /// No `ulimit` / CAP_IPC_LOCK required for correctness.
     pub fn new(slot_bytes: usize) -> Result<Self> {
-        Self::with_lock(slot_bytes, true)
+        Self::new_auto(slot_bytes)
     }
 
-    /// Same as [`Self::new`] but skips `mlock` (useful when `RLIMIT_MEMLOCK` is tight).
+    /// Opportunistic lock: pin if budget covers 2× slots, else unlocked.
+    pub fn new_auto(slot_bytes: usize) -> Result<Self> {
+        try_raise_memlock_limit();
+        let need = slot_bytes.saturating_mul(2);
+        if memlock_covers(need) {
+            match Self::with_lock(slot_bytes, true) {
+                Ok(v) => return Ok(v),
+                Err(_) => { /* fall through to unlocked */ }
+            }
+        }
+        Self::with_lock(slot_bytes, false)
+    }
+
+    /// Force unlocked arenas (tests / demos).
     pub fn new_unlocked(slot_bytes: usize) -> Result<Self> {
         Self::with_lock(slot_bytes, false)
+    }
+
+    /// Force `mlock` (fails if limit is too small). Prefer [`Self::new`].
+    #[allow(dead_code)]
+    pub fn new_locked(slot_bytes: usize) -> Result<Self> {
+        Self::with_lock(slot_bytes, true)
     }
 
     fn with_lock(slot_bytes: usize, lock: bool) -> Result<Self> {
@@ -187,12 +247,31 @@ pub struct PrefetchRing {
 }
 
 impl PrefetchRing {
+    /// Opportunistic lock (same policy as [`PrefetchBufferManager::new`]).
     pub fn new(slot_bytes: usize, n_slots: usize) -> Result<Self> {
-        Self::with_lock(slot_bytes, n_slots, true)
+        Self::new_auto(slot_bytes, n_slots)
+    }
+
+    pub fn new_auto(slot_bytes: usize, n_slots: usize) -> Result<Self> {
+        try_raise_memlock_limit();
+        let n = n_slots.max(2);
+        let need = slot_bytes.saturating_mul(n);
+        if memlock_covers(need) {
+            match Self::with_lock(slot_bytes, n_slots, true) {
+                Ok(v) => return Ok(v),
+                Err(_) => {}
+            }
+        }
+        Self::with_lock(slot_bytes, n_slots, false)
     }
 
     pub fn new_unlocked(slot_bytes: usize, n_slots: usize) -> Result<Self> {
         Self::with_lock(slot_bytes, n_slots, false)
+    }
+
+    #[allow(dead_code)]
+    pub fn new_locked(slot_bytes: usize, n_slots: usize) -> Result<Self> {
+        Self::with_lock(slot_bytes, n_slots, true)
     }
 
     fn with_lock(slot_bytes: usize, n_slots: usize, lock: bool) -> Result<Self> {
@@ -234,6 +313,10 @@ impl PrefetchRing {
     #[allow(dead_code)]
     pub fn total_pinned_bytes(&self) -> usize {
         self.slots.iter().map(|s| s.capacity()).sum()
+    }
+
+    pub fn all_locked(&self) -> bool {
+        !self.slots.is_empty() && self.slots.iter().all(|s| s.is_locked())
     }
 }
 

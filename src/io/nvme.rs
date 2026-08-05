@@ -2,8 +2,9 @@
 //!
 //! Why `O_DIRECT`:
 //! bypasses the page cache so weight pages are DMA'd straight into our
-//! mlock'd prefetch arenas. Under a fixed RAM budget this avoids
-//! double-buffering in the kernel page cache (file cache + our arena).
+//! page-aligned prefetch arenas (optionally mlock'd when the OS allows).
+//! Under a fixed RAM budget this avoids double-buffering in the kernel
+//! page cache (file cache + our arena).
 //!
 //! Why `io_uring`:
 //! submission / completion separation lets the CPU compute on Buffer A while

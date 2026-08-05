@@ -9,8 +9,7 @@ pub enum IoError {
     Mmap(usize, #[source] io::Error),
 
     #[error(
-        "mlock failed ({0} bytes): {1} \
-         (raise `ulimit -l` / RLIMIT_MEMLOCK, or grant CAP_IPC_LOCK)"
+        "mlock failed ({0} bytes): {1}"
     )]
     Mlock(usize, #[source] io::Error),
 

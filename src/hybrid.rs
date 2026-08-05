@@ -22,7 +22,7 @@ use crate::io::gguf_map::{qtensor_from_loc, GgufLayerMap, LayerDmaPlan, TensorLo
 use crate::io::moe::{ExpertDmaPlan, MoeInfo};
 use crate::io::nvme::AsyncNvmeReader;
 use crate::io::pack::{ensure_experts_packed, ensure_packed, PackedExperts};
-use crate::io::prefetch::{PrefetchBufferManager, PrefetchRing};
+use crate::io::prefetch::{try_raise_memlock_limit, PrefetchBufferManager, PrefetchRing};
 use crate::progress;
 
 const MAX_SEQ_LEN: usize = 4096;
@@ -67,13 +67,20 @@ impl Mlp {
         xs: &Tensor,
         lora: Option<&LayerLora>,
     ) -> Result<Tensor> {
-        let gate = qmm(compute, &self.gate, lora.and_then(|l| l.gate.as_ref()), xs)?;
+        let pair = compute.qmatmul_multi(&[&self.gate, &self.up], xs)?;
+        let mut gate = pair[0].clone();
+        let mut rhs = pair[1].clone();
+        if let Some(d) = lora.and_then(|l| l.gate.as_ref()) {
+            gate = (gate + d.forward(xs)?)?;
+        }
+        if let Some(d) = lora.and_then(|l| l.up.as_ref()) {
+            rhs = (rhs + d.forward(xs)?)?;
+        }
         let lhs = if self.use_gelu {
             gate.gelu()?
         } else {
             candle_nn::ops::silu(&gate)?
         };
-        let rhs = qmm(compute, &self.up, lora.and_then(|l| l.up.as_ref()), xs)?;
         let mid = (lhs * rhs)?;
         qmm(compute, &self.down, lora.and_then(|l| l.down.as_ref()), &mid)
     }
@@ -112,6 +119,19 @@ impl ExpertLru {
             hits: 0,
             misses: 0,
         }
+    }
+
+    fn contains(&self, key: (usize, usize)) -> bool {
+        self.map.contains_key(&key)
+    }
+
+    fn snapshot(&self) -> (usize, usize, u64, u64) {
+        (self.map.len(), self.capacity, self.hits, self.misses)
+    }
+
+    fn reset_counters(&mut self) {
+        self.hits = 0;
+        self.misses = 0;
     }
 
     fn get(&mut self, key: (usize, usize)) -> Option<Mlp> {
@@ -275,6 +295,8 @@ pub struct HybridEngine {
     report_prefill: bool,
     /// MoE expert MLP LRU (RAM); survives KV resets across chat turns.
     expert_cache: ExpertLru,
+    /// Last-token Top-K ids per layer — speculative prefetch on the next decode step.
+    last_experts: Vec<Vec<usize>>,
 }
 
 /// Expert streaming state: packed plans + dedicated io_uring reader + ring.
@@ -285,6 +307,10 @@ struct MoeRuntime {
     packed: PackedExperts,
     reader: AsyncNvmeReader,
     ring: PrefetchRing,
+    /// Which `(layer, expert)` currently occupies each ring slot.
+    slot_expert: Vec<Option<(usize, usize)>>,
+    /// In-flight DMA target `(slot, layer, expert)` awaiting CQE.
+    pending: Option<(usize, usize, usize)>,
 }
 
 impl HybridEngine {
@@ -297,6 +323,7 @@ impl HybridEngine {
     ) -> Result<Self> {
         let path = path.as_ref();
         let pack_cache = pack_cache.as_ref();
+        try_raise_memlock_limit();
         let mut map = GgufLayerMap::open(path).map_err(|e| AppError::msg(e.to_string()))?;
         let device = compute.device().clone();
         let device_label = format!("{}+pack+io_uring", compute.label());
@@ -362,43 +389,41 @@ impl HybridEngine {
 
         progress::phase(2, phases, "allocating prefetch arenas / MoE ring …");
         let slot = packed.recommended_slot_bytes();
-        let buffers = match PrefetchBufferManager::new(slot) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("warning: mlock failed ({e}); using unlocked arenas");
-                PrefetchBufferManager::new_unlocked(slot)
-                    .map_err(|e| AppError::msg(e.to_string()))?
-            }
-        };
+        let buffers =
+            PrefetchBufferManager::new(slot).map_err(|e| AppError::msg(e.to_string()))?;
+        if buffers.both_locked() {
+            eprintln!("io: layer arenas mlock'd ({} MiB)", buffers.total_pinned_bytes() / (1024 * 1024));
+        }
         let reader =
             AsyncNvmeReader::open(&packed.pack_path).map_err(|e| AppError::msg(e.to_string()))?;
 
         let moe_runtime = if let Some(pe) = packed_experts {
             let n_slots = pe.moe.expert_used_count.max(2);
             let expert_slot = pe.recommended_slot_bytes();
-            let ring = match PrefetchRing::new(expert_slot, n_slots) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("warning: expert mlock failed ({e}); using unlocked ring");
-                    PrefetchRing::new_unlocked(expert_slot, n_slots)
-                        .map_err(|e| AppError::msg(e.to_string()))?
-                }
-            };
+            let ring =
+                PrefetchRing::new(expert_slot, n_slots).map_err(|e| AppError::msg(e.to_string()))?;
             let expert_reader =
                 AsyncNvmeReader::open(&pe.pack_path).map_err(|e| AppError::msg(e.to_string()))?;
             eprintln!(
-                "MoE: family={:?} experts={} top-k={} expert_slot={} KiB ring={}",
+                "MoE: family={:?} experts={} top-k={} expert_slot={} KiB ring={}{}",
                 pe.moe.family,
                 pe.moe.expert_count,
                 pe.moe.expert_used_count,
                 expert_slot / 1024,
-                n_slots
+                n_slots,
+                if ring.all_locked() {
+                    " (mlock'd)"
+                } else {
+                    ""
+                }
             );
             Some(MoeRuntime {
                 info: pe.moe.clone(),
                 packed: pe,
                 reader: expert_reader,
                 ring,
+                slot_expert: vec![None; n_slots],
+                pending: None,
             })
         } else {
             None
@@ -589,8 +614,7 @@ impl HybridEngine {
         if stream_count > 0 {
             eprintln!(
                 "hint: {stream_count} layers stream from pack each forward — \
-                 for lower latency try `--hot-layers {n_layers}` or raise `--ram-mib` \
-                 (and `ulimit -l` if mlock failed)"
+                 for lower latency try `--hot-layers {n_layers}` or raise `--ram-mib`"
             );
         }
         if let Some(sw) = map.sliding_window {
@@ -631,6 +655,7 @@ impl HybridEngine {
             device_label,
             report_prefill: false,
             expert_cache: ExpertLru::new(expert_cache_cap),
+            last_experts: vec![Vec::new(); n_layers],
         })
     }
 
@@ -745,16 +770,16 @@ impl HybridEngine {
         let mut logits = prepare_logits(self.forward(&input, 0)?)?;
         self.report_prefill = false;
         let prefill_s = t_prefill.elapsed().as_secs_f64();
+        let (fill, cap, pre_hits, pre_miss) = self.expert_cache.snapshot();
+        self.expert_cache.reset_counters();
+        let prompt_tok = tokens.len();
         progress::phase(
             2,
             2,
             &format!(
-                "prefill done in {prefill_s:.1}s — generating up to {max_tokens} tokens \
-                 (expert cache {}/{} hits={}/misses={})",
-                self.expert_cache.map.len(),
-                self.expert_cache.capacity,
-                self.expert_cache.hits,
-                self.expert_cache.misses
+                "prefill done in {prefill_s:.1}s ({:.2} tok/s) — generating up to {max_tokens} tokens \
+                 (expert cache {fill}/{cap} prefill hits={pre_hits}/misses={pre_miss})",
+                prompt_tok as f64 / prefill_s.max(1e-6)
             ),
         );
         if cfg!(debug_assertions) && prefill_s > 30.0 {
@@ -767,6 +792,7 @@ impl HybridEngine {
         let mut generated = String::new();
         let mut tokens_generated = 0usize;
         let mut hit_eos = false;
+        let t_decode = Instant::now();
         for _ in 0..max_tokens {
             let next = logits_processor.sample(&logits)?;
             tokens.push(next);
@@ -782,6 +808,16 @@ impl HybridEngine {
             }
             let input = Tensor::new(&[next], &self.device)?.unsqueeze(0)?;
             logits = prepare_logits(self.forward(&input, tokens.len() - 1)?)?;
+        }
+        let decode_s = t_decode.elapsed().as_secs_f64();
+        let (_, _, dec_hits, dec_miss) = self.expert_cache.snapshot();
+        let decode_tps = tokens_generated as f64 / decode_s.max(1e-6);
+        eprintln!(
+            "[bench] TTFT={prefill_s:.2}s  decode={tokens_generated} tok in {decode_s:.2}s \
+             ({decode_tps:.2} tok/s)  expert decode hits={dec_hits}/misses={dec_miss}"
+        );
+        if let Some((submits, skips)) = self.compute.vulkan_stats() {
+            eprintln!("[bench] vulkan submits={submits} skips={skips}");
         }
         Ok(crate::engine::GenerateOutcome {
             text: generated,
@@ -1111,39 +1147,30 @@ impl HybridEngine {
             .filter_map(|(i, v)| if v.is_empty() { None } else { Some(i) })
             .collect();
 
-        for (ai, &expert_id) in active.iter().enumerate() {
-            let slot = ai
-                % self
-                    .moe_runtime
-                    .as_ref()
-                    .map(|m| m.ring.len())
-                    .unwrap_or(2);
-            if let Some(&next_id) = active.get(ai + 1) {
-                let next_slot = (ai + 1)
-                    % self
-                        .moe_runtime
-                        .as_ref()
-                        .map(|m| m.ring.len())
-                        .unwrap_or(2);
-                self.dma_expert(layer_idx, next_id, next_slot)?;
-            }
-            let mlp = self.load_expert_mlp(layer_idx, expert_id, slot, use_gelu)?;
-            let row_ids = &top_x[expert_id];
-            if row_ids.is_empty() {
-                continue;
-            }
-            let index = Tensor::new(row_ids.as_slice(), &self.device)?;
-            let indexed = xs_flat.index_select(&index, 0)?;
-            let mut out = mlp.forward(&self.compute, &indexed, None)?;
+        if seq_len == 1 {
+            self.prefetch_speculative_experts(layer_idx)?;
+        }
+        let jobs = self.collect_moe_jobs(
+            layer_idx,
+            &active,
+            &top_x,
+            &selected_rws,
+            &xs_flat,
+            use_gelu,
+        )?;
+        let outs = run_moe_jobs_parallel(&self.compute, &jobs)?;
+        for ((expert_id, _mlp, index, rws, _indexed), mut out) in jobs.into_iter().zip(outs) {
             if let Some(ref scales) = down_scales {
                 if let Some(&s) = scales.get(expert_id) {
                     out = (out * f64::from(s))?;
                 }
             }
-            let rw = Tensor::new(selected_rws[expert_id].as_slice(), &self.device)?
-                .reshape((row_ids.len(), 1))?;
+            let rw = Tensor::new(rws.as_slice(), &self.device)?.reshape((rws.len(), 1))?;
             let weighted = out.broadcast_mul(&rw)?;
             ys = ys.index_add(&index, &weighted, 0)?;
+        }
+        if layer_idx < self.last_experts.len() {
+            self.last_experts[layer_idx] = active;
         }
 
         cur_moe = ys.reshape((b_size, seq_len, hidden_dim))?;
@@ -1202,31 +1229,81 @@ impl HybridEngine {
 
         let mut ys = xs_flat.zeros_like()?;
 
-        // Collect experts that have tokens, prefetch via ring while computing.
         let active: Vec<usize> = top_x
             .iter()
             .enumerate()
             .filter_map(|(i, v)| if v.is_empty() { None } else { Some(i) })
             .collect();
 
-        for (ai, &expert_id) in active.iter().enumerate() {
-            let slot = ai % self
-                .moe_runtime
-                .as_ref()
-                .map(|m| m.ring.len())
-                .unwrap_or(2);
+        if seq_len == 1 {
+            self.prefetch_speculative_experts(layer_idx)?;
+        }
+        let jobs = self.collect_moe_jobs(
+            layer_idx,
+            &active,
+            &top_x,
+            &selected_rws,
+            &xs_flat,
+            use_gelu,
+        )?;
+        let outs = run_moe_jobs_parallel(&self.compute, &jobs)?;
+        for ((_expert_id, _mlp, index, rws, _indexed), out) in jobs.into_iter().zip(outs) {
+            let rw = Tensor::new(rws.as_slice(), &self.device)?.reshape((rws.len(), 1))?;
+            let weighted = out.broadcast_mul(&rw)?;
+            ys = ys.index_add(&index, &weighted, 0)?;
+        }
+        if layer_idx < self.last_experts.len() {
+            self.last_experts[layer_idx] = active;
+        }
 
-            // Prefetch next active expert into the other ring slot.
-            if let Some(&next_id) = active.get(ai + 1) {
-                let next_slot = (ai + 1)
-                    % self
-                        .moe_runtime
-                        .as_ref()
-                        .map(|m| m.ring.len())
-                        .unwrap_or(2);
-                self.dma_expert(layer_idx, next_id, next_slot)?;
+        Ok(ys.reshape((b_size, seq_len, hidden_dim))?)
+    }
+
+    fn prefetch_speculative_experts(&mut self, layer_idx: usize) -> Result<()> {
+        let Some(prev) = self.last_experts.get(layer_idx).cloned() else {
+            return Ok(());
+        };
+        let n_slots = self
+            .moe_runtime
+            .as_ref()
+            .map(|m| m.ring.len())
+            .unwrap_or(0);
+        if n_slots == 0 {
+            return Ok(());
+        }
+        for (i, &eid) in prev.iter().enumerate() {
+            if self.expert_cache.contains((layer_idx, eid)) {
+                continue;
             }
+            self.start_dma_expert(layer_idx, eid, i % n_slots)?;
+        }
+        Ok(())
+    }
 
+    fn collect_moe_jobs(
+        &mut self,
+        layer_idx: usize,
+        active: &[usize],
+        top_x: &[Vec<u32>],
+        selected_rws: &[Vec<f32>],
+        xs_flat: &Tensor,
+        use_gelu: bool,
+    ) -> Result<Vec<(usize, Mlp, Tensor, Vec<f32>, Tensor)>> {
+        let n_slots = self
+            .moe_runtime
+            .as_ref()
+            .map(|m| m.ring.len())
+            .unwrap_or(2)
+            .max(1);
+        let mut jobs = Vec::with_capacity(active.len());
+        for (ai, &expert_id) in active.iter().enumerate() {
+            let slot = ai % n_slots;
+            if let Some(&next_id) = active.get(ai + 1) {
+                if !self.expert_cache.contains((layer_idx, next_id)) {
+                    let next_slot = (ai + 1) % n_slots;
+                    self.start_dma_expert(layer_idx, next_id, next_slot)?;
+                }
+            }
             let mlp = self.load_expert_mlp(layer_idx, expert_id, slot, use_gelu)?;
             let row_ids = &top_x[expert_id];
             if row_ids.is_empty() {
@@ -1234,17 +1311,32 @@ impl HybridEngine {
             }
             let index = Tensor::new(row_ids.as_slice(), &self.device)?;
             let indexed = xs_flat.index_select(&index, 0)?;
-            let out = mlp.forward(&self.compute, &indexed, None)?;
-            let rw = Tensor::new(selected_rws[expert_id].as_slice(), &self.device)?
-                .reshape((row_ids.len(), 1))?;
-            let weighted = out.broadcast_mul(&rw)?;
-            ys = ys.index_add(&index, &weighted, 0)?;
+            jobs.push((
+                expert_id,
+                mlp,
+                index,
+                selected_rws[expert_id].clone(),
+                indexed,
+            ));
         }
-
-        Ok(ys.reshape((b_size, seq_len, hidden_dim))?)
+        Ok(jobs)
     }
 
-    fn dma_expert(&mut self, layer_idx: usize, expert_id: usize, slot: usize) -> Result<()> {
+    fn start_dma_expert(&mut self, layer_idx: usize, expert_id: usize, slot: usize) -> Result<()> {
+        if self.expert_cache.contains((layer_idx, expert_id)) {
+            return Ok(());
+        }
+        let rt = self
+            .moe_runtime
+            .as_mut()
+            .ok_or_else(|| AppError::msg("MoE runtime missing"))?;
+        if rt.slot_expert.get(slot).copied().flatten() == Some((layer_idx, expert_id)) {
+            return Ok(());
+        }
+        if rt.pending == Some((slot, layer_idx, expert_id)) {
+            return Ok(());
+        }
+        self.wait_expert_dma()?;
         let rt = self
             .moe_runtime
             .as_mut()
@@ -1258,13 +1350,26 @@ impl HybridEngine {
                 ))
             })?
             .clone();
-        if rt.reader.has_in_flight() {
-            rt.reader.wait_completion()?;
-        }
         let buf = rt.ring.get_mut(slot)?;
         rt.reader
             .submit_read(buf, slot, plan.read_offset, plan.read_len)?;
-        rt.reader.wait_completion()?;
+        rt.pending = Some((slot, layer_idx, expert_id));
+        rt.slot_expert[slot] = None;
+        Ok(())
+    }
+
+    fn wait_expert_dma(&mut self) -> Result<()> {
+        let Some(rt) = self.moe_runtime.as_mut() else {
+            return Ok(());
+        };
+        if rt.reader.has_in_flight() {
+            rt.reader.wait_completion()?;
+        }
+        if let Some((slot, layer, expert)) = rt.pending.take() {
+            if let Some(entry) = rt.slot_expert.get_mut(slot) {
+                *entry = Some((layer, expert));
+            }
+        }
         Ok(())
     }
 
@@ -1279,8 +1384,16 @@ impl HybridEngine {
         if let Some(cached) = self.expert_cache.get(key) {
             return Ok(cached);
         }
-        // Ensure this expert is in the ring slot.
-        self.dma_expert(layer_idx, expert_id, slot)?;
+        let already_resident = self
+            .moe_runtime
+            .as_ref()
+            .and_then(|rt| rt.slot_expert.get(slot).copied().flatten())
+            == Some(key)
+            || self.moe_runtime.as_ref().and_then(|rt| rt.pending) == Some((slot, layer_idx, expert_id));
+        if !already_resident {
+            self.start_dma_expert(layer_idx, expert_id, slot)?;
+        }
+        self.wait_expert_dma()?;
         let rt = self
             .moe_runtime
             .as_ref()
@@ -1292,7 +1405,8 @@ impl HybridEngine {
         })?;
         let dma = rt.ring.get(slot)?.as_slice();
         let mlp = materialize_expert_mlp(plan, dma, &self.device, use_gelu)?;
-        mlp.warm_q4k(&self.compute);
+        // Do not VRAM-warm every expert: 768-slot cache thrash + sync upload
+        // dominated prefill. Hot attn/shared weights are warmed at pin time.
         self.expert_cache.insert(key, mlp.clone_handles());
         Ok(mlp)
     }
@@ -1314,13 +1428,39 @@ impl HybridEngine {
 
         let (q, k, v) = {
             let lora = self.lora.get(layer_idx);
-            let q = qmm(&self.compute, &layer.wq, lora.and_then(|l| l.q.as_ref()), x)?;
-            let k = qmm(&self.compute, &layer.wk, lora.and_then(|l| l.k.as_ref()), x)?;
-            let v = match &layer.wv {
-                Some(wv) => qmm(&self.compute, wv, lora.and_then(|l| l.v.as_ref()), x)?,
-                None => k.clone(), // Gemma 4 attention_k_eq_v
-            };
-            (q, k, v)
+            match &layer.wv {
+                Some(wv) => {
+                    let triple = self
+                        .compute
+                        .qmatmul_multi(&[&layer.wq, &layer.wk, wv], x)?;
+                    let mut q = triple[0].clone();
+                    let mut k = triple[1].clone();
+                    let mut v = triple[2].clone();
+                    if let Some(d) = lora.and_then(|l| l.q.as_ref()) {
+                        q = (q + d.forward(x)?)?;
+                    }
+                    if let Some(d) = lora.and_then(|l| l.k.as_ref()) {
+                        k = (k + d.forward(x)?)?;
+                    }
+                    if let Some(d) = lora.and_then(|l| l.v.as_ref()) {
+                        v = (v + d.forward(x)?)?;
+                    }
+                    (q, k, v)
+                }
+                None => {
+                    let pair = self.compute.qmatmul_multi(&[&layer.wq, &layer.wk], x)?;
+                    let mut q = pair[0].clone();
+                    let mut k = pair[1].clone();
+                    if let Some(d) = lora.and_then(|l| l.q.as_ref()) {
+                        q = (q + d.forward(x)?)?;
+                    }
+                    if let Some(d) = lora.and_then(|l| l.k.as_ref()) {
+                        k = (k + d.forward(x)?)?;
+                    }
+                    let v = k.clone(); // Gemma 4 attention_k_eq_v
+                    (q, k, v)
+                }
+            }
         };
 
         let mut q = q
@@ -1547,6 +1687,37 @@ fn warm_layer_q4k(compute: &ComputeContext, layer: &LayerLive) {
             }
         }
     }
+}
+
+fn run_moe_jobs_parallel(
+    compute: &ComputeContext,
+    jobs: &[(usize, Mlp, Tensor, Vec<f32>, Tensor)],
+) -> Result<Vec<Tensor>> {
+    let parallel = jobs.len() > 1
+        && jobs
+            .iter()
+            .all(|(_, _, _, _, indexed)| !compute.would_use_gpu(indexed));
+    if !parallel {
+        let mut outs = Vec::with_capacity(jobs.len());
+        for (_, mlp, _, _, indexed) in jobs {
+            outs.push(mlp.forward(compute, indexed, None)?);
+        }
+        return Ok(outs);
+    }
+    std::thread::scope(|scope| {
+        let mut joins = Vec::with_capacity(jobs.len());
+        for (_, mlp, _, _, indexed) in jobs {
+            joins.push(scope.spawn(move || mlp.forward(compute, indexed, None)));
+        }
+        let mut outs = Vec::with_capacity(joins.len());
+        for join in joins {
+            let piece = join
+                .join()
+                .map_err(|_| AppError::msg("MoE expert worker panicked"))?;
+            outs.push(piece?);
+        }
+        Ok(outs)
+    })
 }
 
 fn try_tensor<'a>(plan: &'a LayerDmaPlan, suffix: &str) -> Option<&'a TensorLoc> {

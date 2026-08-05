@@ -53,7 +53,7 @@ Last updated: 2026-08-04
 | Extension / Phase 10 | Vulkan real speedup (quantized shaders + VRAM-resident hot weights) | **In progress** (Q4_K GEMV + warm; e2e decode → Phase 13) |
 | Extension / Phase 11 | Gemma 3 largest (27B) hybrid **text** run | **Done** (text hybrid verified) |
 | Extension / Phase 12 | Gemma 4 **26B-A4B (MoE)** hybrid text run | **Done** (text hybrid verified; latency polish → Phase 13) |
-| Extension / Phase 13 | Decode throughput (MoE + Vulkan end-to-end) | **Next** (~1 char/s decode on 26B; measure → fuse → MoE I/O) |
+| Extension / Phase 13 | Decode throughput (MoE + Vulkan end-to-end) | **In progress** (CPU decode + parallel Top-K + fused prefill + bench) |
 
 **Available now:**  
 `lpc-llm run <model> --adapter <name>` (Hybrid LoRA),  
@@ -72,7 +72,7 @@ On MoE GGUF: `experts.pack` + Top-K expert DMA + **RAM LRU expert cache** (hybri
 **Phase 10 (parallel; throughput owned by 13):** Q4_K GEMV + VRAM warm exist; per-call fence still dominates end-to-end decode.  
 **Phase 11 (done):** Gemma 3 **27B** dense instruct via `--hybrid` (text-only).  
 **Phase 12 (done):** Gemma 4 **26B-A4B MoE** (~25.2B / ~3.8B active); resident target ≤16 GiB.  
-**Phase 13 (next):** conversation-speed decode — measure → Vulkan submit fusion → MoE I/O/mlock → A/B vs CPU.
+**Phase 13 (in progress):** decode on Candle CPU Q4_K + parallel Top-K; fused Vulkan prefill; `[bench]` TTFT/tok/s. Remaining: host numbers + RSS write-up.
 
 ---
 
@@ -396,7 +396,7 @@ Gemma 3 has **no MoE 27B**. The Gemma-family MoE near that class is **Gemma 4 26
 
 **Ops tip:** debug builds make MoE prefill minutes-long; use `./target/release/lpc-llm`. stderr shows prefill layer progress and `expert cache hits/misses`.
 
-### Phase 13: Decode throughput (MoE + Vulkan end-to-end) — **Next**
+### Phase 13: Decode throughput (MoE + Vulkan end-to-end) — **In progress**
 
 Phase 12 proved **correctness** (`gemma4:26b-a4b` text chat). Observed **decode ≈ 1 char/s** on release + Vulkan is not conversation-usable.  
 Microbench already shows Q4_K GEMV GPU≈0.18 ms vs CPU≈0.59 ms, yet end-to-end is still crawling — so the bottleneck is **pipeline / sync / I/O**, not “missing a GEMV shader”.
@@ -426,45 +426,45 @@ Microbench already shows Q4_K GEMV GPU≈0.18 ms vs CPU≈0.59 ms, yet end-t
 
 #### 13.0 Ops baseline (do first — no code)
 
-- [ ] Raise memlock: `ulimit -l unlimited` (or systemd `LimitMEMLOCK=infinity`) so hybrid arenas / expert ring actually `mlock`
-- [ ] Re-run **turn 1 then turn 2** with identical prompts; judge speed on **turn 2** (cache warm)
-- [ ] A/B `--device cpu` vs `--device vulkan` on the same release binary (GPU may still lose until 13.2)
+- [x] Raise memlock soft→hard when allowed; **default path needs no `ulimit`** (unlocked arenas)
+- [x] Document: judge speed on **turn 2** (cache warm); stderr `[bench]` line
+- [ ] Host A/B `--device cpu` vs `--device vulkan` on release (user machine; decode now CPU on both unless probe wins)
 - [ ] Note RSS / expert cache fill after turn 1 (`/proc/<pid>/status` VmRSS + stderr cache line)
 
 #### 13.1 Measurement harness (absorb Phase 12.4 polish)
 
-- [ ] stderr (or `--bench`): **TTFT**, **decode tok/s**, prefill vs decode split
-- [ ] Expert cache **hits/misses during decode only** (today’s post-prefill line mixes phases)
-- [ ] Optional counters: Vulkan submits/token, `vulkan-skip` reasons (once + rate)
-- [ ] Document method + numbers vs `gemma3:27b` dense under `--ram-mib 16384`
+- [x] stderr `[bench]`: **TTFT**, **decode tok/s**, prefill vs decode split
+- [x] Expert cache **hits/misses during decode only** (counters reset after prefill)
+- [x] Vulkan submit / skip counters on the bench line; first `vulkan-skip` reason logged once
+- [ ] Document numbers vs `gemma3:27b` dense under `--ram-mib 16384` (host run)
 - [ ] Confirm RSS / hot selection respects ~16 GiB intent (from Phase 12.5)
 
 #### 13.2 Vulkan decode path — cut sync (highest leverage)
 
-- [ ] **Fuse command buffers**: record many Q4_K GEMVs per submit; fence once per layer or per token (not per MatMul)
-- [ ] Keep activations in device buffers across fused GEMVs; avoid `to_vec1` round-trip every call
-- [ ] Reuse staging / descriptor sets (already partial scratch reuse — extend)
-- [ ] If fused GPU still loses to CPU on this host: **auto-prefer CPU for decode** while keeping GPU for large-m prefill (decode-specific policy beyond today’s probe)
+- [x] **Fuse command buffers**: multiple Q4_K GEMVs per submit (Q/K/V, gate/up; up to 8 ops)
+- [ ] Keep activations in device buffers across fused GEMVs (still D2H per fused group — next polish)
+- [x] Reuse staging / multi descriptor sets
+- [x] **Auto-prefer CPU for decode (m&lt;8)** via decode microbench; GPU kept for prefill m≥8
 - [ ] (Later) group Top-K expert GEMVs (MUL_MAT_ID-style batching; llama.cpp lesson)
 
 #### 13.3 MoE decode I/O
 
-- [ ] Ensure Top-K **prefetch overlaps** decode compute (audit `PrefetchRing` path; eliminate sync `wait` before every expert when cache-hit)
-- [ ] Decode-phase hit-rate target: after warm turn, **>90%** expert RAM hits on short chats
-- [ ] Pin expert LRU pages when `mlock` available; document `ulimit -l` in README / startup hint
+- [x] Skip DMA on cache hit; async prefetch without immediate wait; ring slot occupancy
+- [ ] Decode-phase hit-rate target: after warm turn, **>90%** expert RAM hits on short chats (measure on host)
+- [x] Document opportunistic `mlock` (no `ulimit` required); soft RLIMIT_MEMLOCK raise when allowed
 - [ ] Tune ring depth / LRU vs `--ram-mib` spare (2048 slots ≈8.4 GiB — validate thrash vs hit)
-- [ ] (Optional) Speculative prefetch from previous-token Top-K affinity / agent hints
+- [x] Speculative prefetch from previous-token Top-K ids
 
 #### 13.4 Residual compute (Phase 10 leftovers)
 
-- [ ] Warn when non-Q4_K tensors dominate skips
+- [x] Log first `vulkan-skip` reason (dtype / policy / cold weight) once + skip counter
 - [ ] Q8_0 (or common) expert-down path if present in packs
 - [ ] (Optional) streamed non-hot layer GPU path — low priority while hot=all 30 for 26B-A4B
-- [ ] (Optional) attention Softmax / RoPE stay CPU unless fused graph justifies GPU move
+- [x] attention Softmax / RoPE stay CPU (fused graph not justified yet)
 
 #### 13.5 Verification
 
-- [ ] Baseline + post-13.2/13.3 numbers in README (host, driver, release hash)
+- [x] Bench method documented in README (host numbers still TBD after user release run)
 - [ ] Regression: short prompt + 128 decode tokens; expert hits on turn 2
 - [ ] (Optional) pathfinder `qwen3:30b-a3b` A/B on same harness
 
@@ -522,14 +522,14 @@ Microbench already shows Q4_K GEMV GPU≈0.18 ms vs CPU≈0.59 ms, yet end-t
 | Vulkan Q4_K-class dequant+GEMV + VRAM hot weights | **In progress** (Phase 10; Q4_K + warm_q4k; end-to-end decode → Phase 13) |
 | Gemma 3 27B hybrid text run | **Done** (Phase 11; text hybrid verified) |
 | Gemma 4 26B-A4B MoE hybrid text run | **Done** (Phase 12; text verified) |
-| Decode throughput (MoE + Vulkan fuse / MoE I/O) | **Next** (Phase 13) |
+| Decode throughput (MoE + Vulkan fuse / MoE I/O) | **In progress** (Phase 13; CPU decode + parallel experts + fused prefill) |
 | ΔW merge at CQE (weight rewrite) | Not adopted (side-path policy) |
 
 ---
 
 ## 5. Recommended next steps
 
-1. **Phase 13 (priority)** — decode throughput: ops baseline (`ulimit -l`, turn-2 warm) → measure tok/s / decode expert hits → **Vulkan submit fusion** → MoE prefetch/mlock → A/B cpu vs vulkan
+1. **Phase 13 (in progress)** — landed: CPU decode + parallel Top-K + fused prefill + `[bench]` + memlock raise. Remaining: host tok/s / RSS write-up; optional Q8_0 / MUL_MAT_ID
 2. **Phase 10 leftovers** — folded into Phase 13.4 (non-Q4_K warn; Q8_0 expert-down; optional streamed GPU)
 3. **Phase 12 polish** — folded into Phase 13.1 (TTFT/tok/s vs 27B; RSS write-up)
 4. **Phase 6 follow-ups** — Wire real cluster launchers / CUDA backends into `job.remote` and `$LPC_LLM_CONVERT_CMD`
@@ -585,7 +585,7 @@ Microbench already shows Q4_K GEMV GPU≈0.18 ms vs CPU≈0.59 ms, yet end-t
 | 拡張 / Phase 10 | Vulkan 本格高速化（量子化シェーダ + VRAM ホット重み常駐） | **進行中**（Q4_K GEMV + warm；端到端デコード → Phase 13） |
 | 拡張 / Phase 11 | Gemma 3 最大版（27B）hybrid **テキスト**実行 | **完了**（テキスト hybrid 検証済） |
 | 拡張 / Phase 12 | Gemma 4 **26B-A4B（MoE）** hybrid テキスト実行 | **完了**（テキスト hybrid 検証済；レイテンシ磨き → Phase 13） |
-| 拡張 / Phase 13 | デコードスループット（MoE + Vulkan 端到端） | **次**（26B で ~1 文字/秒；計測 → fuse → MoE I/O） |
+| 拡張 / Phase 13 | デコードスループット（MoE + Vulkan 端到端） | **進行中**（CPU デコード + Top-K 並列 + prefill 融合 + bench） |
 
 **いま使えるもの:**  
 `lpc-llm run <model> --adapter <name>`（Hybrid LoRA）、  
@@ -604,7 +604,7 @@ MoE GGUF では `experts.pack` + Top-K Expert DMA + **Expert RAM LRU キャッ�
 **Phase 10（並行；スループットは 13 が担当）:** Q4_K GEMV + VRAM warm は存在。呼び出し単位の fence が端到端デコードを支配しやすい。  
 **Phase 11（完了）:** Gemma 3 **27B** dense Instruct を `--hybrid` でテキスト実行。  
 **Phase 12（完了）:** Gemma 4 **26B-A4B MoE**（総量 ~25.2B / 活性 ~3.8B）；常駐目標 ≤16 GiB。  
-**Phase 13（次）:** 会話速度のデコード — 計測 → Vulkan submit 融合 → MoE I/O・mlock → CPU vs Vulkan A/B。
+**Phase 13（進行中）:** デコードは Candle CPU Q4_K + Top-K 並列、prefill は融合 Vulkan。`[bench]` で TTFT/tok/s。ホスト実測と RSS 文書化が残り。
 
 ---
 
@@ -928,7 +928,7 @@ Gemma 3 に **MoE 27B は無い**。同クラスの Gemma 系 MoE は **Gemma 4 
 
 **運用ヒント:** debug ビルドでは MoE prefill が分単位になりやすい → `./target/release/lpc-llm` を使う。stderr に prefill 層進捗と `expert cache hits/misses` を表示。
 
-### Phase 13: デコードスループット（MoE + Vulkan 端到端） — **次**
+### Phase 13: デコードスループット（MoE + Vulkan 端到端） — **進行中**
 
 Phase 12 で **正しさ**（`gemma4:26b-a4b` テキスト対話）は到達。release + Vulkan でも **デコード ≈ 1 文字/秒**は会話用途に耐えない。  
 マイクロベンチでは Q4_K GEMV が GPU≈0.18 ms vs CPU≈0.59 ms で勝っていても端到端が遅い → ボトルネックは **パイプライン / 同期 / I/O**であり、「GEMV シェーダ不足」ではない。
@@ -958,47 +958,47 @@ Phase 12 で **正しさ**（`gemma4:26b-a4b` テキスト対話）は到達。r
 
 #### 13.0 運用ベースライン（コード不要・最先）
 
-- [ ] memlock 引き上げ: `ulimit -l unlimited`（または systemd `LimitMEMLOCK=infinity`）で arena / expert ring が実際に `mlock` されること
-- [ ] **1 通目 → 2 通目**を同一プロンプトで再計測し、速度判定は **2 通目**（キャッシュ暖機後）
-- [ ] 同一 release で `--device cpu` vs `--device vulkan` の A/B（13.2 までは CPU が勝つ可能性）
-- [ ] 1 通目後の RSS / expert キャッシュ充填を記録（`/proc/<pid>/status` の VmRSS + stderr）
+- [x] memlock: soft→hard のみ静かに上げる。**既定は `ulimit` 不要**（unlocked arena）
+- [x] 速度判定は **2 通目**；stderr `[bench]` 行
+- [ ] 同一 release で `--device cpu` vs `--device vulkan` のホスト A/B
+- [ ] 1 通目後の RSS / expert キャッシュ充填を記録
 
 #### 13.1 計測ハーネス（Phase 12.4 磨きを吸収）
 
-- [ ] stderr（または `--bench`）: **TTFT**、**decode tok/s**、prefill / decode 分割
-- [ ] Expert キャッシュの **デコード区間のみ** hits/misses（現状の prefill 直後行はフェーズ混在）
-- [ ] （任意）Vulkan submits/token、`vulkan-skip` 理由（初回 + レート）
-- [ ] `--ram-mib 16384` 下で `gemma3:27b` dense との計測方法・数値を文書化
-- [ ] RSS / hot 選定が ~16 GiB 意図を満たすことを確認（Phase 12.5 から移管）
+- [x] stderr `[bench]`: **TTFT**、**decode tok/s**、prefill / decode 分割
+- [x] Expert キャッシュの **デコード区間のみ** hits/misses
+- [x] Vulkan submits / skip カウンタ；`vulkan-skip` 理由は初回のみログ
+- [ ] `--ram-mib 16384` 下で `gemma3:27b` との数値を文書化（ホスト実行）
+- [ ] RSS / hot 選定が ~16 GiB 意図を満たすことを確認
 
 #### 13.2 Vulkan デコード経路 — 同期削減（最大レバレッジ）
 
-- [ ] **コマンドバッファ融合**: 多数の Q4_K GEMV を 1 submit にまとめ、fence は層単位またはトークン単位
-- [ ] 融合区間では activation をデバイスバッファに保持；呼び出しごとの `to_vec1` 往復を避ける
-- [ ] staging / descriptor 再利用の拡張（scratch 再利用は一部済）
-- [ ] 融合後も当該ホストで CPU に負けるなら、**デコードは CPU 優先・大きな m の prefill は GPU**（現行 probe を超える decode 専用ポリシー）
-- [ ] （後続）Top-K expert GEMV の一括（MUL_MAT_ID 風；llama.cpp の教訓）
+- [x] **コマンドバッファ融合**: Q/K/V・gate/up などを 1 submit（最大 8 ops）
+- [ ] 融合区間で activation をデバイスに滞留（現状は融合グループごとに D2H）
+- [x] staging / 複数 descriptor set 再利用
+- [x] **デコード（m&lt;8）は CPU 優先**（decode マイクロベンチ）；prefill m≥8 は GPU
+- [ ] （後続）Top-K expert GEMV の一括（MUL_MAT_ID 風）
 
 #### 13.3 MoE デコード I/O
 
-- [ ] Top-K **prefetch とデコード計算の重ね合わせ**を監査（キャッシュヒット時の不要な同期 `wait` を排除）
-- [ ] 暖機後の短対話で expert RAM hit 率 **>90%** を目標
-- [ ] `mlock` 可能時に expert LRU ページをピン；README / 起動ヒントに `ulimit -l` を明記
-- [ ] ring 深さ / LRU と `--ram-mib` 余剰の調整（2048 スロット ≈8.4 GiB — thrash vs hit を検証）
-- [ ] （任意）直前トークン Top-K / agent ヒントからの投機 prefetch
+- [x] キャッシュヒット時 DMA スキップ；非同期 prefetch；ring スロット占有管理
+- [ ] 暖機後 hit 率 **>90%**（ホスト計測）
+- [x] README: 任意の `mlock`（`ulimit` 不要）；soft RLIMIT_MEMLOCK 引き上げ
+- [ ] ring / LRU と `--ram-mib` 余剰の調整
+- [x] 直前トークン Top-K からの投機 prefetch
 
 #### 13.4 残計算（Phase 10 残り）
 
-- [ ] non-Q4_K がスキップを支配する場合の起動警告
-- [ ] packs に存在するなら Q8_0（等）expert-down 経路
-- [ ] （任意）非ホット層の GPU 経路 — 26B-A4B で hot=30 の間は低優先
-- [ ] （任意）attention Softmax / RoPE は、融合グラフが正当化するまで CPU のまま
+- [x] `vulkan-skip` 理由の初回ログ + カウンタ
+- [ ] Q8_0（等）expert-down 経路
+- [ ] （任意）非ホット層の GPU 経路
+- [x] attention Softmax / RoPE は当面 CPU
 
 #### 13.5 検証
 
-- [ ] ベースライン + 13.2/13.3 後の数値を README に（ホスト、ドライバ、release ハッシュ）
+- [x] 計測方法を README に記載（ホスト数値は release 実行後）
 - [ ] 回帰: 短プロンプト + 128 decode；2 通目の expert hits
-- [ ] （任意）同ハーネスで `qwen3:30b-a3b` 経路探査 A/B
+- [ ] （任意）`qwen3:30b-a3b` A/B
 
 **pull 独立性 / 運用:** Phase 12 と同じ。計測は常に `./target/release/lpc-llm`。
 
@@ -1054,14 +1054,14 @@ Phase 12 で **正しさ**（`gemma4:26b-a4b` テキスト対話）は到達。r
 | Vulkan Q4_K 系 dequant+GEMV + VRAM ホット重み | **進行中**（Phase 10；Q4_K + warm_q4k；端到端デコード → Phase 13） |
 | Gemma 3 27B hybrid テキスト実行 | **完了**（Phase 11；テキスト hybrid 検証済） |
 | Gemma 4 26B-A4B MoE hybrid テキスト実行 | **完了**（Phase 12；テキスト検証済） |
-| デコードスループット（MoE + Vulkan fuse / MoE I/O） | **次**（Phase 13） |
+| デコードスループット（MoE + Vulkan fuse / MoE I/O） | **進行中**（Phase 13；CPU デコード + Top-K 並列 + prefill 融合） |
 | CQE 時の ΔW マージ（重み書き換え） | 採用せず（サイドパス方針） |
 
 ---
 
 ## 5. 推奨する次工程
 
-1. **Phase 13（最優先）** — デコードスループット: 運用ベースライン（`ulimit -l`、2 通目暖機）→ tok/s / デコード expert hits 計測 → **Vulkan submit 融合** → MoE prefetch・mlock → cpu vs vulkan A/B
+1. **Phase 13（進行中）** — 実装済: CPU デコード + Top-K 並列 + prefill 融合 + `[bench]` + memlock 引き上げ。残り: ホスト tok/s・RSS 文書化；任意 Q8_0 / MUL_MAT_ID
 2. **Phase 10 残り** — Phase 13.4 に吸収（non-Q4_K 警告；Q8_0 expert-down；任意のストリーム GPU）
 3. **Phase 12 磨き** — Phase 13.1 に吸収（27B との TTFT/tok/s；RSS 文書化）
 4. **Phase 6 フォロー** — `job.remote` / `$LPC_LLM_CONVERT_CMD` に実クラスタ・CUDA 変換を接続

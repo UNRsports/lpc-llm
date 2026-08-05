@@ -123,18 +123,7 @@ pub fn run(args: IoArgs) -> Result<()> {
     let mut buffers = if args.no_mlock {
         PrefetchBufferManager::new_unlocked(slot_bytes).map_err(|e| AppError::msg(e.to_string()))?
     } else {
-        match PrefetchBufferManager::new(slot_bytes) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("warning: {e}");
-                eprintln!(
-                    "falling back to unlocked buffers — raise `ulimit -l` for production \
-                     (or pass --no-mlock explicitly)"
-                );
-                PrefetchBufferManager::new_unlocked(slot_bytes)
-                    .map_err(|e| AppError::msg(e.to_string()))?
-            }
-        }
+        PrefetchBufferManager::new(slot_bytes).map_err(|e| AppError::msg(e.to_string()))?
     };
 
     eprintln!(

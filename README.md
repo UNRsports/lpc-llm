@@ -110,6 +110,9 @@ Tuning levers (perceived impact):
 | Pack layout + double buffer | High | `{gguf} → cache/.../layers.pack`, 1 DMA per layer |
 | Hot resident ratio | Medium–high | `--ram-mib` / `--hot-layers` |
 | MoE expert RAM LRU + VRAM warm | High (decode) | avoid re-reading `experts.pack` every token |
+| **Decode on Candle CPU Q4_K (m=1)** | **Very high** | per-call Vulkan fence was ~1 tok/s; CPU + parallel Top-K experts is conversation-speed |
+| Prefill fused Vulkan Q4_K (m≥8) | High (TTFT) | one submit for Q/K/V and gate/up |
+| Opportunistic `mlock` | Low | used only when `RLIMIT_MEMLOCK` already covers arenas; no `ulimit` required |
 | **`cargo build --release`** | **Very high** | debug builds make MoE prefill minutes-long |
 | Chunked continuation after token cap | Medium | `--max-tokens`, REPL `/more` |
 | Chunk-size micro-tuning | Low | DMA window align at pack time, I/O wait EMA |
@@ -292,12 +295,13 @@ First hybrid run builds packs (may take minutes; GGUF is not modified). Startup 
 ✓ ready on Vulkan+pack+io_uring (gemma4)
 >>>
 … [1/2] prefill N tokens × 30 layers …
-[2/2] prefill done in Xs — generating … (expert cache … hits=…/misses=…)
+[2/2] prefill done in Xs (Y tok/s) — generating … (expert cache … prefill hits=…/misses=…)
+[bench] TTFT=Xs  decode=N tok in Ys (Z tok/s)  expert decode hits=…/misses=…
 ```
 
-`mlock failed ... using unlocked arenas` is a warning; inference continues (raise `ulimit -l` if needed).
+Arenas use page-aligned `mmap` for `O_DIRECT`. `mlock` is applied only when the process already has enough memlock budget; otherwise unlocked arenas are used silently (no `ulimit` needed).
 
-**Gemma 4 MoE notes:** routed experts live in `experts.pack` (~15 GiB sidecar). The engine keeps a RAM LRU of materialized experts and warms Q4_K weights into Vulkan VRAM when `--device vulkan`. First turn still pays cold DMA; later turns reuse the cache. Always prefer `./target/release/lpc-llm` for this model.
+**Gemma 4 MoE notes (Phase 13):** routed experts live in `experts.pack`. Decode (m=1) uses Candle CPU Q4_K with parallel Top-K experts; Vulkan fused Q4_K is kept for prefill (m≥8). Opt into GPU decode with `LPC_LLM_GPU_DECODE=1` only for experiments. Judge speed on **turn 2+** after the expert RAM LRU is warm. Always use `./target/release/lpc-llm`.
 
 ### 4. Training data placement
 
@@ -493,7 +497,7 @@ lpc-llm io --help
 | Symptom | Fix |
 |------|------|
 | Garbage like `Jove Jove…` | Possibly an old binary. `unset CARGO_TARGET_DIR && cargo build --release`, then use `./target/release/lpc-llm` |
-| `mlock failed` | Warning only. Optionally `ulimit -l unlimited` (depends on privileges) |
+| `mlock failed` | N/A — hybrid auto-selects unlocked arenas; no user action |
 | Downloads every time | Check `~/.local/share/lpc-llm/blobs`. Migrating from old `~/.local/share/l3m`: rename / symlink |
 | Pack is slow | First run only. Delete `cache/packs/<model>/` to regenerate (e.g. after expert-pack version bump) |
 | `gemma4` prefill takes minutes | Use **release** build; first turn warms expert RAM/VRAM cache — later turns are much faster |
@@ -654,6 +658,9 @@ Ollama に依存しない、**純 Rust のローカル LLM プレイヤー**で�
 | パック再配置 + ダブルバッファ | 大 | `{gguf} → cache/.../layers.pack`、層ごと 1 DMA |
 | ホット常駐比率 | 中〜大 | `--ram-mib` / `--hot-layers` |
 | MoE Expert RAM LRU + VRAM warm | 大（デコード） | 毎トークンの `experts.pack` 再読込を避ける |
+| **デコードは Candle CPU Q4_K（m=1）** | **非常に大** | Vulkan の呼び出し単位 fence が ~1 tok/s だった。CPU + Top-K 並列で会話速度 |
+| Prefill の融合 Vulkan Q4_K（m≥8） | 大（TTFT） | Q/K/V と gate/up を 1 submit |
+| 任意の `mlock` | 小 | `RLIMIT_MEMLOCK` が足りるときだけピン；`ulimit` 不要 |
 | **`cargo build --release`** | **非常に大** | debug だと MoE prefill が分単位になりやすい |
 | トークン上限後の続き生成 | 中 | `--max-tokens`、REPL の `/more` |
 | チャンクサイズ微調整 | 小 | pack 時の DMA 窓アライン、I/O wait EMA |
@@ -825,12 +832,13 @@ lpc-llm
 ✓ ready on Vulkan+pack+io_uring (gemma4)
 >>>
 … [1/2] prefill N tokens × 30 layers …
-[2/2] prefill done in Xs — generating … (expert cache … hits=…/misses=…)
+[2/2] prefill done in Xs (Y tok/s) — generating … (expert cache … prefill hits=…/misses=…)
+[bench] TTFT=Xs  decode=N tok in Ys (Z tok/s)  expert decode hits=…/misses=…
 ```
 
-`mlock failed ... using unlocked arenas` は警告です。推論は継続します（必要なら `ulimit -l` を上げる）。
+arena は `O_DIRECT` 向けにページアライン `mmap`。`mlock` は memlock 予算が足りるときだけ適用し、足りなければ unlocked のまま黙って続行します（`ulimit` 不要）。
 
-**Gemma 4 MoE メモ:** ルーテッド Expert は `experts.pack`（約 15 GiB サイドカー）。エンジンは materialize 済み Expert の RAM LRU を持ち、`--device vulkan` 時は Q4_K を VRAM に warm します。1 通目はコールド DMA、2 通目以降はキャッシュ再利用。本モデルは必ず `./target/release/lpc-llm` を使ってください。
+**Gemma 4 MoE メモ（Phase 13）:** ルーテッド Expert は `experts.pack`。デコード（m=1）は Candle CPU Q4_K + Top-K 並列。Vulkan 融合 Q4_K は prefill（m≥8）向け。実験的に GPU デコードを試す場合のみ `LPC_LLM_GPU_DECODE=1`。速度は Expert RAM LRU が暖まった **2 通目以降**で判断。必ず `./target/release/lpc-llm` を使う。
 
 ### 4. 学習用データの設置場所
 
@@ -1013,7 +1021,7 @@ lpc-llm io --help
 | 症状 | 対処 |
 |------|------|
 | `Jove Jove…` などゴミ出力 | 古いバイナリの可能性。`unset CARGO_TARGET_DIR && cargo build --release` 後に `./target/release/lpc-llm` を使う |
-| `mlock failed` | 警告のみ。必要なら `ulimit -l unlimited`（権限による） |
+| `mlock failed` | 該当なし — hybrid は unlocked arena を自動選択；ユーザー操作不要 |
 | 毎回ダウンロードされる | `~/.local/share/lpc-llm/blobs` を確認。旧 `~/.local/share/l3m` から移行する場合は rename / symlink |
 | pack が遅い | 初回のみ。`cache/packs/<model>/` を消せば再生成（Expert pack 版上げ後など） |
 | `gemma4` の prefill が分単位 | **release** ビルドを使う。1 通目で Expert RAM/VRAM を暖機し、2 通目以降が速い |

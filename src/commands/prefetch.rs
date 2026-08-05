@@ -93,13 +93,8 @@ pub fn run(name: &str, auto_pull: bool) -> Result<()> {
         );
     }
 
-    let mut buffers = match PrefetchBufferManager::new(slot) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("warning: {e}; unlocked arenas");
-            PrefetchBufferManager::new_unlocked(slot).map_err(|e| AppError::msg(e.to_string()))?
-        }
-    };
+    let mut buffers =
+        PrefetchBufferManager::new(slot).map_err(|e| AppError::msg(e.to_string()))?;
     let mut reader =
         AsyncNvmeReader::open(&packed.pack_path).map_err(|e| AppError::msg(e.to_string()))?;
 

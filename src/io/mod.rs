@@ -23,6 +23,7 @@ pub use pack::{ensure_experts_packed, ensure_packed, PackedExperts, PackedWeight
 pub use pipeline::{run_pipeline, synthesize_layers, LayerExtent, StepStats};
 #[allow(unused_imports)]
 pub use prefetch::{
-    align_up, PrefetchBuffer, PrefetchBufferManager, PrefetchRing, DIRECT_ALIGN,
+    align_up, try_raise_memlock_limit, PrefetchBuffer, PrefetchBufferManager, PrefetchRing,
+    DIRECT_ALIGN,
 };
 
