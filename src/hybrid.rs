@@ -1097,14 +1097,20 @@ impl HybridEngine {
             eps: layer.ffn_norm.eps,
         };
 
-        // Shared expert path.
-        let mut cur_mlp = ffn_norm.forward(attn_out)?;
-        cur_mlp = shared.forward(&self.compute, &cur_mlp, None)?;
-        if let Some(n) = &post_ffw_norm_1 {
-            cur_mlp = n.forward(&cur_mlp)?;
-        }
+        // Shared expert path — gate/up on GPU; defer down until experts run (parallel CPU).
+        let cur_mlp = ffn_norm.forward(attn_out)?;
+        let shared_pair = self
+            .compute
+            .qmatmul_multi(&[&shared.gate, &shared.up], &cur_mlp)?;
+        let shared_lhs = if shared.use_gelu {
+            shared_pair[0].gelu()?
+        } else {
+            candle_nn::ops::silu(&shared_pair[0])?
+        };
+        let shared_mid = (shared_lhs * &shared_pair[1])?;
 
-        // Routed experts path.
+        // Routed experts path (norms + router). Router is typically n=128 → CPU via
+        // fence-bound tiny-GEMV skip, which frees the GPU for attn / gate work.
         let mut cur_moe = match &pre_ffw_norm_2 {
             Some(n) => n.forward(attn_out)?,
             None => attn_out.clone(),
@@ -1172,7 +1178,23 @@ impl HybridEngine {
             &xs_flat,
             use_gelu,
         )?;
-        let outs = run_moe_jobs_parallel(&self.compute, &jobs)?;
+
+        // Parallel critical path: shared Q8_0 down ∥ Top-K expert gate/up+downs.
+        let down_w = shared.down.clone();
+        let (mut cur_mlp, outs) = std::thread::scope(|scope| -> Result<(Tensor, Vec<Tensor>)> {
+            let shared_join = scope.spawn(|| -> Result<Tensor> {
+                Ok(down_w.forward(&shared_mid)?)
+            });
+            let expert_outs = run_moe_jobs_parallel(&self.compute, &jobs)?;
+            let shared_out = shared_join
+                .join()
+                .map_err(|_| AppError::msg("shared expert down panicked"))??;
+            Ok((shared_out, expert_outs))
+        })?;
+        if let Some(n) = &post_ffw_norm_1 {
+            cur_mlp = n.forward(&cur_mlp)?;
+        }
+
         for ((expert_id, _mlp, index, rws, _indexed), mut out) in jobs.into_iter().zip(outs) {
             if let Some(ref scales) = down_scales {
                 if let Some(&s) = scales.get(expert_id) {
@@ -1446,6 +1468,14 @@ impl HybridEngine {
             let lora = self.lora.get(layer_idx);
             match &layer.wv {
                 Some(wv) => {
+                    // DeviceAct: one flatten + one fused Q/K/V submit (cuts attn fences).
+                    #[cfg(feature = "vulkan")]
+                    let triple = {
+                        let act = crate::device::DeviceAct::from_tensor(x)?;
+                        self.compute
+                            .qmatmul_multi_act(&[&layer.wq, &layer.wk, wv], &act)?
+                    };
+                    #[cfg(not(feature = "vulkan"))]
                     let triple = self
                         .compute
                         .qmatmul_multi(&[&layer.wq, &layer.wk, wv], x)?;
@@ -1464,6 +1494,13 @@ impl HybridEngine {
                     (q, k, v)
                 }
                 None => {
+                    #[cfg(feature = "vulkan")]
+                    let pair = {
+                        let act = crate::device::DeviceAct::from_tensor(x)?;
+                        self.compute
+                            .qmatmul_multi_act(&[&layer.wq, &layer.wk], &act)?
+                    };
+                    #[cfg(not(feature = "vulkan"))]
                     let pair = self.compute.qmatmul_multi(&[&layer.wq, &layer.wk], x)?;
                     let mut q = pair[0].clone();
                     let mut k = pair[1].clone();

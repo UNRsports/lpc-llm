@@ -61,18 +61,22 @@ impl ModelEntry {
                 s
             }
             PromptStyle::Gemma4 => {
-                // Bartowski / llama.cpp Gemma 4 IT chat template (text-only; no thought channel).
+                // Official non-thinking format: empty thought channel after model turn
+                // so the model does not emit a visible "thought" stub at decode start.
+                // See https://ai.google.dev/gemma/docs/core/prompt-formatting-gemma4
                 let mut s = String::from("<bos>");
                 for (u, a) in history {
                     s.push_str("<|turn>user\n");
                     s.push_str(u);
                     s.push_str("<turn|>\n<|turn>model\n");
-                    s.push_str(a);
+                    s.push_str("<|channel>thought\n<channel|>");
+                    s.push_str(strip_gemma4_channels(a));
                     s.push_str("<turn|>\n");
                 }
                 s.push_str("<|turn>user\n");
                 s.push_str(user);
                 s.push_str("<turn|>\n<|turn>model\n");
+                s.push_str("<|channel>thought\n<channel|>");
                 s
             }
             PromptStyle::Raw => {
@@ -104,9 +108,32 @@ impl ModelEntry {
         partial: &str,
     ) -> String {
         let mut s = self.format_prompt(user, prior_history);
-        s.push_str(partial);
+        // format_prompt already opened the empty thought channel for Gemma4;
+        // append only the visible answer fragment.
+        s.push_str(strip_gemma4_channels(partial));
         s
     }
+}
+
+/// Remove Gemma 4 `<|channel>…<channel|>` wrappers (and a leading bare `thought`) from text.
+pub fn strip_gemma4_channels(text: &str) -> &str {
+    let mut s = text;
+    // Full channel block(s).
+    while let Some(start) = s.find("<|channel>") {
+        if let Some(rel_end) = s[start..].find("<channel|>") {
+            let end = start + rel_end + "<channel|>".len();
+            s = s[end..].trim_start();
+        } else {
+            break;
+        }
+    }
+    // Decoder may surface the channel name alone when special tokens are skipped.
+    let trimmed = s.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("thought") {
+        let rest = rest.trim_start_matches(['\r', '\n', ' ', '\t']);
+        return rest;
+    }
+    s
 }
 
 /// Static catalog shipped with the binary.
@@ -214,5 +241,33 @@ pub fn entry_for_local(name: &str, gguf_file: &str, tokenizer_repo: &str) -> Mod
         approx_size: "custom".into(),
         min_ram_hint: "varies".into(),
         prompt_style: PromptStyle::Raw,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_gemma4_channel_and_bare_thought() {
+        assert_eq!(
+            strip_gemma4_channels("<|channel>thought\n<channel|>Hello"),
+            "Hello"
+        );
+        assert_eq!(strip_gemma4_channels("thought\nHi"), "Hi");
+        assert_eq!(strip_gemma4_channels("Hello"), "Hello");
+    }
+
+    #[test]
+    fn gemma4_prompt_opens_empty_thought_channel() {
+        let e = catalog()
+            .into_iter()
+            .find(|m| m.name == "gemma4:26b-a4b")
+            .expect("gemma4 catalog");
+        let p = e.format_prompt("ping", &[]);
+        assert!(
+            p.ends_with("<|turn>model\n<|channel>thought\n<channel|>"),
+            "prompt should open empty thought channel, got: {p:?}"
+        );
     }
 }

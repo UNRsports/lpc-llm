@@ -591,6 +591,17 @@ impl VulkanContext {
                 kind.name()
             )));
         }
+        // Tiny output rows (e.g. MoE router n=128): host fence dominates the kernel.
+        // Prefer Candle CPU and keep the queue free for large attn / gate GEMVs.
+        const MIN_GPU_N: u32 = 256;
+        if (n as u32) < MIN_GPU_N {
+            self.log_skip(&format!(
+                "n={n} < {MIN_GPU_N} (CPU; fence-bound tiny GEMV)"
+            ));
+            return Err(AppError::msg(format!(
+                "vulkan-skip: n={n} < {MIN_GPU_N} (CPU; fence-bound tiny GEMV)"
+            )));
+        }
         let key = Arc::as_ptr(qt) as usize;
         let cached = self
             .weight_cache

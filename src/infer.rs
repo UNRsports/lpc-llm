@@ -509,13 +509,16 @@ impl ChatSession {
         self.backend.reset_state();
 
         let mut stdout = io::stdout();
-        // Prefill progress goes to stderr; keep the reply marker on stdout.
+        // Prefill progress goes to stderr; `>>>` is printed with the first answer token.
         eprintln!(
-            "{} generating (prefill progress on stderr; tokens stream below) …",
+            "{} generating (prefill on stderr; answer below) …",
             style("·").cyan()
         );
-        print!("{} ", style("…").green());
-        stdout.flush()?;
+
+        let gemma4 = matches!(self.entry.prompt_style, crate::catalog::PromptStyle::Gemma4);
+        let mut filter = StreamChannelFilter::new(gemma4);
+        let mut visible = String::new();
+        let mut showed_prompt = false;
 
         let outcome = self.backend.generate(
             &self.tokenizer,
@@ -523,13 +526,159 @@ impl ChatSession {
             max_tokens,
             self.temperature,
             |token| {
-                print!("{token}");
-                let _ = stdout.flush();
+                let pieces = filter.push(token);
+                for p in pieces {
+                    if p.is_empty() {
+                        continue;
+                    }
+                    if !showed_prompt {
+                        print!("{}", style(">>> ").green().bold());
+                        showed_prompt = true;
+                    }
+                    print!("{p}");
+                    let _ = stdout.flush();
+                    visible.push_str(&p);
+                }
                 Ok(())
             },
         )?;
 
+        let tail = filter.finish();
+        if !tail.is_empty() {
+            if !showed_prompt {
+                print!("{}", style(">>> ").green().bold());
+            }
+            print!("{tail}");
+            let _ = stdout.flush();
+            visible.push_str(&tail);
+        }
+
         println!();
-        Ok(outcome)
+        Ok(GenerateOutcome {
+            text: visible,
+            hit_eos: outcome.hit_eos,
+            tokens_generated: outcome.tokens_generated,
+        })
+    }
+}
+
+/// Filters Gemma 4 thought-channel leakage from streamed tokens.
+/// Hides `<|channel>…<channel|>` and a leading bare `thought` (special tokens skipped).
+struct StreamChannelFilter {
+    enabled: bool,
+    /// Accumulator for detecting markers that span token boundaries.
+    buf: String,
+    /// True after we have emitted at least one visible answer character.
+    started_answer: bool,
+    /// Inside `<|channel>…<channel|>`.
+    in_channel: bool,
+}
+
+impl StreamChannelFilter {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            buf: String::new(),
+            started_answer: false,
+            in_channel: false,
+        }
+    }
+
+    fn push(&mut self, token: &str) -> Vec<String> {
+        if !self.enabled {
+            return vec![token.to_string()];
+        }
+        self.buf.push_str(token);
+        let mut out = Vec::new();
+        loop {
+            if self.in_channel {
+                if let Some(end) = self.buf.find("<channel|>") {
+                    let after = end + "<channel|>".len();
+                    self.buf = self.buf[after..].to_string();
+                    self.in_channel = false;
+                    continue;
+                }
+                // Keep a short tail in case the closer is split across tokens.
+                if self.buf.len() > 32 {
+                    let keep = 16;
+                    self.buf = self.buf[self.buf.len() - keep..].to_string();
+                }
+                break;
+            }
+            if let Some(start) = self.buf.find("<|channel>") {
+                let visible = self.buf[..start].to_string();
+                if !visible.is_empty() {
+                    if let Some(v) = self.emit_visible(&visible) {
+                        out.push(v);
+                    }
+                }
+                self.buf = self.buf[start + "<|channel>".len()..].to_string();
+                self.in_channel = true;
+                continue;
+            }
+            // Hold back a prefix that might become `<|channel>` or leading `thought`.
+            let hold = if !self.started_answer {
+                // Hold enough for "thought" or partial "<|channel>".
+                12usize
+            } else if self.buf.ends_with('<')
+                || self.buf.ends_with("<|")
+                || self.buf.ends_with("<|c")
+                || self.buf.ends_with("<|ch")
+                || self.buf.ends_with("<|cha")
+                || self.buf.ends_with("<|chan")
+                || self.buf.ends_with("<|chann")
+                || self.buf.ends_with("<|channe")
+                || self.buf.ends_with("<|channel")
+            {
+                self.buf.len()
+            } else {
+                0
+            };
+            if self.buf.len() <= hold {
+                break;
+            }
+            let split = self.buf.len() - hold;
+            let chunk = self.buf[..split].to_string();
+            self.buf = self.buf[split..].to_string();
+            if let Some(v) = self.emit_visible(&chunk) {
+                out.push(v);
+            }
+        }
+        out
+    }
+
+    fn emit_visible(&mut self, s: &str) -> Option<String> {
+        let mut t = s;
+        if !self.started_answer {
+            let trimmed = t.trim_start_matches(['\r', '\n', ' ', '\t']);
+            if let Some(rest) = trimmed.strip_prefix("thought") {
+                t = rest.trim_start_matches(['\r', '\n', ' ', '\t']);
+                if t.is_empty() {
+                    return None;
+                }
+            } else if trimmed.is_empty() {
+                return None;
+            } else {
+                t = trimmed;
+            }
+            self.started_answer = true;
+        }
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    }
+
+    fn finish(&mut self) -> String {
+        if !self.enabled {
+            return String::new();
+        }
+        if self.in_channel {
+            self.buf.clear();
+            return String::new();
+        }
+        let rest = std::mem::take(&mut self.buf);
+        self.emit_visible(&rest).unwrap_or_default()
     }
 }

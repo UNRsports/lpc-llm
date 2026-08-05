@@ -72,7 +72,7 @@ On MoE GGUF: `experts.pack` + Top-K expert DMA + **RAM LRU expert cache** (hybri
 **Phase 10 (parallel; throughput owned by 13):** Q4_K GEMV + VRAM warm exist; per-call fence still dominates end-to-end decode.  
 **Phase 11 (done):** Gemma 3 **27B** dense instruct via `--hybrid` (text-only).  
 **Phase 12 (done):** Gemma 4 **26B-A4B MoE** (~25.2B / ~3.8B active); resident target ≤16 GiB.  
-**Phase 13 (in progress):** decode on Candle CPU Q4_K + parallel Top-K; fused Vulkan prefill; `[bench]` TTFT/tok/s. **2026-08-05:** DeviceAct + fused Top-K gate/up + multi-X API; Q8_0 downs stay CPU (faster); warm skip; host decode **~1.8–1.9 tok/s** (~2× vs ~1 tok/s baseline; submits ≈½). Remaining: ≥3× stretch, RSS write-up.
+**Phase 13 (in progress):** decode on Candle CPU Q4_K + parallel Top-K; fused Vulkan prefill; `[bench]` TTFT/tok/s. **2026-08-05:** DeviceAct + fused Top-K gate/up + multi-X API; Q8_0 downs stay CPU; warm skip; shared∥expert parallel; attn QKV via DeviceAct; tiny-GEMV CPU skip; Gemma4 empty thought channel + `>>>` answer marker. Host decode **~1.8–2.4 tok/s** (~2–2.4× vs ~1 baseline). Stretch **≥3×** still open (Softmax/Q8_0 GPU graph).
 
 ---
 
@@ -469,15 +469,17 @@ Microbench already shows Q4_K GEMV GPU≈0.18 ms vs CPU≈0.59 ms, yet end-t
 - [x] Regression smoke: short prompt + decode; turn-2 expert hits (2026-08-05: ~1.8 tok/s ≈2× baseline; submits≈½)
 - [ ] (Optional) pathfinder `qwen3:30b-a3b` A/B on same harness
 
-**Host A/B (2026-08-05, release, `--hybrid --ram-mib 16384 --device vulkan --max-tokens 16`):**
+**Host A/B (2026-08-05, release, `--hybrid --ram-mib 16384 --device vulkan`):**
 
-| Turn | decode tok/s | expert hits/misses | notes |
-|------|-------------|-------------------|--------|
+| Turn / note | decode tok/s | expert hits/misses | notes |
+|-------------|-------------|-------------------|--------|
 | Phase-13 baseline (2026-08-04) | **~1** | cold | documented ~1 char/s |
-| After fuse+DeviceAct (turn 1) | **1.87** | 1350/90 | TTFT≈11s |
-| After fuse+DeviceAct (turn 2) | **1.81** | 2359/41 | ≈2× baseline; vulkan submits≈½ |
+| After fuse+DeviceAct (turn 2, short) | **1.81** | 2359/41 | ≈2×; submits≈½ |
+| + shared∥expert, attn DeviceAct (turn 2, short) | **~2.4** | high | 3-tok replies; optimistic |
+| + same (turn 2, longer, `--max-tokens 48`) | **1.82** | 1594/86 | sustained ≈2× |
+| Stretch **≥3×** | — | — | still open: GPU Softmax / Q8_0 fused graph when microbench wins |
 
-Stretch **≥3×** still open (attention GPU / fewer fences across Softmax boundary).
+Gemma4 UI: prompt opens empty `<|channel>thought`<channel|>`; stream strips channel leakage; answer prefix **`>>> `** (first visible token).
 
 **Pull isolation / ops:** unchanged from Phase 12. Always measure with `./target/release/lpc-llm`.
 
@@ -615,7 +617,7 @@ MoE GGUF では `experts.pack` + Top-K Expert DMA + **Expert RAM LRU キャッ�
 **Phase 10（並行；スループットは 13 が担当）:** Q4_K GEMV + VRAM warm は存在。呼び出し単位の fence が端到端デコードを支配しやすい。  
 **Phase 11（完了）:** Gemma 3 **27B** dense Instruct を `--hybrid` でテキスト実行。  
 **Phase 12（完了）:** Gemma 4 **26B-A4B MoE**（総量 ~25.2B / 活性 ~3.8B）；常駐目標 ≤16 GiB。  
-**Phase 13（進行中）:** デコードは Candle CPU Q4_K + Top-K 並列、prefill は融合 Vulkan。`[bench]` で TTFT/tok/s。**2026-08-05:** DeviceAct + Top-K gate/up 融合 + multi-X API；Q8_0 down は CPU；warm skip。ホスト decode **~1.8–1.9 tok/s**（baseline ~1 に対し ≈2×；submits ≈½）。残り: ≥3× ストレッチ、RSS 文書化。
+**Phase 13（進行中）:** DeviceAct + Top-K gate/up 融合 + shared∥expert 並列 + attn QKV DeviceAct + Gemma4 thought 抑制（`>>>` 回答）。ホスト **~1.8–2.4 tok/s**（≈2–2.4×）。ストレッチ **≥3×** は Softmax/Q8_0 GPU グラフが次。
 
 ---
 
