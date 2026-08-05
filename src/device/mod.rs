@@ -165,19 +165,28 @@ impl ComputeContext {
         None
     }
 
-    /// Best-effort: pin a Q4_K weight in VRAM so small-batch GEMV can use the GPU.
-    pub fn warm_q4k(&self, w: &QMatMul) {
+    /// Best-effort: pin a Q4_K / Q6_K weight in VRAM so GEMV can use the GPU.
+    /// Hot layers use pin=true (never LRU-evicted); experts use pin=false.
+    pub fn warm_quant(&self, w: &QMatMul, pin: bool) {
         #[cfg(feature = "vulkan")]
         if let Some(ref vk) = self.vulkan {
-            if let Err(e) = vk.warm_q4k(w) {
+            if let Err(e) = vk.warm_quant(w, pin) {
                 let msg = e.to_string();
                 if !msg.starts_with("vulkan-skip:") {
-                    eprintln!("warning: Vulkan warm_q4k failed ({e})");
+                    eprintln!("warning: Vulkan warm_quant failed ({e})");
                 }
             }
         }
         #[cfg(not(feature = "vulkan"))]
-        let _ = w;
+        {
+            let _ = w;
+            let _ = pin;
+        }
+    }
+
+    /// Warm + pin (hot attn / shared / router).
+    pub fn warm_q4k(&self, w: &QMatMul) {
+        self.warm_quant(w, true);
     }
 }
 

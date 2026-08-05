@@ -86,9 +86,16 @@ impl Mlp {
     }
 
     fn warm_q4k(&self, compute: &ComputeContext) {
-        compute.warm_q4k(&self.gate);
-        compute.warm_q4k(&self.up);
-        compute.warm_q4k(&self.down);
+        compute.warm_quant(&self.gate, true);
+        compute.warm_quant(&self.up, true);
+        compute.warm_quant(&self.down, true);
+    }
+
+    /// Upload expert weights to VRAM without pinning (LRU-evictable).
+    fn warm_expert_gpu(&self, compute: &ComputeContext) {
+        compute.warm_quant(&self.gate, false);
+        compute.warm_quant(&self.up, false);
+        compute.warm_quant(&self.down, false);
     }
 
     fn clone_handles(&self) -> Self {
@@ -1382,6 +1389,8 @@ impl HybridEngine {
     ) -> Result<Mlp> {
         let key = (layer_idx, expert_id);
         if let Some(cached) = self.expert_cache.get(key) {
+            // Re-warm: VRAM LRU may have evicted while the expert stayed in RAM.
+            cached.warm_expert_gpu(&self.compute);
             return Ok(cached);
         }
         let already_resident = self
@@ -1405,8 +1414,8 @@ impl HybridEngine {
         })?;
         let dma = rt.ring.get(slot)?.as_slice();
         let mlp = materialize_expert_mlp(plan, dma, &self.device, use_gelu)?;
-        // Do not VRAM-warm every expert: 768-slot cache thrash + sync upload
-        // dominated prefill. Hot attn/shared weights are warmed at pin time.
+        // MUL_MAT_ID-style: keep Top-K expert weights in VRAM (unpinned LRU).
+        mlp.warm_expert_gpu(&self.compute);
         self.expert_cache.insert(key, mlp.clone_handles());
         Ok(mlp)
     }
@@ -1693,20 +1702,32 @@ fn run_moe_jobs_parallel(
     compute: &ComputeContext,
     jobs: &[(usize, Mlp, Tensor, Vec<f32>, Tensor)],
 ) -> Result<Vec<Tensor>> {
-    // Experts are almost never VRAM-cached; prefer parallel CPU. Only serialize
-    // if every expert would actually hit the GPU path.
-    let parallel = jobs.len() > 1
-        && !jobs.iter().all(|(_, mlp, _, _, _)| {
-            compute.weight_cached(&mlp.gate)
-                && compute.weight_cached(&mlp.up)
-                && compute.weight_cached(&mlp.down)
-        });
-    if !parallel {
+    if jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // MUL_MAT_ID-lite: when every expert is VRAM-warmed and shares one activation
+    // (decode Top-K), fuse gate/up GEMVs across experts in few GPU submits.
+    let all_gpu = jobs.iter().all(|(_, mlp, _, _, _)| {
+        compute.weight_cached(&mlp.gate)
+            && compute.weight_cached(&mlp.up)
+            && compute.weight_cached(&mlp.down)
+    });
+    if all_gpu {
+        if let Some(outs) = try_moe_jobs_fused_gpu(compute, jobs)? {
+            return Ok(outs);
+        }
         let mut outs = Vec::with_capacity(jobs.len());
         for (_, mlp, _, _, indexed) in jobs {
             outs.push(mlp.forward(compute, indexed, None)?);
         }
         return Ok(outs);
+    }
+
+    // Experts not fully VRAM-cached — parallel Candle CPU.
+    if jobs.len() == 1 {
+        let (_, mlp, _, _, indexed) = &jobs[0];
+        return Ok(vec![mlp.forward(compute, indexed, None)?]);
     }
     std::thread::scope(|scope| {
         let mut joins = Vec::with_capacity(jobs.len());
@@ -1722,6 +1743,47 @@ fn run_moe_jobs_parallel(
         }
         Ok(outs)
     })
+}
+
+/// Fuse Top-K expert gate/up when all share the same indexed activation.
+fn try_moe_jobs_fused_gpu(
+    compute: &ComputeContext,
+    jobs: &[(usize, Mlp, Tensor, Vec<f32>, Tensor)],
+) -> Result<Option<Vec<Tensor>>> {
+    if jobs.len() < 2 {
+        return Ok(None);
+    }
+    // Same token rows ⇒ same activation (decode Top-K; rare identical prefill subsets).
+    let first_idx = jobs[0].2.to_vec1::<u32>().ok();
+    let Some(ref first_rows) = first_idx else {
+        return Ok(None);
+    };
+    let shared = jobs.iter().all(|(_, _, index, _, _)| {
+        index
+            .to_vec1::<u32>()
+            .ok()
+            .map(|rows| rows == *first_rows)
+            .unwrap_or(false)
+    });
+    if !shared {
+        return Ok(None);
+    }
+    let xs = &jobs[0].4;
+    let gate_ws: Vec<&QMatMul> = jobs.iter().map(|(_, mlp, _, _, _)| &mlp.gate).collect();
+    let up_ws: Vec<&QMatMul> = jobs.iter().map(|(_, mlp, _, _, _)| &mlp.up).collect();
+    let gates = compute.qmatmul_multi(&gate_ws, xs)?;
+    let ups = compute.qmatmul_multi(&up_ws, xs)?;
+    let mut outs = Vec::with_capacity(jobs.len());
+    for (i, (_, mlp, _, _, _)) in jobs.iter().enumerate() {
+        let lhs = if mlp.use_gelu {
+            gates[i].gelu()?
+        } else {
+            candle_nn::ops::silu(&gates[i])?
+        };
+        let mid = (lhs * &ups[i])?;
+        outs.push(qmm(compute, &mlp.down, None, &mid)?);
+    }
+    Ok(Some(outs))
 }
 
 fn try_tensor<'a>(plan: &'a LayerDmaPlan, suffix: &str) -> Option<&'a TensorLoc> {

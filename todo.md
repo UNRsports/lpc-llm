@@ -441,11 +441,12 @@ Microbench already shows Q4_K GEMV GPU≈0.18 ms vs CPU≈0.59 ms, yet end-t
 
 #### 13.2 Vulkan decode path — cut sync (highest leverage)
 
-- [x] **Fuse command buffers**: multiple Q4_K GEMVs per submit (Q/K/V, gate/up; up to 8 ops)
+- [x] **Fuse command buffers**: multiple Q4_K/Q6_K GEMVs per submit (Q/K/V, gate/up; up to 16 ops)
 - [ ] Keep activations in device buffers across fused GEMVs (still D2H per fused group — next polish)
 - [x] Reuse staging / multi descriptor sets
-- [x] **Auto-prefer CPU for decode (m&lt;8)** via decode microbench; GPU kept for prefill m≥8
-- [ ] (Later) group Top-K expert GEMVs (MUL_MAT_ID-style batching; llama.cpp lesson)
+- [x] GPU for VRAM-warmed weights (hot pin + MoE experts); cold → Candle CPU
+- [x] **Q6_K Vulkan shader** (bit-exact vs candle `BlockQ6K::to_float`) — kills Q6_K→CPU skip on attn/down
+- [x] **Expert GPU path**: warm Top-K experts into VRAM (unpinned LRU); fuse shared-activation gate/up (MUL_MAT_ID-lite)
 
 #### 13.3 MoE decode I/O
 
@@ -529,7 +530,7 @@ Microbench already shows Q4_K GEMV GPU≈0.18 ms vs CPU≈0.59 ms, yet end-t
 
 ## 5. Recommended next steps
 
-1. **Phase 13 (in progress)** — landed: CPU decode + parallel Top-K + fused prefill + `[bench]` + memlock raise. Remaining: host tok/s / RSS write-up; optional Q8_0 / MUL_MAT_ID
+1. **Phase 13 (in progress)** — landed: Q4_K/Q6_K Vulkan + expert VRAM warm + fused Top-K gate/up + `[bench]`. Remaining: host tok/s / RSS write-up; optional Q8_0
 2. **Phase 10 leftovers** — folded into Phase 13.4 (non-Q4_K warn; Q8_0 expert-down; optional streamed GPU)
 3. **Phase 12 polish** — folded into Phase 13.1 (TTFT/tok/s vs 27B; RSS write-up)
 4. **Phase 6 follow-ups** — Wire real cluster launchers / CUDA backends into `job.remote` and `$LPC_LLM_CONVERT_CMD`
@@ -973,11 +974,12 @@ Phase 12 で **正しさ**（`gemma4:26b-a4b` テキスト対話）は到達。r
 
 #### 13.2 Vulkan デコード経路 — 同期削減（最大レバレッジ）
 
-- [x] **コマンドバッファ融合**: Q/K/V・gate/up などを 1 submit（最大 8 ops）
+- [x] **コマンドバッファ融合**: Q4_K/Q6_K GEMV を 1 submit（最大 16 ops）
 - [ ] 融合区間で activation をデバイスに滞留（現状は融合グループごとに D2H）
 - [x] staging / 複数 descriptor set 再利用
-- [x] **デコード（m&lt;8）は CPU 優先**（decode マイクロベンチ）；prefill m≥8 は GPU
-- [ ] （後続）Top-K expert GEMV の一括（MUL_MAT_ID 風）
+- [x] VRAM warm 済み重みは GPU（ホット pin + MoE Expert）；コールドは Candle CPU
+- [x] **Q6_K Vulkan シェーダ**（candle `BlockQ6K::to_float` と一致）
+- [x] **Expert GPU 経路**: Top-K を VRAM warm（unpin LRU）；同一活性化の gate/up 融合（MUL_MAT_ID-lite）
 
 #### 13.3 MoE デコード I/O
 
@@ -1061,7 +1063,7 @@ Phase 12 で **正しさ**（`gemma4:26b-a4b` テキスト対話）は到達。r
 
 ## 5. 推奨する次工程
 
-1. **Phase 13（進行中）** — 実装済: CPU デコード + Top-K 並列 + prefill 融合 + `[bench]` + memlock 引き上げ。残り: ホスト tok/s・RSS 文書化；任意 Q8_0 / MUL_MAT_ID
+1. **Phase 13（進行中）** — 実装済: Q4_K/Q6_K Vulkan + Expert VRAM warm + Top-K gate/up 融合 + `[bench]`。残り: ホスト tok/s・RSS 文書化；任意 Q8_0
 2. **Phase 10 残り** — Phase 13.4 に吸収（non-Q4_K 警告；Q8_0 expert-down；任意のストリーム GPU）
 3. **Phase 12 磨き** — Phase 13.1 に吸収（27B との TTFT/tok/s；RSS 文書化）
 4. **Phase 6 フォロー** — `job.remote` / `$LPC_LLM_CONVERT_CMD` に実クラスタ・CUDA 変換を接続

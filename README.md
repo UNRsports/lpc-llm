@@ -110,8 +110,8 @@ Tuning levers (perceived impact):
 | Pack layout + double buffer | High | `{gguf} → cache/.../layers.pack`, 1 DMA per layer |
 | Hot resident ratio | Medium–high | `--ram-mib` / `--hot-layers` |
 | MoE expert RAM LRU + VRAM warm | High (decode) | avoid re-reading `experts.pack` every token |
-| **Decode on Candle CPU Q4_K (m=1)** | **Very high** | MoE Top-K experts dominate; parallel CPU. GPU only for warmed hot attn/shared |
-| Prefill fused Vulkan Q4_K | Medium (TTFT) | GPU for warmed hot weights; experts stay CPU (avoids VRAM thrash) |
+| **Decode GPU Q4_K/Q6_K when VRAM-warmed** | **High** | Hot attn/shared pinned; MoE Top-K experts warmed (LRU); fuse shared-activation gate/up |
+| Prefill fused Vulkan Q4_K/Q6_K | High (TTFT) | Up to 16 GEMVs/submit; experts warm into VRAM on materialize |
 | Opportunistic `mlock` | Low | used only when `RLIMIT_MEMLOCK` already covers arenas; no `ulimit` required |
 | **`cargo build --release`** | **Very high** | debug builds make MoE prefill minutes-long |
 | Chunked continuation after token cap | Medium | `--max-tokens`, REPL `/more` |
@@ -301,7 +301,7 @@ First hybrid run builds packs (may take minutes; GGUF is not modified). Startup 
 
 Arenas use page-aligned `mmap` for `O_DIRECT`. `mlock` is applied only when the process already has enough memlock budget; otherwise unlocked arenas are used silently (no `ulimit` needed).
 
-**Gemma 4 MoE notes (Phase 13):** routed experts live in `experts.pack`. Decode (m=1) uses Candle CPU Q4_K with parallel Top-K experts; Vulkan fused Q4_K is kept for prefill (m≥8). Opt into GPU decode with `LPC_LLM_GPU_DECODE=1` only for experiments. Judge speed on **turn 2+** after the expert RAM LRU is warm. Always use `./target/release/lpc-llm`.
+**Gemma 4 MoE notes (Phase 13):** routed experts live in `experts.pack`. Vulkan runs **Q4_K and Q6_K** GEMV for VRAM-warmed weights (hot layers pinned; Top-K experts LRU-warmed, fused gate/up when they share an activation). Cold weights fall back to Candle CPU. Judge speed on **turn 2+** after the expert RAM LRU is warm. Always use `./target/release/lpc-llm`.
 
 ### 4. Training data placement
 
@@ -501,7 +501,7 @@ lpc-llm io --help
 | Downloads every time | Check `~/.local/share/lpc-llm/blobs`. Migrating from old `~/.local/share/l3m`: rename / symlink |
 | Pack is slow | First run only. Delete `cache/packs/<model>/` to regenerate (e.g. after expert-pack version bump) |
 | `gemma4` prefill takes minutes | Use **release** build; first turn warms expert RAM/VRAM cache — later turns are much faster |
-| GPU looks unused | Vulkan only accelerates **Q4_K already in VRAM**; cold experts / Q8_0 / attention stay on CPU until warmed |
+| GPU looks unused | Vulkan accelerates **Q4_K/Q6_K already in VRAM**; cold experts / other dtypes / Softmax stay on CPU until warmed |
 | `unsupported dtype for rmsnorm F16` | Fixed on current main (activations cast to F32); rebuild |
 | `cos has to be contiguous in rope` | Fixed on current main; rebuild |
 | Segfault in `materialize_expert_mlp` | Need experts.pack **v3+** (Candle-reversed expert dims). Delete `cache/packs/gemma4_26b-a4b/` and rerun |
@@ -658,8 +658,8 @@ Ollama に依存しない、**純 Rust のローカル LLM プレイヤー**で�
 | パック再配置 + ダブルバッファ | 大 | `{gguf} → cache/.../layers.pack`、層ごと 1 DMA |
 | ホット常駐比率 | 中〜大 | `--ram-mib` / `--hot-layers` |
 | MoE Expert RAM LRU + VRAM warm | 大（デコード） | 毎トークンの `experts.pack` 再読込を避ける |
-| **デコードは Candle CPU Q4_K（m=1）** | **非常に大** | MoE Top-K Expert が支配的 → CPU 並列。GPU は warm 済みホット attn/shared のみ |
-| Prefill の融合 Vulkan Q4_K | 中（TTFT） | warm 済みホット重みは GPU；Expert は CPU（VRAM thrash 回避） |
+| **デコードは VRAM warm 済み Q4_K/Q6_K を GPU** | **大** | ホット attn/shared は pin；MoE Top-K Expert は LRU warm；同一活性化なら gate/up 融合 |
+| Prefill の融合 Vulkan Q4_K/Q6_K | 大（TTFT） | 最大 16 GEMV/submit；Expert は materialize 時に VRAM warm |
 | 任意の `mlock` | 小 | `RLIMIT_MEMLOCK` が足りるときだけピン；`ulimit` 不要 |
 | **`cargo build --release`** | **非常に大** | debug だと MoE prefill が分単位になりやすい |
 | トークン上限後の続き生成 | 中 | `--max-tokens`、REPL の `/more` |
@@ -838,7 +838,7 @@ lpc-llm
 
 arena は `O_DIRECT` 向けにページアライン `mmap`。`mlock` は memlock 予算が足りるときだけ適用し、足りなければ unlocked のまま黙って続行します（`ulimit` 不要）。
 
-**Gemma 4 MoE メモ（Phase 13）:** ルーテッド Expert は `experts.pack`。デコード（m=1）は Candle CPU Q4_K + Top-K 並列。Vulkan 融合 Q4_K は prefill（m≥8）向け。実験的に GPU デコードを試す場合のみ `LPC_LLM_GPU_DECODE=1`。速度は Expert RAM LRU が暖まった **2 通目以降**で判断。必ず `./target/release/lpc-llm` を使う。
+**Gemma 4 MoE メモ（Phase 13）:** ルーテッド Expert は `experts.pack`。Vulkan は **Q4_K / Q6_K** を VRAM warm 済み重みで GEMV（ホット層は pin、Top-K Expert は LRU warm、同一活性化なら gate/up 融合）。コールドは Candle CPU。速度は Expert RAM LRU が暖まった **2 通目以降**で判断。必ず `./target/release/lpc-llm` を使う。
 
 ### 4. 学習用データの設置場所
 
@@ -1025,7 +1025,7 @@ lpc-llm io --help
 | 毎回ダウンロードされる | `~/.local/share/lpc-llm/blobs` を確認。旧 `~/.local/share/l3m` から移行する場合は rename / symlink |
 | pack が遅い | 初回のみ。`cache/packs/<model>/` を消せば再生成（Expert pack 版上げ後など） |
 | `gemma4` の prefill が分単位 | **release** ビルドを使う。1 通目で Expert RAM/VRAM を暖機し、2 通目以降が速い |
-| GPU が使われないように見える | Vulkan は **VRAM 上の Q4_K** のみ加速。コールド Expert / Q8_0 / attention は warm まで CPU |
+| GPU が使われないように見える | Vulkan は **VRAM 上の Q4_K/Q6_K** を加速。コールド Expert / 他 dtype / Softmax は warm まで CPU |
 | `unsupported dtype for rmsnorm F16` | 現行ソースで修正済（活性化を F32 化）。再ビルド |
 | `cos has to be contiguous in rope` | 現行ソースで修正済。再ビルド |
 | `materialize_expert_mlp` で segfault | experts.pack **v3+** が必要（Candle 次元反転対応）。`cache/packs/gemma4_26b-a4b/` を消して再実行 |
