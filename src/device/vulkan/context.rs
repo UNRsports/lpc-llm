@@ -1,6 +1,6 @@
 //! ash-based Vulkan compute: Q4_K dequant+GEMV with VRAM-resident weights.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,14 +15,8 @@ use crate::error::{AppError, Result};
 
 const SPIRV_Q4K: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/q4k_gemv.spv"));
 
-/// Cap cached weight buffers so streamed (rebuilt) tensors cannot grow VRAM forever.
-/// MoE keeps many Top-K expert Q4_K mats hot across turns — allow a larger set.
-const MAX_WEIGHT_CACHE: usize = 768;
-
-/// Prefill / multi-token batches at or above this use GPU when the probe wins.
-/// Decode (m=1) uses a separate `gpu_decode_worthwhile` gate — per-call fence
-/// usually loses to Candle CPU even when a single kernel is faster.
-const PREFILL_MIN_BATCH: u32 = 8;
+/// Cap cached weight buffers. MoE must not thrash hot attn/shared entries.
+const MAX_WEIGHT_CACHE: usize = 2048;
 
 /// Max independent Q4_K GEMVs recorded into one submit (Q/K/V + gate/up, etc.).
 const FUSED_MAX_OPS: usize = 8;
@@ -71,11 +65,11 @@ pub struct VulkanContext {
     submit_lock: Mutex<()>,
     /// Quantized weight blobs keyed by `Arc<QTensor>` pointer.
     weight_cache: Mutex<HashMap<usize, GpuBuffer>>,
+    /// LRU order (front = oldest). Protected from thrashing hot layers.
+    weight_lru: Mutex<VecDeque<usize>>,
     scratch: Mutex<Option<SubmitResources>>,
     /// When false, always fall back to Candle CPU (microbench lost on this GPU).
     gpu_gemv_worthwhile: bool,
-    /// When false, m=1 decode stays on Candle CPU (fence/round-trip dominated).
-    gpu_decode_worthwhile: bool,
     skip_count: AtomicU64,
     submit_count: AtomicU64,
     skip_seen: Mutex<HashSet<String>>,
@@ -162,33 +156,18 @@ impl VulkanContext {
             shader,
             submit_lock: Mutex::new(()),
             weight_cache: Mutex::new(HashMap::new()),
+            weight_lru: Mutex::new(VecDeque::new()),
             scratch: Mutex::new(None),
             gpu_gemv_worthwhile: true,
-            gpu_decode_worthwhile: false,
             skip_count: AtomicU64::new(0),
             submit_count: AtomicU64::new(0),
             skip_seen: Mutex::new(HashSet::new()),
         };
         ctx.gpu_gemv_worthwhile = ctx.microbench_gpu_vs_cpu().unwrap_or(false);
-        // Decode (m=1) always stays on Candle CPU unless explicitly opted in.
-        // A single GEMV+fence can beat CPU while hundreds of round-trips/token
-        // plus lost expert parallelism still lose end-to-end.
-        let probe_decode = if ctx.gpu_gemv_worthwhile {
-            ctx.microbench_decode_vs_cpu().unwrap_or(false)
-        } else {
-            false
-        };
-        let opt_in = std::env::var("LPC_LLM_GPU_DECODE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        ctx.gpu_decode_worthwhile = opt_in && probe_decode;
-        if opt_in && !probe_decode {
+        if ctx.gpu_gemv_worthwhile {
             eprintln!(
-                "compute: LPC_LLM_GPU_DECODE set but decode probe lost — staying on CPU decode"
-            );
-        } else if !opt_in {
-            eprintln!(
-                "compute: decode uses Candle CPU Q4_K (set LPC_LLM_GPU_DECODE=1 to try GPU m=1)"
+                "compute: GPU Q4_K for warmed hot-layer weights (attn/shared/router); \
+                 MoE experts stay on parallel CPU — expect modest GPU% , high CPU%"
             );
         }
         Ok(ctx)
@@ -199,9 +178,10 @@ impl VulkanContext {
         self.gpu_gemv_worthwhile
     }
 
-    /// True when sequential m=1 GEMV+fence still beats Candle CPU (rare).
+    /// Kept for API symmetry with startup banners / future decode policy.
+    #[allow(dead_code)]
     pub fn gpu_decode_worthwhile(&self) -> bool {
-        self.gpu_decode_worthwhile
+        self.gpu_gemv_worthwhile
     }
 
     pub fn stats(&self) -> (u64, u64) {
@@ -215,7 +195,9 @@ impl VulkanContext {
         self.skip_count.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut seen) = self.skip_seen.lock() {
             if seen.insert(reason.to_string()) {
-                eprintln!("compute: vulkan-skip ({reason}) — further skips of this reason are silent");
+                eprintln!(
+                    "compute: vulkan-skip ({reason}) — further skips of this reason are silent"
+                );
             }
         }
     }
@@ -225,12 +207,23 @@ impl VulkanContext {
         if !self.gpu_gemv_worthwhile {
             return false;
         }
-        let m = batch_rows(x);
-        if m < PREFILL_MIN_BATCH {
-            self.gpu_decode_worthwhile
-        } else {
-            true
+        let _ = x;
+        true
+    }
+
+    /// True if this Q4_K weight is already resident in the VRAM cache.
+    pub fn weight_cached(&self, w: &QMatMul) -> bool {
+        let QMatMul::QTensor(qt) = w else {
+            return false;
+        };
+        if qt.dtype() != GgmlDType::Q4K {
+            return false;
         }
+        let key = Arc::as_ptr(qt) as usize;
+        self.weight_cache
+            .lock()
+            .map(|c| c.contains_key(&key))
+            .unwrap_or(false)
     }
 
     /// Upload a Q4_K weight into the VRAM cache without running GEMV.
@@ -284,49 +277,15 @@ impl VulkanContext {
         Ok(win)
     }
 
-    fn microbench_decode_vs_cpu(&self) -> Result<bool> {
-        let n = 2048usize;
-        let k = 2048usize;
-        let w = pack_constant_q4k(n, k, 3, 0.2, 0.05);
-        let x = vec![0.15f32; k];
-        let iters = 8usize;
-
-        let t0 = std::time::Instant::now();
-        for _ in 0..iters {
-            let _ = q4k::q4k_gemv_cpu(&w, n, k, &x)?;
-        }
-        let cpu_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-
-        let key = 0xDEC0_DE01_usize;
-        let _ = self.q4k_gemm_gpu(key, &w, n as u32, k as u32, 1, &x)?;
-        let t1 = std::time::Instant::now();
-        for _ in 0..iters {
-            let _ = self.q4k_gemm_gpu(key, &w, n as u32, k as u32, 1, &x)?;
-        }
-        let gpu_ms = t1.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-
-        // Decode fires hundreds of GEMVs/token; require a clear win after fence cost.
-        let win = gpu_ms * 2.0 < cpu_ms;
-        eprintln!(
-            "compute: decode GEMV (n={n} k={k}) CPU≈{cpu_ms:.2}ms GPU≈{gpu_ms:.2}ms/call → {}",
-            if win {
-                "use GPU for m=1 decode"
-            } else {
-                "Candle CPU for decode (Vulkan prefill m≥8 keeps GPU)"
-            }
-        );
-        Ok(win)
-    }
-
     /// Multiple independent Q4_K GEMVs against the same activation (one submit).
     pub fn qmatmul_multi(&self, ws: &[&QMatMul], x: &Tensor) -> Result<Vec<Tensor>> {
         if ws.is_empty() {
             return Ok(Vec::new());
         }
         if !self.should_try_gpu(x) {
-            self.log_skip("decode/prefill policy prefers CPU for this batch");
+            self.log_skip("GPU GEMV disabled on this device");
             return Err(AppError::msg(
-                "vulkan-skip: decode/prefill policy prefers CPU for this batch",
+                "vulkan-skip: GPU GEMV disabled on this device",
             ));
         }
 
@@ -337,6 +296,8 @@ impl VulkanContext {
         }
         let last = *x_dims.last().unwrap();
         let m: usize = x_dims[..x_dims.len() - 1].iter().product::<usize>().max(1);
+        // Forward path never uploads: only `warm_q4k` (hot pin) fills VRAM.
+        // Prevents MoE expert thrashing from evicting hot attn/shared weights.
 
         let mut guards = Vec::with_capacity(ws.len());
         let mut metas: Vec<(usize, u32, u32)> = Vec::with_capacity(ws.len());
@@ -370,18 +331,16 @@ impl VulkanContext {
                 )));
             }
             let key = Arc::as_ptr(qt) as usize;
-            if (m as u32) < PREFILL_MIN_BATCH {
-                let cached = self
-                    .weight_cache
-                    .lock()
-                    .map_err(|_| AppError::msg("weight cache lock poisoned"))?
-                    .contains_key(&key);
-                if !cached {
-                    self.log_skip("small batch / weight not yet in VRAM cache");
-                    return Err(AppError::msg(
-                        "vulkan-skip: small batch / weight not yet in VRAM cache",
-                    ));
-                }
+            let cached = self
+                .weight_cache
+                .lock()
+                .map_err(|_| AppError::msg("weight cache lock poisoned"))?
+                .contains_key(&key);
+            if !cached {
+                self.log_skip("weight not VRAM-cached (CPU; experts / cold)");
+                return Err(AppError::msg(
+                    "vulkan-skip: weight not VRAM-cached (CPU; experts / cold)",
+                ));
             }
             let w_bytes = qt
                 .data()
@@ -414,24 +373,90 @@ impl VulkanContext {
         Ok(outs)
     }
 
-    fn ensure_weight(&self, key: usize, bytes: &[u8]) -> Result<()> {
-        let mut cache = self
-            .weight_cache
-            .lock()
-            .map_err(|_| AppError::msg("weight cache lock poisoned"))?;
-        if cache.contains_key(&key) {
-            return Ok(());
+    fn touch_lru(lru: &mut VecDeque<usize>, key: usize) {
+        if let Some(pos) = lru.iter().position(|&k| k == key) {
+            lru.remove(pos);
         }
-        if cache.len() >= MAX_WEIGHT_CACHE {
-            // Evict an arbitrary entry (streamed tensors churn Arc keys).
-            if let Some(old_key) = cache.keys().next().copied() {
+        lru.push_back(key);
+    }
+
+    fn ensure_weights_batch(&self, ops: &[(usize, &[u8], u32, u32)]) -> Result<()> {
+        let protect: HashSet<usize> = ops.iter().map(|&(k, _, _, _)| k).collect();
+        for &(key, w_bytes, _, _) in ops {
+            self.ensure_weight_protected(key, w_bytes, &protect)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_weight(&self, key: usize, bytes: &[u8]) -> Result<()> {
+        self.ensure_weight_protected(key, bytes, &HashSet::new())
+    }
+
+    fn ensure_weight_protected(
+        &self,
+        key: usize,
+        bytes: &[u8],
+        protect: &HashSet<usize>,
+    ) -> Result<()> {
+        {
+            let mut cache = self
+                .weight_cache
+                .lock()
+                .map_err(|_| AppError::msg("weight cache lock poisoned"))?;
+            if cache.contains_key(&key) {
+                let mut lru = self
+                    .weight_lru
+                    .lock()
+                    .map_err(|_| AppError::msg("weight lru lock poisoned"))?;
+                Self::touch_lru(&mut lru, key);
+                return Ok(());
+            }
+            // Evict LRU entries that are not in the current fused batch.
+            while cache.len() >= MAX_WEIGHT_CACHE {
+                let mut lru = self
+                    .weight_lru
+                    .lock()
+                    .map_err(|_| AppError::msg("weight lru lock poisoned"))?;
+                let mut victim = None;
+                for &cand in lru.iter() {
+                    if !protect.contains(&cand) && cand != key {
+                        victim = Some(cand);
+                        break;
+                    }
+                }
+                let Some(old_key) = victim else {
+                    // Entire cache is protected — skip GPU rather than thrash.
+                    return Err(AppError::msg(
+                        "vulkan-skip: VRAM weight cache full (protected batch)",
+                    ));
+                };
+                if let Some(pos) = lru.iter().position(|&k| k == old_key) {
+                    lru.remove(pos);
+                }
                 if let Some(old) = cache.remove(&old_key) {
+                    drop(lru);
                     self.destroy_buffer(old);
+                } else {
+                    break;
                 }
             }
         }
         let buf = self.upload_bytes(bytes)?;
+        let mut cache = self
+            .weight_cache
+            .lock()
+            .map_err(|_| AppError::msg("weight cache lock poisoned"))?;
+        let mut lru = self
+            .weight_lru
+            .lock()
+            .map_err(|_| AppError::msg("weight lru lock poisoned"))?;
+        if cache.contains_key(&key) {
+            Self::touch_lru(&mut lru, key);
+            self.destroy_buffer(buf);
+            return Ok(());
+        }
         cache.insert(key, buf);
+        Self::touch_lru(&mut lru, key);
         Ok(())
     }
 
@@ -543,9 +568,7 @@ impl VulkanContext {
             .lock()
             .map_err(|_| AppError::msg("vulkan submit lock poisoned"))?;
 
-        for &(key, w_bytes, _, _) in ops {
-            self.ensure_weight(key, w_bytes)?;
-        }
+        self.ensure_weights_batch(ops)?;
         self.ensure_scratch()?;
 
         let w_bufs: Vec<(vk::Buffer, u64)> = {
@@ -557,7 +580,9 @@ impl VulkanContext {
             for &(key, _, _, _) in ops {
                 let w_buf = cache
                     .get(&key)
-                    .ok_or_else(|| AppError::msg("weight cache miss after ensure"))?;
+                    .ok_or_else(|| {
+                        AppError::msg("vulkan-skip: weight cache miss after ensure")
+                    })?;
                 out.push((w_buf.buffer, w_buf.size));
             }
             out
@@ -899,6 +924,9 @@ impl Drop for VulkanContext {
                     self.device.free_memory(buf.memory, None);
                 }
             }
+            if let Ok(mut lru) = self.weight_lru.lock() {
+                lru.clear();
+            }
             self.device.destroy_command_pool(self.command_pool, None);
             self.device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
@@ -914,6 +942,7 @@ impl Drop for VulkanContext {
     }
 }
 
+#[allow(dead_code)]
 fn batch_rows(x: &Tensor) -> u32 {
     let dims = x.dims();
     if dims.len() <= 1 {

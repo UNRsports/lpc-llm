@@ -56,13 +56,8 @@ impl ComputeContext {
                 Ok(ctx) => {
                     if ctx.gpu_gemv_worthwhile() {
                         eprintln!(
-                            "compute: Vulkan Q4_K path ready (prefill m≥8 fused submit; \
-                             decode m=1 → {}; other dtypes / cold weights → CPU)",
-                            if ctx.gpu_decode_worthwhile() {
-                                "GPU"
-                            } else {
-                                "Candle CPU (fewer fences)"
-                            }
+                            "compute: Vulkan Q4_K ready — prefill uploads+fused submit; \
+                             decode uses warmed VRAM weights only (experts → CPU parallel)"
                         );
                     } else {
                         eprintln!(
@@ -137,6 +132,7 @@ impl ComputeContext {
         Ok(out)
     }
 
+    #[allow(dead_code)]
     pub fn would_use_gpu(&self, x: &Tensor) -> bool {
         #[cfg(feature = "vulkan")]
         if let Some(ref vk) = self.vulkan {
@@ -144,6 +140,17 @@ impl ComputeContext {
         }
         #[cfg(not(feature = "vulkan"))]
         let _ = x;
+        false
+    }
+
+    /// True if this weight is already in VRAM (decode can hit GPU without upload).
+    pub fn weight_cached(&self, w: &QMatMul) -> bool {
+        #[cfg(feature = "vulkan")]
+        if let Some(ref vk) = self.vulkan {
+            return vk.weight_cached(w);
+        }
+        #[cfg(not(feature = "vulkan"))]
+        let _ = w;
         false
     }
 

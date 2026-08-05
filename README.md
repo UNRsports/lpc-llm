@@ -110,8 +110,8 @@ Tuning levers (perceived impact):
 | Pack layout + double buffer | High | `{gguf} → cache/.../layers.pack`, 1 DMA per layer |
 | Hot resident ratio | Medium–high | `--ram-mib` / `--hot-layers` |
 | MoE expert RAM LRU + VRAM warm | High (decode) | avoid re-reading `experts.pack` every token |
-| **Decode on Candle CPU Q4_K (m=1)** | **Very high** | per-call Vulkan fence was ~1 tok/s; CPU + parallel Top-K experts is conversation-speed |
-| Prefill fused Vulkan Q4_K (m≥8) | High (TTFT) | one submit for Q/K/V and gate/up |
+| **Decode on Candle CPU Q4_K (m=1)** | **Very high** | MoE Top-K experts dominate; parallel CPU. GPU only for warmed hot attn/shared |
+| Prefill fused Vulkan Q4_K | Medium (TTFT) | GPU for warmed hot weights; experts stay CPU (avoids VRAM thrash) |
 | Opportunistic `mlock` | Low | used only when `RLIMIT_MEMLOCK` already covers arenas; no `ulimit` required |
 | **`cargo build --release`** | **Very high** | debug builds make MoE prefill minutes-long |
 | Chunked continuation after token cap | Medium | `--max-tokens`, REPL `/more` |
@@ -658,8 +658,8 @@ Ollama に依存しない、**純 Rust のローカル LLM プレイヤー**で�
 | パック再配置 + ダブルバッファ | 大 | `{gguf} → cache/.../layers.pack`、層ごと 1 DMA |
 | ホット常駐比率 | 中〜大 | `--ram-mib` / `--hot-layers` |
 | MoE Expert RAM LRU + VRAM warm | 大（デコード） | 毎トークンの `experts.pack` 再読込を避ける |
-| **デコードは Candle CPU Q4_K（m=1）** | **非常に大** | Vulkan の呼び出し単位 fence が ~1 tok/s だった。CPU + Top-K 並列で会話速度 |
-| Prefill の融合 Vulkan Q4_K（m≥8） | 大（TTFT） | Q/K/V と gate/up を 1 submit |
+| **デコードは Candle CPU Q4_K（m=1）** | **非常に大** | MoE Top-K Expert が支配的 → CPU 並列。GPU は warm 済みホット attn/shared のみ |
+| Prefill の融合 Vulkan Q4_K | 中（TTFT） | warm 済みホット重みは GPU；Expert は CPU（VRAM thrash 回避） |
 | 任意の `mlock` | 小 | `RLIMIT_MEMLOCK` が足りるときだけピン；`ulimit` 不要 |
 | **`cargo build --release`** | **非常に大** | debug だと MoE prefill が分単位になりやすい |
 | トークン上限後の続き生成 | 中 | `--max-tokens`、REPL の `/more` |

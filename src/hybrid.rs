@@ -1693,10 +1693,14 @@ fn run_moe_jobs_parallel(
     compute: &ComputeContext,
     jobs: &[(usize, Mlp, Tensor, Vec<f32>, Tensor)],
 ) -> Result<Vec<Tensor>> {
+    // Experts are almost never VRAM-cached; prefer parallel CPU. Only serialize
+    // if every expert would actually hit the GPU path.
     let parallel = jobs.len() > 1
-        && jobs
-            .iter()
-            .all(|(_, _, _, _, indexed)| !compute.would_use_gpu(indexed));
+        && !jobs.iter().all(|(_, mlp, _, _, _)| {
+            compute.weight_cached(&mlp.gate)
+                && compute.weight_cached(&mlp.up)
+                && compute.weight_cached(&mlp.down)
+        });
     if !parallel {
         let mut outs = Vec::with_capacity(jobs.len());
         for (_, mlp, _, _, indexed) in jobs {
