@@ -114,7 +114,7 @@ Tuning levers (perceived impact):
 | Prefill fused Vulkan Q4_K/Q6_K | High (TTFT) | Up to 16 GEMVs/submit; experts warm into VRAM on materialize |
 | Opportunistic `mlock` | Low | used only when `RLIMIT_MEMLOCK` already covers arenas; no `ulimit` required |
 | **`cargo build --release`** | **Very high** | debug builds make MoE prefill minutes-long |
-| Chunked continuation after token cap | Medium | `--max-tokens`, REPL `/more` |
+| Chunked continuation after answer ceiling | Medium | `--max-tokens` ceiling + REPL `/more` |
 | Chunk-size micro-tuning | Low | DMA window align at pack time, I/O wait EMA |
 
 ### Data layout (module separation)
@@ -301,7 +301,9 @@ First hybrid run builds packs (may take minutes; GGUF is not modified). Startup 
 
 Arenas use page-aligned `mmap` for `O_DIRECT`. `mlock` is applied only when the process already has enough memlock budget; otherwise unlocked arenas are used silently (no `ulimit` needed).
 
-**Gemma 4 MoE notes (Phase 13):** routed experts live in `experts.pack`. Vulkan runs **Q4_K and Q6_K** GEMV for VRAM-warmed weights (hot layers pinned; Top-K experts LRU-warmed, fused gate/up when they share an activation). Cold weights fall back to Candle CPU. Judge speed on **turn 2+** after the expert RAM LRU is warm. Always use `./target/release/lpc-llm`.
+**Gemma 4 MoE notes (Phase 13–14):** routed experts live in `experts.pack`. Vulkan runs **Q4_K / Q6_K** GEMV for VRAM-warmed weights (hot layers pinned; Top-K experts LRU-warmed, fused gate/up when they share an activation). **Phase 14:** dual-scratch ping-pong, Softmax GPU (large last-dim), shared gate/up ∥ router CPU, and **conditional fused Q8_0 downs** (≥4 ops when microbench wins; else Candle CPU). Cold weights fall back to Candle CPU. Judge speed on **turn 2+** after the expert RAM LRU is warm (`[bench]` expert decode hits ≥95% target). Always use `./target/release/lpc-llm`.
+
+**RSS / `--ram-mib 16384` (Phase 14.4):** after a warm turn, read `VmRSS` from `/proc/<pid>/status` while the REPL is idle; compare to `--ram-mib` (hot layers + emb/lm_head + expert LRU spare). Expert capacity is derived from residual MiB after pinning hot weights — see startup `expert cache` line.
 
 ### 4. Training data placement
 
@@ -408,7 +410,7 @@ Multi-billion HF→GGUF: set `LPC_LLM_CONVERT_CMD` to write a `.gguf` into `$LPC
 | `/clear` | Clear history and KV |
 | `/bye` `/exit` `/quit` | Leave chat |
 
-Each reply is capped by `--max-tokens` (default 512). If the model hits that cap before EOS, the REPL prints a truncation hint — type `/more` for another chunk.
+Each reply runs until the model emits end-of-turn, up to `--max-tokens` (default **2048**, floor 2048 if a smaller value is passed, ceiling 8192). Only if that ceiling is hit without EOS does the REPL offer `/more`.
 
 ### 8. Stop
 
@@ -470,7 +472,7 @@ lpc-llm io --help
 | `--hybrid` | on for gemma* | Layer-streaming inference |
 | `--hot-layers N` | auto | Force number of RAM-resident layers |
 | `--ram-mib N` | 4096 | Soft budget for hot layers + 2 slots (MiB) |
-| `--max-tokens N` | 512 | Max new tokens per reply (and per `/more`) |
+| `--max-tokens N` | 2048 | Complete-answer budget until end-of-turn (floor 2048, ceiling 8192); `/more` only if the ceiling is hit |
 | `--adapter <name>` | none | Bind LoRA side-path (forces hybrid) |
 | `--agent` | off | SmolLM2 router before main (exclusive RAM) |
 | `--agent-model` | `smollm2:360m` | Router model for `--agent` |
@@ -662,7 +664,7 @@ Ollama に依存しない、**純 Rust のローカル LLM プレイヤー**で�
 | Prefill の融合 Vulkan Q4_K/Q6_K | 大（TTFT） | 最大 16 GEMV/submit；Expert は materialize 時に VRAM warm |
 | 任意の `mlock` | 小 | `RLIMIT_MEMLOCK` が足りるときだけピン；`ulimit` 不要 |
 | **`cargo build --release`** | **非常に大** | debug だと MoE prefill が分単位になりやすい |
-| トークン上限後の続き生成 | 中 | `--max-tokens`、REPL の `/more` |
+| トークン天井後の続き生成 | 中 | `--max-tokens` 天井 + REPL `/more` |
 | チャンクサイズ微調整 | 小 | pack 時の DMA 窓アライン、I/O wait EMA |
 
 ### データレイアウト（モジュール分離）
@@ -838,7 +840,9 @@ lpc-llm
 
 arena は `O_DIRECT` 向けにページアライン `mmap`。`mlock` は memlock 予算が足りるときだけ適用し、足りなければ unlocked のまま黙って続行します（`ulimit` 不要）。
 
-**Gemma 4 MoE メモ（Phase 13）:** ルーテッド Expert は `experts.pack`。Vulkan は **Q4_K / Q6_K** を VRAM warm 済み重みで GEMV（ホット層は pin、Top-K Expert は LRU warm、同一活性化なら gate/up 融合）。コールドは Candle CPU。速度は Expert RAM LRU が暖まった **2 通目以降**で判断。必ず `./target/release/lpc-llm` を使う。
+**Gemma 4 MoE メモ（Phase 13–14）:** ルーテッド Expert は `experts.pack`。Vulkan は **Q4_K / Q6_K** を VRAM warm 済み重みで GEMV（ホット層は pin、Top-K Expert は LRU warm、同一活性化なら gate/up 融合）。**Phase 14:** dual-scratch ping-pong、大きな last-dim の Softmax GPU、shared gate/up ∥ router CPU、**条件付き融合 Q8_0 down**（≥4 ops かつマイクロベンチ勝利時；それ以外は Candle CPU）。コールドは Candle CPU。速度は Expert RAM LRU が暖まった **2 通目以降**で判断（`[bench]` expert decode hits ≥95% 目標）。必ず `./target/release/lpc-llm` を使う。
+
+**RSS / `--ram-mib 16384`（Phase 14.4）:** 暖機後の REPL 待機中に `/proc/<pid>/status` の `VmRSS` を読む。`--ram-mib`（ホット層 + emb/lm_head + Expert LRU 余剰）と比較。Expert 容量はホット pin 後の残余 MiB から決まり、起動時の `expert cache` 行に出る。
 
 ### 4. 学習用データの設置場所
 
@@ -932,7 +936,7 @@ lpc-llm job convert --from-dir ~/.local/share/lpc-llm/cache/train/tiny_demo \
 | `/clear` | 会話履歴と KV をクリア |
 | `/bye` `/exit` `/quit` | チャット終了 |
 
-各応答は `--max-tokens`（既定 512）が上限です。EOS 前に上限へ達した場合は打ち切りヒントが出るので、続きは `/more` で足せます。
+各応答は end-of-turn まで生成します。予算は `--max-tokens`（既定 **2048**；より小さい指定は 2048 に切り上げ、上限 8192）。天井に達して EOS が無いときだけ `/more` で続きを足せます。
 
 ### 8. 停止
 
@@ -994,7 +998,7 @@ lpc-llm io --help
 | `--hybrid` | gemma* は on | 層ストリーミング推論 |
 | `--hot-layers N` | 自動 | RAM 常駐層数を強制 |
 | `--ram-mib N` | 4096 | ホット層 + 2 スロットのソフト予算 (MiB) |
-| `--max-tokens N` | 512 | 1 回の応答（および `/more`）の最大トークン数 |
+| `--max-tokens N` | 2048 | end-of-turn までの回答予算（下限 2048・上限 8192）；天井到達時のみ `/more` |
 | `--adapter <name>` | なし | LoRA サイドパス（hybrid 強制） |
 | `--agent` | off | ルーター後にメイン（RAM 排他） |
 | `--agent-model` | `smollm2:360m` | `--agent` 用ルーター |

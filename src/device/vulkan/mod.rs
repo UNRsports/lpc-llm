@@ -5,4 +5,4 @@ mod q4k;
 mod q6k;
 mod q8_0;
 
-pub use context::{probe, DeviceAct, VulkanContext};
+pub use context::{probe, softmax_last_dim_f32, DeviceAct, VulkanContext};

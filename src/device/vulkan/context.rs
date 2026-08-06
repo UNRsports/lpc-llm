@@ -12,12 +12,13 @@ use candle_core::{DType, Device as CandleDevice, Tensor};
 
 use super::q4k::{self, pack_constant_q4k, BLOCK_Q4K_SIZE, QK_K};
 use super::q6k::BLOCK_Q6K_SIZE;
-use super::q8_0::{BLOCK_Q8_0_SIZE, QK8_0};
+use super::q8_0::{self, pack_constant_q8_0, BLOCK_Q8_0_SIZE, QK8_0};
 use crate::error::{AppError, Result};
 
 const SPIRV_Q4K: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/q4k_gemv.spv"));
 const SPIRV_Q6K: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/q6k_gemv.spv"));
 const SPIRV_Q8_0: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/q8_0_gemv.spv"));
+const SPIRV_SOFTMAX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/softmax_f32.spv"));
 
 /// Cap cached weight buffers. Hot (pinned) + recent experts.
 const MAX_WEIGHT_CACHE: usize = 4096;
@@ -77,7 +78,12 @@ impl DeviceAct {
             .map_err(|e| AppError::msg(e.to_string()))
     }
 
-    fn from_flat(data: Vec<f32>, m: u32, n: u32, template_dims: &[usize]) -> Result<Self> {
+    pub(crate) fn from_flat(
+        data: Vec<f32>,
+        m: u32,
+        n: u32,
+        template_dims: &[usize],
+    ) -> Result<Self> {
         let mut dims = template_dims.to_vec();
         if dims.is_empty() {
             dims = vec![m as usize, n as usize];
@@ -97,8 +103,6 @@ impl DeviceAct {
 enum QuantKind {
     Q4K,
     Q6K,
-    /// Shader wired; currently unused on forward (CPU preferred for Q8_0 downs).
-    #[allow(dead_code)]
     Q8_0,
 }
 
@@ -107,9 +111,7 @@ impl QuantKind {
         match dt {
             GgmlDType::Q4K => Some(Self::Q4K),
             GgmlDType::Q6K => Some(Self::Q6K),
-            // Q8_0 shader exists, but for Gemma4 expert/shared *downs* (k≈704)
-            // Candle CPU MatMul beats host-synchronized GPU GEMV. Keep CPU.
-            GgmlDType::Q8_0 => None,
+            GgmlDType::Q8_0 => Some(Self::Q8_0),
             _ => None,
         }
     }
@@ -182,6 +184,7 @@ pub struct VulkanContext {
     pipeline_q4k: QuantPipeline,
     pipeline_q6k: QuantPipeline,
     pipeline_q8_0: QuantPipeline,
+    pipeline_softmax: QuantPipeline,
     pipeline_layout: vk::PipelineLayout,
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
@@ -193,9 +196,13 @@ pub struct VulkanContext {
     weight_lru: Mutex<VecDeque<usize>>,
     /// Hot-layer keys that LRU must never evict.
     weight_pinned: Mutex<HashSet<usize>>,
-    scratch: Mutex<Option<SubmitResources>>,
+    /// Dual scratch slots for ping-pong (wait only the slot being reused).
+    scratches: Mutex<[Option<SubmitResources>; 2]>,
+    scratch_rr: AtomicU64,
     /// When false, always fall back to Candle CPU (microbench lost on this GPU).
     gpu_gemv_worthwhile: bool,
+    /// When true, ≥4 fused Q8_0 downs may use GPU (microbench win).
+    gpu_q8_0_fused_worthwhile: bool,
     skip_count: AtomicU64,
     submit_count: AtomicU64,
     skip_seen: Mutex<HashSet<String>>,
@@ -239,6 +246,7 @@ impl VulkanContext {
         let shader_q4k = create_shader(&device, SPIRV_Q4K)?;
         let shader_q6k = create_shader(&device, SPIRV_Q6K)?;
         let shader_q8_0 = create_shader(&device, SPIRV_Q8_0)?;
+        let shader_softmax = create_shader(&device, SPIRV_SOFTMAX)?;
         let pipeline_q4k = QuantPipeline {
             shader: shader_q4k,
             pipeline: create_compute_pipeline(&device, pipeline_layout, shader_q4k)?,
@@ -251,11 +259,16 @@ impl VulkanContext {
             shader: shader_q8_0,
             pipeline: create_compute_pipeline(&device, pipeline_layout, shader_q8_0)?,
         };
+        let pipeline_softmax = QuantPipeline {
+            shader: shader_softmax,
+            pipeline: create_compute_pipeline(&device, pipeline_layout, shader_softmax)?,
+        };
 
+        // Dual scratch × FUSED_MAX_OPS sets (each set: 3 storage + 1 uniform).
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: (FUSED_MAX_OPS as u32) * 8,
+                descriptor_count: (FUSED_MAX_OPS as u32) * 2 * 3,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
@@ -264,7 +277,7 @@ impl VulkanContext {
         ];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-            .max_sets((FUSED_MAX_OPS as u32) + 4)
+            .max_sets((FUSED_MAX_OPS as u32) * 2)
             .pool_sizes(&pool_sizes);
         let descriptor_pool = unsafe {
             device
@@ -291,6 +304,7 @@ impl VulkanContext {
             pipeline_q4k,
             pipeline_q6k,
             pipeline_q8_0,
+            pipeline_softmax,
             pipeline_layout,
             descriptor_set_layout,
             descriptor_pool,
@@ -299,17 +313,27 @@ impl VulkanContext {
             weight_cache: Mutex::new(HashMap::new()),
             weight_lru: Mutex::new(VecDeque::new()),
             weight_pinned: Mutex::new(HashSet::new()),
-            scratch: Mutex::new(None),
+            scratches: Mutex::new([None, None]),
+            scratch_rr: AtomicU64::new(0),
             gpu_gemv_worthwhile: true,
+            gpu_q8_0_fused_worthwhile: true,
             skip_count: AtomicU64::new(0),
             submit_count: AtomicU64::new(0),
             skip_seen: Mutex::new(HashSet::new()),
         };
         ctx.gpu_gemv_worthwhile = ctx.microbench_gpu_vs_cpu().unwrap_or(false);
+        // Allow Q8_0 fused path during probe; result overwrites the flag.
+        ctx.gpu_q8_0_fused_worthwhile = true;
+        ctx.gpu_q8_0_fused_worthwhile = ctx.microbench_q8_0_fused().unwrap_or(false);
         if ctx.gpu_gemv_worthwhile {
             eprintln!(
-                "compute: GPU Q4_K/Q6_K for VRAM-warmed weights (hot + MoE gate/up); \
-                 Q8_0 downs stay on Candle CPU (faster than sync GPU)"
+                "compute: GPU Q4_K/Q6_K for VRAM-warmed weights; \
+                 Q8_0 fused downs {}",
+                if ctx.gpu_q8_0_fused_worthwhile {
+                    "enabled (≥4 ops, microbench win)"
+                } else {
+                    "disabled (CPU faster on this GPU)"
+                }
             );
         }
         Ok(ctx)
@@ -318,6 +342,11 @@ impl VulkanContext {
     /// True when the naive GPU GEMV path beat Candle-style CPU on a small probe.
     pub fn gpu_gemv_worthwhile(&self) -> bool {
         self.gpu_gemv_worthwhile
+    }
+
+    /// True when ≥4 fused Q8_0 downs beat parallel CPU on this GPU.
+    pub fn gpu_q8_0_fused_worthwhile(&self) -> bool {
+        self.gpu_q8_0_fused_worthwhile
     }
 
     /// Kept for API symmetry with startup banners / future decode policy.
@@ -433,7 +462,63 @@ impl VulkanContext {
         Ok(win)
     }
 
-    /// Multiple independent Q4_K / Q6_K GEMVs against the same activation (one submit).
+    /// 8 fused Q8_0 GEMVs (n≈2816, k≈704) vs 8 parallel CPU refs. Win if GPU < CPU * 0.90.
+    fn microbench_q8_0_fused(&self) -> Result<bool> {
+        let n = 2816usize;
+        let k = 704usize;
+        let w = pack_constant_q8_0(n, k, 2, 0.25);
+        let x = vec![1.0f32; k];
+        let rounds = 2usize;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..rounds {
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    let w_ref = &w;
+                    let x_ref = &x;
+                    scope.spawn(move || {
+                        let _ = q8_0::q8_0_gemv_cpu(w_ref, n, k, x_ref);
+                    });
+                }
+            });
+        }
+        let cpu_ms = t0.elapsed().as_secs_f64() * 1000.0 / rounds as f64;
+
+        let key = 0xC8F0_BEEF_u64 as usize;
+        let ops: Vec<(usize, &[u8], u32, u32, QuantKind)> = (0..8)
+            .map(|i| {
+                (
+                    key + i,
+                    w.as_slice(),
+                    n as u32,
+                    k as u32,
+                    QuantKind::Q8_0,
+                )
+            })
+            .collect();
+        let xs: Vec<&[f32]> = (0..8).map(|_| x.as_slice()).collect();
+
+        // Warm GPU path once.
+        let _ = self.quant_gemm_gpu_multi_xs(&ops, &xs)?;
+        let t1 = std::time::Instant::now();
+        for _ in 0..rounds {
+            let _ = self.quant_gemm_gpu_multi_xs(&ops, &xs)?;
+        }
+        let gpu_ms = t1.elapsed().as_secs_f64() * 1000.0 / rounds as f64;
+
+        let win = gpu_ms < cpu_ms * 0.90;
+        eprintln!(
+            "compute: Q8_0 fused×8 probe CPU≈{cpu_ms:.2}ms GPU≈{gpu_ms:.2}ms → {}",
+            if win {
+                "use GPU for ≥4 fused Q8_0 downs"
+            } else {
+                "prefer Candle CPU for Q8_0 downs"
+            }
+        );
+        Ok(win)
+    }
+
+    /// Multiple independent Q4_K / Q6_K / Q8_0 GEMVs against the same activation (one submit).
     pub fn qmatmul_multi(&self, ws: &[&QMatMul], x: &Tensor) -> Result<Vec<Tensor>> {
         if ws.is_empty() {
             return Ok(Vec::new());
@@ -478,6 +563,52 @@ impl VulkanContext {
             outs.push(DeviceAct::from_flat(c_flat, act.m(), n, act.dims())?);
         }
         Ok(outs)
+    }
+
+    /// Fused GEMVs with CPU work overlapped between `queue_submit` and fence wait / D2H.
+    #[allow(dead_code)] // Phase 14 MoE / layer overlap
+    pub fn qmatmul_multi_overlap<R, F>(
+        &self,
+        ws: &[&QMatMul],
+        x: &Tensor,
+        between: F,
+    ) -> Result<(Vec<Tensor>, R)>
+    where
+        F: FnOnce() -> Result<R>,
+    {
+        if ws.is_empty() {
+            let r = between()?;
+            return Ok((Vec::new(), r));
+        }
+        if !self.should_try_gpu(x) {
+            self.log_skip("GPU GEMV disabled on this device");
+            return Err(AppError::msg(
+                "vulkan-skip: GPU GEMV disabled on this device",
+            ));
+        }
+        let act = DeviceAct::from_tensor(x)?;
+        let mut guards = Vec::with_capacity(ws.len());
+        let mut metas: Vec<(usize, u32, u32, QuantKind)> = Vec::with_capacity(ws.len());
+        for w in ws {
+            let (key, n, k, kind, guard) = self.prepare_one_gemv(w, act.k() as usize)?;
+            guards.push(guard);
+            metas.push((key, n, k, kind));
+        }
+        let prepared: Vec<(usize, &[u8], u32, u32, QuantKind)> = metas
+            .iter()
+            .zip(guards.iter())
+            .map(|(&(key, n, k, kind), g)| (key, g.as_ref(), n, k, kind))
+            .collect();
+        let x_refs: Vec<&[f32]> = (0..prepared.len()).map(|_| act.data()).collect();
+        let (chunks, r) =
+            self.quant_gemm_gpu_multi_xs_overlap(&prepared, &x_refs, between)?;
+        let mut outs = Vec::with_capacity(chunks.len());
+        for (i, c_flat) in chunks.into_iter().enumerate() {
+            let n = metas[i].1;
+            let da = DeviceAct::from_flat(c_flat, act.m(), n, act.dims())?;
+            outs.push(da.to_tensor()?);
+        }
+        Ok((outs, r))
     }
 
     /// Independent GEMVs with **per-op activations** (one submit; MoE expert downs).
@@ -568,9 +699,9 @@ impl VulkanContext {
             ));
         };
         let Some(kind) = QuantKind::from_dtype(qt.dtype()) else {
-            self.log_skip(&format!("dtype {:?} (Q4_K/Q6_K GPU; Q8_0→CPU)", qt.dtype()));
+            self.log_skip(&format!("dtype {:?} (unsupported quant)", qt.dtype()));
             return Err(AppError::msg(format!(
-                "vulkan-skip: dtype {:?} (Q4_K/Q6_K GPU; Q8_0→CPU)",
+                "vulkan-skip: dtype {:?} (unsupported quant)",
                 qt.dtype()
             )));
         };
@@ -721,60 +852,62 @@ impl VulkanContext {
     }
 
     fn ensure_scratch(&self) -> Result<()> {
-        let mut slot = self
-            .scratch
+        let mut slots = self
+            .scratches
             .lock()
             .map_err(|_| AppError::msg("scratch lock poisoned"))?;
-        if slot.is_some() {
-            return Ok(());
-        }
-        let x = self.alloc_mapped(
-            64 * 1024,
-            vk::BufferUsageFlags::STORAGE_BUFFER,
-        )?;
-        let y = self.alloc_mapped(
-            64 * 1024,
-            vk::BufferUsageFlags::STORAGE_BUFFER,
-        )?;
-        let u = self.alloc_mapped(
-            (size_of::<[u32; 4]>() * FUSED_MAX_OPS) as u64,
-            vk::BufferUsageFlags::UNIFORM_BUFFER,
-        )?;
+        for slot_idx in 0..2 {
+            if slots[slot_idx].is_some() {
+                continue;
+            }
+            let x = self.alloc_mapped(
+                64 * 1024,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+            )?;
+            let y = self.alloc_mapped(
+                64 * 1024,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+            )?;
+            let u = self.alloc_mapped(
+                (size_of::<[u32; 4]>() * FUSED_MAX_OPS) as u64,
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+            )?;
 
-        let set_layouts = vec![self.descriptor_set_layout; FUSED_MAX_OPS];
-        let alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&set_layouts);
-        let sets = unsafe {
-            self.device
-                .allocate_descriptor_sets(&alloc)
-                .map_err(|e| AppError::msg(format!("allocate_descriptor_sets: {e}")))?
-        };
-        let alloc_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(self.command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let cmds = unsafe {
-            self.device
-                .allocate_command_buffers(&alloc_info)
-                .map_err(|e| AppError::msg(format!("allocate_command_buffers: {e}")))?
-        };
-        let fence = unsafe {
-            self.device
-                .create_fence(
-                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                    None,
-                )
-                .map_err(|e| AppError::msg(format!("create_fence: {e}")))?
-        };
-        *slot = Some(SubmitResources {
-            x,
-            y,
-            u,
-            sets,
-            cmd: cmds[0],
-            fence,
-        });
+            let set_layouts = vec![self.descriptor_set_layout; FUSED_MAX_OPS];
+            let alloc = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(self.descriptor_pool)
+                .set_layouts(&set_layouts);
+            let sets = unsafe {
+                self.device
+                    .allocate_descriptor_sets(&alloc)
+                    .map_err(|e| AppError::msg(format!("allocate_descriptor_sets: {e}")))?
+            };
+            let alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let cmds = unsafe {
+                self.device
+                    .allocate_command_buffers(&alloc_info)
+                    .map_err(|e| AppError::msg(format!("allocate_command_buffers: {e}")))?
+            };
+            let fence = unsafe {
+                self.device
+                    .create_fence(
+                        &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                        None,
+                    )
+                    .map_err(|e| AppError::msg(format!("create_fence: {e}")))?
+            };
+            slots[slot_idx] = Some(SubmitResources {
+                x,
+                y,
+                u,
+                sets,
+                cmd: cmds[0],
+                fence,
+            });
+        }
         Ok(())
     }
 
@@ -848,8 +981,23 @@ impl VulkanContext {
         ops: &[(usize, &[u8], u32, u32, QuantKind)],
         xs: &[&[f32]],
     ) -> Result<Vec<Vec<f32>>> {
+        self.quant_gemm_gpu_multi_xs_overlap(ops, xs, || Ok(()))
+            .map(|(outs, _)| outs)
+    }
+
+    /// Like [`Self::quant_gemm_gpu_multi_xs`] but runs `between` after submit, before wait+D2H.
+    fn quant_gemm_gpu_multi_xs_overlap<R, F>(
+        &self,
+        ops: &[(usize, &[u8], u32, u32, QuantKind)],
+        xs: &[&[f32]],
+        between: F,
+    ) -> Result<(Vec<Vec<f32>>, R)>
+    where
+        F: FnOnce() -> Result<R>,
+    {
         if ops.is_empty() {
-            return Ok(Vec::new());
+            let r = between()?;
+            return Ok((Vec::new(), r));
         }
         if ops.len() != xs.len() {
             return Err(AppError::msg(format!(
@@ -859,11 +1007,41 @@ impl VulkanContext {
             )));
         }
         if ops.len() > FUSED_MAX_OPS {
+            // Chunk without overlap on intermediate chunks; run between on the last chunk only.
             let mut all = Vec::new();
-            for (chunk_ops, chunk_xs) in ops.chunks(FUSED_MAX_OPS).zip(xs.chunks(FUSED_MAX_OPS)) {
-                all.extend(self.quant_gemm_gpu_multi_xs(chunk_ops, chunk_xs)?);
+            let n_chunks = ops.chunks(FUSED_MAX_OPS).len();
+            let mut between_opt = Some(between);
+            let mut last_r: Option<R> = None;
+            for (ci, (chunk_ops, chunk_xs)) in ops
+                .chunks(FUSED_MAX_OPS)
+                .zip(xs.chunks(FUSED_MAX_OPS))
+                .enumerate()
+            {
+                if ci + 1 == n_chunks {
+                    let (chunk_outs, r) = self.quant_gemm_gpu_multi_xs_overlap(
+                        chunk_ops,
+                        chunk_xs,
+                        between_opt.take().unwrap(),
+                    )?;
+                    all.extend(chunk_outs);
+                    last_r = Some(r);
+                } else {
+                    all.extend(self.quant_gemm_gpu_multi_xs(chunk_ops, chunk_xs)?);
+                }
             }
-            return Ok(all);
+            return Ok((all, last_r.unwrap()));
+        }
+
+        // Policy: single/tiny Q8_0 stays CPU; ≥4 fused may use GPU when microbench wins.
+        let any_q8 = ops.iter().any(|op| op.4 == QuantKind::Q8_0);
+        if any_q8 && (ops.len() < 4 || !self.gpu_q8_0_fused_worthwhile) {
+            let reason = if ops.len() < 4 {
+                format!("Q8_0 fused len={} < 4 (CPU)", ops.len())
+            } else {
+                "Q8_0 fused microbench lost (CPU)".to_string()
+            };
+            self.log_skip(&reason);
+            return Err(AppError::msg(format!("vulkan-skip: {reason}")));
         }
 
         let ms: Vec<u32> = ops
@@ -923,11 +1101,12 @@ impl VulkanContext {
         let y_bytes = (y_total * size_of::<f32>()) as u64;
         let u_bytes = (size_of::<[u32; 4]>() * ops.len()) as u64;
 
+        let slot_idx = (self.scratch_rr.fetch_add(1, Ordering::Relaxed) % 2) as usize;
         let mut scratch_guard = self
-            .scratch
+            .scratches
             .lock()
             .map_err(|_| AppError::msg("scratch lock poisoned"))?;
-        let scratch = scratch_guard
+        let scratch = scratch_guard[slot_idx]
             .as_mut()
             .ok_or_else(|| AppError::msg("scratch missing after ensure"))?;
 
@@ -1040,6 +1219,7 @@ impl VulkanContext {
         }
         unsafe { self.device.update_descriptor_sets(&writes, &[]) };
 
+        // Wait ONLY this slot's fence before reuse (other slot may still be in flight).
         unsafe {
             self.device
                 .wait_for_fences(&[scratch.fence], true, 60_000_000_000)
@@ -1118,6 +1298,12 @@ impl VulkanContext {
             self.device
                 .queue_submit(self.queue, &submits, fence)
                 .map_err(|e| AppError::msg(format!("queue_submit: {e}")))?;
+        }
+
+        // CPU work while GPU runs (submit_lock held; fine for single-threaded decode).
+        let r = between()?;
+
+        unsafe {
             self.device
                 .wait_for_fences(&[fence], true, 60_000_000_000)
                 .map_err(|e| AppError::msg(format!("wait_for_fences: {e}")))?;
@@ -1138,10 +1324,189 @@ impl VulkanContext {
             outs.push(out);
             off += len;
         }
-        Ok(outs)
+        Ok((outs, r))
     }
 
     // --- end quant_gemm_gpu_multi_xs ---
+
+    /// Softmax over the last dimension (Candle-compatible f32 max/exp/sum/div).
+    #[allow(dead_code)] // Phase 14 Softmax GPU
+    pub fn softmax_last_dim_gpu(&self, rows: u32, cols: u32, x: &[f32]) -> Result<Vec<f32>> {
+        let expect = (rows as usize).saturating_mul(cols as usize);
+        if x.len() != expect {
+            return Err(AppError::msg(format!(
+                "softmax_last_dim_gpu: x len {} != rows*cols={expect}",
+                x.len()
+            )));
+        }
+        if rows == 0 || cols == 0 {
+            return Ok(Vec::new());
+        }
+
+        let _guard = self
+            .submit_lock
+            .lock()
+            .map_err(|_| AppError::msg("vulkan submit lock poisoned"))?;
+        self.ensure_scratch()?;
+
+        let x_bytes = (x.len() * size_of::<f32>()) as u64;
+        let y_bytes = x_bytes;
+        let u_bytes = size_of::<[u32; 4]>() as u64;
+
+        let slot_idx = (self.scratch_rr.fetch_add(1, Ordering::Relaxed) % 2) as usize;
+        let mut scratch_guard = self
+            .scratches
+            .lock()
+            .map_err(|_| AppError::msg("scratch lock poisoned"))?;
+        let scratch = scratch_guard[slot_idx]
+            .as_mut()
+            .ok_or_else(|| AppError::msg("scratch missing after ensure"))?;
+
+        self.grow_mapped(
+            &mut scratch.x,
+            x_bytes,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+        )?;
+        self.grow_mapped(
+            &mut scratch.y,
+            y_bytes,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+        )?;
+        self.grow_mapped(
+            &mut scratch.u,
+            u_bytes,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+        )?;
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                x.as_ptr(),
+                scratch.x.ptr as *mut f32,
+                x.len(),
+            );
+            let dims = [rows, cols, 0u32, 0u32];
+            std::ptr::copy_nonoverlapping(dims.as_ptr(), scratch.u.ptr as *mut u32, 4);
+        }
+
+        // Softmax bindings: 0=x, 1=y, 2=unused, 3=dims (same layout types as GEMV).
+        let x_info = [vk::DescriptorBufferInfo {
+            buffer: scratch.x.buffer,
+            offset: 0,
+            range: x_bytes.max(4),
+        }];
+        let y_info = [vk::DescriptorBufferInfo {
+            buffer: scratch.y.buffer,
+            offset: 0,
+            range: y_bytes.max(4),
+        }];
+        let unused_info = [vk::DescriptorBufferInfo {
+            buffer: scratch.y.buffer,
+            offset: 0,
+            range: 4,
+        }];
+        let u_info = [vk::DescriptorBufferInfo {
+            buffer: scratch.u.buffer,
+            offset: 0,
+            range: u_bytes,
+        }];
+        let set = scratch.sets[0];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&x_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&y_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&unused_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(&u_info),
+        ];
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+
+        unsafe {
+            self.device
+                .wait_for_fences(&[scratch.fence], true, 60_000_000_000)
+                .map_err(|e| AppError::msg(format!("wait_for_fences(reset): {e}")))?;
+            self.device
+                .reset_fences(&[scratch.fence])
+                .map_err(|e| AppError::msg(format!("reset_fences: {e}")))?;
+            self.device
+                .reset_command_buffer(scratch.cmd, vk::CommandBufferResetFlags::empty())
+                .map_err(|e| AppError::msg(format!("reset_command_buffer: {e}")))?;
+        }
+
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        let cmd = scratch.cmd;
+        let fence = scratch.fence;
+        unsafe {
+            self.device
+                .begin_command_buffer(cmd, &begin)
+                .map_err(|e| AppError::msg(format!("begin_command_buffer: {e}")))?;
+            self.device.cmd_bind_pipeline(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_softmax.pipeline,
+            );
+            self.device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_layout,
+                0,
+                &[set],
+                &[],
+            );
+            self.device.cmd_dispatch(cmd, 1, rows, 1);
+            let barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ);
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+            self.device
+                .end_command_buffer(cmd)
+                .map_err(|e| AppError::msg(format!("end_command_buffer: {e}")))?;
+        }
+
+        let cmds = [cmd];
+        let submits = [vk::SubmitInfo::default().command_buffers(&cmds)];
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &submits, fence)
+                .map_err(|e| AppError::msg(format!("queue_submit: {e}")))?;
+            self.device
+                .wait_for_fences(&[fence], true, 60_000_000_000)
+                .map_err(|e| AppError::msg(format!("wait_for_fences: {e}")))?;
+        }
+        self.submit_count.fetch_add(1, Ordering::Relaxed);
+
+        let mut out = vec![0f32; x.len()];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                scratch.y.ptr as *const f32,
+                out.as_mut_ptr(),
+                out.len(),
+            );
+        }
+        Ok(out)
+    }
 
     fn alloc_mapped(&self, capacity: u64, usage: vk::BufferUsageFlags) -> Result<MappedScratch> {
         let capacity = capacity.max(4);
@@ -1269,13 +1634,15 @@ impl Drop for VulkanContext {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
-            if let Ok(mut scratch) = self.scratch.lock() {
-                if let Some(s) = scratch.take() {
-                    self.device.destroy_fence(s.fence, None);
-                    // Descriptor set / command buffer freed with pools.
-                    self.destroy_mapped(s.x);
-                    self.destroy_mapped(s.y);
-                    self.destroy_mapped(s.u);
+            if let Ok(mut scratches) = self.scratches.lock() {
+                for slot in scratches.iter_mut() {
+                    if let Some(s) = slot.take() {
+                        self.device.destroy_fence(s.fence, None);
+                        // Descriptor set / command buffer freed with pools.
+                        self.destroy_mapped(s.x);
+                        self.destroy_mapped(s.y);
+                        self.destroy_mapped(s.u);
+                    }
                 }
             }
             if let Ok(mut cache) = self.weight_cache.lock() {
@@ -1297,6 +1664,8 @@ impl Drop for VulkanContext {
             self.device.destroy_pipeline(self.pipeline_q6k.pipeline, None);
             self.device.destroy_pipeline(self.pipeline_q8_0.pipeline, None);
             self.device
+                .destroy_pipeline(self.pipeline_softmax.pipeline, None);
+            self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
             self.device
                 .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
@@ -1306,6 +1675,8 @@ impl Drop for VulkanContext {
                 .destroy_shader_module(self.pipeline_q6k.shader, None);
             self.device
                 .destroy_shader_module(self.pipeline_q8_0.shader, None);
+            self.device
+                .destroy_shader_module(self.pipeline_softmax.shader, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
@@ -1461,6 +1832,34 @@ fn find_memory_type(
     Err(AppError::msg("no suitable Vulkan memory type"))
 }
 
+/// CPU Softmax over the last dimension (Candle-compatible f32).
+#[allow(dead_code)]
+pub fn softmax_last_dim_f32(rows: usize, cols: usize, x: &[f32]) -> Vec<f32> {
+    assert_eq!(x.len(), rows.saturating_mul(cols));
+    let mut y = vec![0f32; x.len()];
+    for r in 0..rows {
+        let base = r * cols;
+        let row = &x[base..base + cols];
+        let mut m = f32::NEG_INFINITY;
+        for &v in row {
+            if v > m {
+                m = v;
+            }
+        }
+        let mut sum = 0f32;
+        for j in 0..cols {
+            let e = (row[j] - m).exp();
+            y[base + j] = e;
+            sum += e;
+        }
+        let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+        for j in 0..cols {
+            y[base + j] *= inv;
+        }
+    }
+    y
+}
+
 #[cfg(test)]
 mod gpu_tests {
     use super::*;
@@ -1509,6 +1908,31 @@ mod gpu_tests {
             assert!(
                 (a - b).abs() < 1e-2,
                 "mismatch at {i}: cpu={a} gpu={b}"
+            );
+        }
+    }
+
+    #[test]
+    fn softmax_gpu_matches_cpu_when_vulkan_available() {
+        let Ok(ctx) = VulkanContext::new() else {
+            eprintln!("skip: no Vulkan device");
+            return;
+        };
+        let rows = 3usize;
+        let cols = 17usize;
+        let mut x = Vec::with_capacity(rows * cols);
+        for i in 0..(rows * cols) {
+            x.push((i as f32) * 0.1 - 1.5);
+        }
+        let cpu = softmax_last_dim_f32(rows, cols, &x);
+        let gpu = ctx
+            .softmax_last_dim_gpu(rows as u32, cols as u32, &x)
+            .expect("gpu softmax");
+        assert_eq!(cpu.len(), gpu.len());
+        for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "softmax mismatch at {i}: cpu={a} gpu={b}"
             );
         }
     }

@@ -106,13 +106,18 @@ pub struct ChatSession {
     tokenizer: Tokenizer,
     entry: ModelEntry,
     history: Vec<(String, String)>,
-    /// Hard cap per generate() call (first reply or `/more`).
+    /// Requested answer budget (`--max-tokens`); see [`Self::answer_token_budget`].
     max_tokens: usize,
     temperature: f64,
     extras: SessionExtras,
     knowledge_dir: Option<PathBuf>,
     pending_search: Option<crate::knowledge::SearchJobHandle>,
 }
+
+/// Floor so short / measurement-style `--max-tokens` still get a real reply.
+const ANSWER_TOKEN_FLOOR: usize = 2048;
+/// Hard safety ceiling for one assistant turn (until EOS or this many new tokens).
+const ANSWER_TOKEN_CEIL: usize = 8192;
 
 impl ChatSession {
     pub fn load_with_config(
@@ -174,12 +179,21 @@ impl ChatSession {
         extras.model_name = entry.name.clone();
         let knowledge_dir = extras.knowledge.as_ref().map(|k| k.dir().to_path_buf());
 
+        let max_tokens = max_tokens.max(1);
+        if max_tokens < ANSWER_TOKEN_FLOOR {
+            eprintln!(
+                "{} --max-tokens={max_tokens} raised to {ANSWER_TOKEN_FLOOR} \
+                 (complete-answer floor; end-of-turn ends the reply earlier)",
+                style("·").cyan()
+            );
+        }
+
         Ok(Self {
             backend,
             tokenizer,
             entry,
             history: Vec::new(),
-            max_tokens: max_tokens.max(1),
+            max_tokens,
             temperature: 0.7,
             extras,
             knowledge_dir,
@@ -300,10 +314,10 @@ impl ChatSession {
 
     pub fn run_repl(&mut self) -> Result<()> {
         println!(
-            "{} {} — `/bye` exit, `/clear` reset, `/more` continue last (+{} tokens)",
+            "{} {} — `/bye` exit, `/clear` reset, `/more` if a reply hit the {}-token ceiling",
             style(">>>").cyan().bold(),
             style(&self.entry.display).bold(),
-            self.max_tokens
+            self.answer_token_budget()
         );
 
         let rl = DefaultEditor::new().map_err(|e| AppError::msg(format!("readline init: {e}")))?;
@@ -459,19 +473,30 @@ impl ChatSession {
         Ok(body)
     }
 
-    /// Generate a new assistant reply for `user`. Returns (text, truncated_without_eos).
+    /// Effective new-token budget for one complete answer (until end-of-turn).
+    /// Floors tiny `--max-tokens` so measurement-style caps cannot truncate mid-reply.
+    fn answer_token_budget(&self) -> usize {
+        self.max_tokens
+            .max(ANSWER_TOKEN_FLOOR)
+            .min(ANSWER_TOKEN_CEIL)
+            .max(1)
+    }
+
+    /// Generate a new assistant reply for `user`. Continues until EOS or the answer budget.
+    /// Returns (text, hit_safety_ceiling_without_eos).
     fn generate_turn(&mut self, user: &str) -> Result<(String, bool)> {
         let enriched = self.enrich_user(user)?;
         let prompt = self.entry.format_prompt(&enriched, &self.history);
-        let outcome = self.stream_generate(&prompt, self.max_tokens)?;
-        let truncated = !outcome.hit_eos && outcome.tokens_generated >= self.max_tokens;
+        let budget = self.answer_token_budget();
+        let outcome = self.stream_generate(&prompt, budget)?;
+        let truncated = !outcome.hit_eos && outcome.tokens_generated >= budget;
         if truncated {
             self.print_truncated_hint();
         }
         Ok((outcome.text.trim().to_string(), truncated))
     }
 
-    /// Continue the last assistant turn (`/more`).
+    /// Continue the last assistant turn (`/more`) up to another full answer budget.
     fn generate_more(&mut self) -> Result<(String, bool)> {
         let Some((user, partial)) = self.history.last().cloned() else {
             return Ok((String::new(), false));
@@ -482,9 +507,10 @@ impl ChatSession {
         let prompt = self
             .entry
             .format_prompt_continue(&enriched, &prior, &partial);
-        let outcome = self.stream_generate(&prompt, self.max_tokens)?;
+        let budget = self.answer_token_budget();
+        let outcome = self.stream_generate(&prompt, budget)?;
         let piece = outcome.text;
-        let truncated = !outcome.hit_eos && outcome.tokens_generated >= self.max_tokens;
+        let truncated = !outcome.hit_eos && outcome.tokens_generated >= budget;
         if let Some(last) = self.history.last_mut() {
             last.1.push_str(&piece);
         }
@@ -498,8 +524,8 @@ impl ChatSession {
         println!(
             "{}",
             style(format!(
-                "(truncated — type /more for up to +{} tokens)",
-                self.max_tokens
+                "(reply reached the {}-token ceiling without end-of-turn — type /more to continue)",
+                self.answer_token_budget()
             ))
             .dim()
         );
@@ -509,9 +535,8 @@ impl ChatSession {
         self.backend.reset_state();
 
         let mut stdout = io::stdout();
-        // Prefill progress goes to stderr; `>>>` is printed with the first answer token.
         eprintln!(
-            "{} generating (prefill on stderr; answer below) …",
+            "{} generating (answer streams below; end-of-turn ends the reply) …",
             style("·").cyan()
         );
 
@@ -553,11 +578,18 @@ impl ChatSession {
             visible.push_str(&tail);
         }
 
+        // Close the answer line before stderr bench (otherwise TTY splices them).
         println!();
+        let _ = stdout.flush();
+        for line in &outcome.bench_lines {
+            eprintln!("{line}");
+        }
+
         Ok(GenerateOutcome {
             text: visible,
             hit_eos: outcome.hit_eos,
             tokens_generated: outcome.tokens_generated,
+            bench_lines: outcome.bench_lines,
         })
     }
 }

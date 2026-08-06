@@ -19,6 +19,39 @@ use candle_core::{Device, Module, Tensor};
 use crate::config::ComputeDevicePref;
 use crate::error::Result;
 
+#[cfg(feature = "vulkan")]
+#[allow(dead_code)]
+fn softmax_last_dim_cpu(rows: usize, cols: usize, x: &[f32]) -> Vec<f32> {
+    vulkan::softmax_last_dim_f32(rows, cols, x)
+}
+
+#[cfg(not(feature = "vulkan"))]
+fn softmax_last_dim_cpu(rows: usize, cols: usize, x: &[f32]) -> Vec<f32> {
+    assert_eq!(x.len(), rows.saturating_mul(cols));
+    let mut y = vec![0f32; x.len()];
+    for r in 0..rows {
+        let base = r * cols;
+        let row = &x[base..base + cols];
+        let mut m = f32::NEG_INFINITY;
+        for &v in row {
+            if v > m {
+                m = v;
+            }
+        }
+        let mut sum = 0f32;
+        for j in 0..cols {
+            let e = (row[j] - m).exp();
+            y[base + j] = e;
+            sum += e;
+        }
+        let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+        for j in 0..cols {
+            y[base + j] *= inv;
+        }
+    }
+    y
+}
+
 /// Shared compute context for inference engines.
 #[derive(Clone)]
 pub struct ComputeContext {
@@ -60,7 +93,12 @@ impl ComputeContext {
                     if ctx.gpu_gemv_worthwhile() {
                         eprintln!(
                             "compute: Vulkan Q4_K/Q6_K ready — fused submits; \
-                             MoE gate/up fused when VRAM-cached (Q8_0 downs → CPU)"
+                             MoE gate/up fused when VRAM-cached; Q8_0 fused downs {}",
+                            if ctx.gpu_q8_0_fused_worthwhile() {
+                                "enabled (≥4)"
+                            } else {
+                                "→ CPU"
+                            }
                         );
                     } else {
                         eprintln!(
@@ -190,6 +228,84 @@ impl ComputeContext {
         }
         let x = act.to_tensor()?;
         self.qmatmul_multi(ws, &x)
+    }
+
+    /// Fused GEMVs with CPU work overlapped while the GPU submit is in flight.
+    #[allow(dead_code)] // Phase 14 MoE / layer overlap
+    pub fn qmatmul_multi_overlap<R, F>(
+        &self,
+        ws: &[&QMatMul],
+        x: &Tensor,
+        between: F,
+    ) -> Result<(Vec<Tensor>, R)>
+    where
+        F: FnOnce() -> Result<R>,
+    {
+        if ws.is_empty() {
+            let r = between()?;
+            return Ok((Vec::new(), r));
+        }
+        #[cfg(feature = "vulkan")]
+        if let Some(ref vk) = self.vulkan {
+            if vk.should_try_gpu(x) {
+                match vk.qmatmul_multi_overlap(ws, x, between) {
+                    Ok(pair) => return Ok(pair),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if !msg.starts_with("vulkan-skip:") {
+                            eprintln!(
+                                "warning: Vulkan QMatMul(overlap) fell back unavailable ({e})"
+                            );
+                        }
+                        // `between` was consumed only if GPU path ran past submit; on
+                        // early skip it was dropped — fall through cannot recover it.
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        // No Vulkan (or GPU disabled): between then CPU matmul.
+        let r = between()?;
+        let mats = self.qmatmul_multi(ws, x)?;
+        Ok((mats, r))
+    }
+
+    /// Softmax over last dim: GPU when Vulkan available and the tensor is large
+    /// enough to amortize H2D/D2H; else CPU reference (Candle-equivalent f32).
+    /// Kept for fused attention graphs; decode Softmax currently uses Candle.
+    #[allow(dead_code)]
+    pub fn softmax_last_dim(&self, rows: u32, cols: u32, x: &[f32]) -> Result<Vec<f32>> {
+        let expect = (rows as usize).saturating_mul(cols as usize);
+        if x.len() != expect {
+            return Err(crate::error::AppError::msg(format!(
+                "softmax_last_dim: x len {} != rows*cols={expect}",
+                x.len()
+            )));
+        }
+        // Fence-bound for small Softmax (decode early KV); keep CPU.
+        const MIN_SOFTMAX_ELEMS: usize = 2048;
+        #[cfg(feature = "vulkan")]
+        if let Some(ref vk) = self.vulkan {
+            if vk.gpu_gemv_worthwhile() && expect >= MIN_SOFTMAX_ELEMS {
+                match vk.softmax_last_dim_gpu(rows, cols, x) {
+                    Ok(y) => return Ok(y),
+                    Err(e) => {
+                        eprintln!("warning: Vulkan Softmax fell back to CPU ({e})");
+                    }
+                }
+            }
+        }
+        Ok(softmax_last_dim_cpu(rows as usize, cols as usize, x))
+    }
+
+    /// True when ≥4 fused Q8_0 downs may use GPU on this device.
+    #[allow(dead_code)]
+    pub fn gpu_q8_0_fused_worthwhile(&self) -> bool {
+        #[cfg(feature = "vulkan")]
+        if let Some(ref vk) = self.vulkan {
+            return vk.gpu_q8_0_fused_worthwhile();
+        }
+        false
     }
 
     #[allow(dead_code)]

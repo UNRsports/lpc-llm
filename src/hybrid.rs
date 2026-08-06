@@ -86,9 +86,16 @@ impl Mlp {
     }
 
     fn warm_q4k(&self, compute: &ComputeContext) {
-        compute.warm_quant(&self.gate, true);
-        compute.warm_quant(&self.up, true);
-        compute.warm_quant(&self.down, true);
+        // Skip redundant uploads when already VRAM-resident (Phase 14.4).
+        if !compute.weight_cached(&self.gate) {
+            compute.warm_quant(&self.gate, true);
+        }
+        if !compute.weight_cached(&self.up) {
+            compute.warm_quant(&self.up, true);
+        }
+        if !compute.weight_cached(&self.down) {
+            compute.warm_quant(&self.down, true);
+        }
     }
 
     /// Upload expert weights to VRAM without pinning (LRU-evictable).
@@ -791,8 +798,8 @@ impl HybridEngine {
             2,
             2,
             &format!(
-                "prefill done in {prefill_s:.1}s ({:.2} tok/s) — generating up to {max_tokens} tokens \
-                 (expert cache {fill}/{cap} prefill hits={pre_hits}/misses={pre_miss})",
+                "prefill done in {prefill_s:.1}s ({:.2} tok/s) — decoding until end-of-turn \
+                 (budget {max_tokens} tokens; expert cache {fill}/{cap} prefill hits={pre_hits}/misses={pre_miss})",
                 prompt_tok as f64 / prefill_s.max(1e-6)
             ),
         );
@@ -826,17 +833,18 @@ impl HybridEngine {
         let decode_s = t_decode.elapsed().as_secs_f64();
         let (_, _, dec_hits, dec_miss) = self.expert_cache.snapshot();
         let decode_tps = tokens_generated as f64 / decode_s.max(1e-6);
-        eprintln!(
+        let mut bench_lines = vec![format!(
             "[bench] TTFT={prefill_s:.2}s  decode={tokens_generated} tok in {decode_s:.2}s \
              ({decode_tps:.2} tok/s)  expert decode hits={dec_hits}/misses={dec_miss}"
-        );
+        )];
         if let Some((submits, skips)) = self.compute.vulkan_stats() {
-            eprintln!("[bench] vulkan submits={submits} skips={skips}");
+            bench_lines.push(format!("[bench] vulkan submits={submits} skips={skips}"));
         }
         Ok(crate::engine::GenerateOutcome {
             text: generated,
             hit_eos,
             tokens_generated,
+            bench_lines,
         })
     }
 
@@ -1097,67 +1105,80 @@ impl HybridEngine {
             eps: layer.ffn_norm.eps,
         };
 
-        // Shared expert path — gate/up on GPU; defer down until experts run (parallel CPU).
+        // Shared gate/up on GPU overlapped with router CPU (Phase 14.2).
         let cur_mlp = ffn_norm.forward(attn_out)?;
-        let shared_pair = self
-            .compute
-            .qmatmul_multi(&[&shared.gate, &shared.up], &cur_mlp)?;
+        let mut cur_moe = match &pre_ffw_norm_2 {
+            Some(n) => n.forward(attn_out)?,
+            None => attn_out.clone(),
+        };
+        let (b_size, seq_len, hidden_dim) = attn_out.dims3()?;
+        let hints = self.expert_prefetch_hints.clone();
+        let rms_eps = self.map.rms_norm_eps as f32;
+        let device = self.device.clone();
+
+        let (shared_pair, (_routing_vec, top_x, selected_rws)) = std::thread::scope(
+            |scope| -> Result<(Vec<Tensor>, (Vec<Vec<f32>>, Vec<Vec<u32>>, Vec<Vec<f32>>))> {
+                let gate = &shared.gate;
+                let up = &shared.up;
+                let compute = &self.compute;
+                let gate_up_join = scope.spawn(move || -> Result<Vec<Tensor>> {
+                    compute.qmatmul_multi(&[gate, up], &cur_mlp)
+                });
+
+                // Router path (typically n=128 → Candle CPU) while shared gate/up runs.
+                let flat = attn_out.reshape(((), hidden_dim))?;
+                let ones = Tensor::ones(hidden_dim, DType::F32, &device)?;
+                let mut tmp = ops::rms_norm(&flat, &ones, rms_eps)?;
+                let scale = 1.0f64 / (hidden_dim as f64).sqrt();
+                tmp = (tmp * scale)?;
+                if let Some(rs) = &router_scale {
+                    tmp = tmp.broadcast_mul(rs)?;
+                }
+                let router_logits = self.compute.qmatmul(&router, &tmp)?;
+                let routing = ops::softmax_last_dim(&router_logits)?;
+                let routing_vec = routing.to_vec2::<f32>()?;
+
+                let n_expert = routing_vec.first().map(|r| r.len()).unwrap_or(0);
+                let mut top_x: Vec<Vec<u32>> = vec![Vec::new(); n_expert];
+                let mut selected_rws: Vec<Vec<f32>> = vec![Vec::new(); n_expert];
+                for (row_idx, rw) in routing_vec.iter().enumerate() {
+                    let mut dst: Vec<u32> = (0..rw.len() as u32).collect();
+                    dst.sort_by(|&i, &j| {
+                        let mut wi = rw[i as usize];
+                        let mut wj = rw[j as usize];
+                        if hints.contains(&(i as usize)) {
+                            wi *= 1.05;
+                        }
+                        if hints.contains(&(j as usize)) {
+                            wj *= 1.05;
+                        }
+                        wj.total_cmp(&wi)
+                    });
+                    let mut sum = 0f32;
+                    for &expert_idx in dst.iter().take(n_expert_used) {
+                        sum += rw[expert_idx as usize];
+                    }
+                    let norm = if sum > 0.0 { sum } else { 1.0 };
+                    for &expert_idx in dst.iter().take(n_expert_used) {
+                        let expert_idx = expert_idx as usize;
+                        top_x[expert_idx].push(row_idx as u32);
+                        selected_rws[expert_idx].push(rw[expert_idx] / norm);
+                    }
+                }
+
+                let shared_pair = gate_up_join
+                    .join()
+                    .map_err(|_| AppError::msg("shared gate/up panicked"))??;
+                Ok((shared_pair, (routing_vec, top_x, selected_rws)))
+            },
+        )?;
+
         let shared_lhs = if shared.use_gelu {
             shared_pair[0].gelu()?
         } else {
             candle_nn::ops::silu(&shared_pair[0])?
         };
         let shared_mid = (shared_lhs * &shared_pair[1])?;
-
-        // Routed experts path (norms + router). Router is typically n=128 → CPU via
-        // fence-bound tiny-GEMV skip, which frees the GPU for attn / gate work.
-        let mut cur_moe = match &pre_ffw_norm_2 {
-            Some(n) => n.forward(attn_out)?,
-            None => attn_out.clone(),
-        };
-
-        let (b_size, seq_len, hidden_dim) = attn_out.dims3()?;
-        let flat = attn_out.reshape(((), hidden_dim))?;
-        let ones = Tensor::ones(hidden_dim, DType::F32, &self.device)?;
-        let mut tmp = ops::rms_norm(&flat, &ones, self.map.rms_norm_eps as f32)?;
-        let scale = 1.0f64 / (hidden_dim as f64).sqrt();
-        tmp = (tmp * scale)?;
-        if let Some(rs) = &router_scale {
-            tmp = tmp.broadcast_mul(rs)?;
-        }
-        let router_logits = self.compute.qmatmul(&router, &tmp)?;
-        let routing = ops::softmax_last_dim(&router_logits)?;
-        let routing_vec = routing.to_vec2::<f32>()?;
-
-        let n_expert = routing_vec.first().map(|r| r.len()).unwrap_or(0);
-        let mut top_x: Vec<Vec<u32>> = vec![Vec::new(); n_expert];
-        let mut selected_rws: Vec<Vec<f32>> = vec![Vec::new(); n_expert];
-        let hints = self.expert_prefetch_hints.clone();
-
-        for (row_idx, rw) in routing_vec.iter().enumerate() {
-            let mut dst: Vec<u32> = (0..rw.len() as u32).collect();
-            dst.sort_by(|&i, &j| {
-                let mut wi = rw[i as usize];
-                let mut wj = rw[j as usize];
-                if hints.contains(&(i as usize)) {
-                    wi *= 1.05;
-                }
-                if hints.contains(&(j as usize)) {
-                    wj *= 1.05;
-                }
-                wj.total_cmp(&wi)
-            });
-            let mut sum = 0f32;
-            for &expert_idx in dst.iter().take(n_expert_used) {
-                sum += rw[expert_idx as usize];
-            }
-            let norm = if sum > 0.0 { sum } else { 1.0 };
-            for &expert_idx in dst.iter().take(n_expert_used) {
-                let expert_idx = expert_idx as usize;
-                top_x[expert_idx].push(row_idx as u32);
-                selected_rws[expert_idx].push(rw[expert_idx] / norm);
-            }
-        }
 
         let xs_flat = cur_moe.reshape(((), hidden_dim))?;
         let mut ys = xs_flat.zeros_like()?;
@@ -1180,7 +1201,14 @@ impl HybridEngine {
         )?;
 
         // Parallel critical path: shared Q8_0 down ∥ Top-K expert gate/up+downs.
+        // When Q8_0 fused microbench won, experts warm+GPU downs inside try_moe_jobs_fused_gpu.
         let down_w = shared.down.clone();
+        if self.compute.gpu_q8_0_fused_worthwhile() && jobs.len() >= 4 {
+            self.compute.warm_quant(&down_w, true);
+            for (_, mlp, _, _, _) in &jobs {
+                self.compute.warm_quant(&mlp.down, false);
+            }
+        }
         let (mut cur_mlp, outs) = std::thread::scope(|scope| -> Result<(Tensor, Vec<Tensor>)> {
             let shared_join = scope.spawn(|| -> Result<Tensor> {
                 Ok(down_w.forward(&shared_mid)?)
@@ -1618,6 +1646,8 @@ impl HybridEngine {
                 m.where_cond(&on_true, &att)?
             }
         };
+        // Softmax stays on Candle (f32). Standalone Softmax GPU + H2D/D2H is a net
+        // loss for decode attention; shader remains for future fused QKᵀ/AV graphs.
         let att = ops::softmax_last_dim(&att)?;
         let y = att.matmul(&v.contiguous()?)?;
         let y = y
@@ -1723,18 +1753,28 @@ fn choose_expert_cache_cap(
 }
 
 fn warm_layer_q4k(compute: &ComputeContext, layer: &LayerLive) {
-    compute.warm_q4k(&layer.wq);
-    compute.warm_q4k(&layer.wk);
-    if let Some(ref wv) = layer.wv {
-        compute.warm_q4k(wv);
+    if !compute.weight_cached(&layer.wq) {
+        compute.warm_q4k(&layer.wq);
     }
-    compute.warm_q4k(&layer.wo);
+    if !compute.weight_cached(&layer.wk) {
+        compute.warm_q4k(&layer.wk);
+    }
+    if let Some(ref wv) = layer.wv {
+        if !compute.weight_cached(wv) {
+            compute.warm_q4k(wv);
+        }
+    }
+    if !compute.weight_cached(&layer.wo) {
+        compute.warm_q4k(&layer.wo);
+    }
     match &layer.ff {
         FeedForward::Dense(mlp) => mlp.warm_q4k(compute),
         FeedForward::MoE {
             router, shared, ..
         } => {
-            compute.warm_q4k(router);
+            if !compute.weight_cached(router) {
+                compute.warm_q4k(router);
+            }
             if let Some(s) = shared {
                 s.warm_q4k(compute);
             }
@@ -1836,16 +1876,25 @@ fn try_moe_jobs_fused_gpu(
     let downs_gpu = jobs
         .iter()
         .all(|(_, mlp, _, _, _)| compute.weight_cached(&mlp.down));
-    if downs_gpu {
+    // Phase 14.3: fused Q8_0 downs when microbench won and ≥4 experts (warmed by caller).
+    if downs_gpu && n >= 4 {
         let down_pairs: Vec<(&QMatMul, &Tensor)> = jobs
             .iter()
             .zip(mids.iter())
             .map(|((_, mlp, _, _, _), mid)| (&mlp.down, mid))
             .collect();
-        return Ok(Some(compute.qmatmul_multi_xs(&down_pairs)?));
+        match compute.qmatmul_multi_xs(&down_pairs) {
+            Ok(outs) => return Ok(Some(outs)),
+            Err(e) => {
+                let msg = e.to_string();
+                if !msg.starts_with("vulkan-skip:") {
+                    eprintln!("warning: fused Q8_0 downs fell back to CPU ({e})");
+                }
+            }
+        }
     }
 
-    // Parallel CPU downs (Q8_0 on Gemma4 Q4_K_M).
+    // Parallel CPU downs (Q8_0 on Gemma4 Q4_K_M, or GPU path skipped).
     std::thread::scope(|scope| {
         let mut joins = Vec::with_capacity(n);
         for (i, (_, mlp, _, _, _)) in jobs.iter().enumerate() {

@@ -168,6 +168,7 @@ impl Engine {
             text: generated,
             hit_eos,
             tokens_generated,
+            bench_lines: Vec::new(),
         })
     }
 }
@@ -178,6 +179,8 @@ pub struct GenerateOutcome {
     pub text: String,
     pub hit_eos: bool,
     pub tokens_generated: usize,
+    /// Printed to stderr *after* the answer line is closed (avoids TTY splice).
+    pub bench_lines: Vec<String>,
 }
 
 fn prepare_logits(logits: Tensor) -> Result<Tensor> {

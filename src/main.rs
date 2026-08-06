@@ -76,8 +76,10 @@ enum Commands {
         /// Soft RAM budget for hot layers + 2 prefetch slots (MiB)
         #[arg(long, default_value_t = 4096)]
         ram_mib: usize,
-        /// Max new tokens per reply (and per `/more` continuation)
-        #[arg(long, default_value_t = 512)]
+        /// Max new tokens for one complete answer (until end-of-turn).
+        /// Tiny values are raised to a reply floor so measurement-style caps cannot
+        /// leave mid-sentence answers; hard ceiling is 8192.
+        #[arg(long, default_value_t = 2048)]
         max_tokens: usize,
         /// Deprecated (ignored). Use `--max-tokens` instead.
         #[arg(long)]
