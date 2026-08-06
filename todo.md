@@ -55,7 +55,6 @@ Last updated: 2026-08-06
 | Extension / Phase 12 | Gemma 4 **26B-A4B (MoE)** hybrid text run | **Done** (text hybrid verified; latency polish → Phase 13) |
 | Extension / Phase 13 | Decode throughput (MoE + Vulkan end-to-end) | **Done** (~2×; stretch ≥3× → Phase 14) |
 | Extension / Phase 14 | Accuracy-preserving decode speed (≥3× / stretch tok/s) | **In progress** (Softmax GPU · dual-scratch · conditional Q8_0 · MoE overlap) |
-| Extension / Phase 15 | Typing-time MoE speculative load (prefetch while composing) | **Planned** (warm cache only; no answer commit) |
 
 **Available now:**  
 `lpc-llm run <model> --adapter <name>` (Hybrid LoRA),  
@@ -76,7 +75,6 @@ On MoE GGUF: `experts.pack` + Top-K expert DMA + **RAM LRU expert cache** (hybri
 **Phase 12 (done):** Gemma 4 **26B-A4B MoE** (~25.2B / ~3.8B active); resident target ≤16 GiB.  
 **Phase 13 (done):** decode ~**1.8–2.4 tok/s** (~2–2.4× vs ~1 baseline) with DeviceAct, fused Top-K gate/up, shared∥expert, Gemma4 `>>>` UI.
 **Phase 14 (in progress):** accuracy-preserving speed — Softmax GPU (large last-dim), dual-scratch ping-pong, shared gate/up ∥ router CPU, conditional fused Q8_0 downs (≥4 + microbench); success ≥3× on warm turn 2+.
-**Phase 15 (planned):** while the user types, speculate which MoE experts (and hot weights) will be needed and **DMA/warm them into RAM/VRAM** before Enter — cache warmth only; final Top-K still owns correctness.
 
 ---
 
@@ -548,59 +546,6 @@ Phase 13 delivered **~2×** warm decode without changing GGUF quant or Top-K. Re
 - [ ] Regression: Gemma4 `>>>` UI + no bare `thought` leak
 - [x] Update this file + README bench blurb with Phase 14 path description
 
-### Phase 15: Typing-time MoE speculative load — **Planned**
-
-Overlap **user think-time** with MoE I/O: as the prompt is composed in the REPL, start loading likely experts (and optionally pinning related hot tensors) so Enter hits a warmer cache. Fits the hybrid theme (NVMe experts + RAM LRU + VRAM warm) and Phase 2/13 prefetch machinery.
-
-**Constraint (hard):** speculation may only **prefetch / materialize / `warm_*`**. It must **not** commit answer tokens or mutate the final forward numerics. Wrong guesses are OK — real Top-K at generate time remains the source of truth (same as today’s speculative expert prefetch from prior-token IDs).
-
-**Goal:** cut **first-turn TTFT** and turn-1 expert miss rate on MoE models (esp. `gemma4:26b-a4b`) without changing answers.  
-**Success (release, MoE hybrid):** with typing-prefetch enabled, cold first turn shows **lower TTFT** and/or **higher expert decode hits on turn 1** vs the same prompt pasted instantly (no compose time); logits/answers match the no-prefetch path on a fixed prompt.  
-**Stretch:** optional lightweight intent hint (keyword / last-turn Top-K / tiny classifier) that improves hit-rate without running the full main model.  
-**Out of success:** running full prefill/decode on every keystroke; draft tokens shown as final; quality-changing Top-K overrides.
-
-**Deps:** Phase 2 `experts.pack` + `PrefetchRing`; Phase 13 expert RAM LRU + `warm_expert_gpu`; REPL in `infer.rs` (`rustyline`). Phase 14 is independent (can land in parallel).
-
-#### 15.0 Design rules
-
-- [ ] Prefetch is best-effort and cancellable (new keystrokes supersede in-flight plans)
-- [ ] Budget: respect `--ram-mib` / expert LRU capacity; never evict hot attn pins for a guess
-- [ ] Default **on** for MoE+hybrid interactive REPL; flag to disable (e.g. `--no-typeahead-prefetch`)
-- [ ] No user-visible “thinking” side channel required; optional dim stderr counter is enough
-
-#### 15.1 Hint sources (accuracy-neutral)
-
-- [ ] Reuse **last-turn Top-K expert IDs** per layer (`last_experts`) as the primary prior
-- [ ] Debounced partial buffer (e.g. idle 150–300 ms or every N chars) → expand candidate set
-- [ ] Optional: cheap keyword / script hints (code vs chat) mapped to affinity like `--agent` boosts — **hints only**, not hard routing
-- [ ] Optional later: ultra-light classifier (reuse Phase 3 SmolLM2 only if RAM exclusivity allows; else skip)
-
-#### 15.2 Load path
-
-- [ ] Map hint IDs → `start_dma_expert` / ring slots without blocking the readline thread (worker or async)
-- [ ] On RAM hit: skip DMA; optional `warm_expert_gpu` if Vulkan and not cached
-- [ ] On Enter: cancel obsolete prefetches; `generate` uses existing cache (no special numerics path)
-- [ ] Coalesce duplicate layer/expert requests; cap outstanding DMA
-
-#### 15.3 REPL wiring
-
-- [ ] Hook compose path in `infer.rs` (rustyline); debounce; pass partial text + history to hybrid engine
-- [ ] Ensure Ctrl-C / `/bye` / `/clear` abort prefetch cleanly
-- [ ] Document that pasted one-shot prompts gain little (no compose window)
-
-#### 15.4 Out of scope
-
-- Committing streamed draft answers while still typing
-- Changing router Top-K results based on typeahead (affinity boost ≤ existing agent-style soft weights only)
-- Dense non-MoE models (optional no-op)
-
-#### 15.5 Verification
-
-- [ ] A/B: type slowly vs instant paste — TTFT / turn-1 expert misses improve when typeahead had time to run
-- [ ] Fixed prompt: answers / logits match `--no-typeahead-prefetch`
-- [ ] No RSS blow-up beyond `--ram-mib` accounting; LRU still evicts guesses under pressure
-- [ ] Update README + this file with ops tip
-
 ---
 
 ## 4. Spec section status
@@ -655,7 +600,6 @@ Overlap **user think-time** with MoE I/O: as the prompt is composed in the REPL,
 | Gemma 4 26B-A4B MoE hybrid text run | **Done** (Phase 12; text verified) |
 | Decode throughput (MoE + Vulkan fuse / MoE I/O) | **Done** (Phase 13; ~2×; ≥3× → Phase 14) |
 | Accuracy-preserving decode speed (≥3×) | **In progress** (Phase 14; Softmax GPU · dual-scratch · conditional Q8_0) |
-| Typing-time MoE speculative load | **Planned** (Phase 15; prefetch/warm while composing; no answer commit) |
 | ΔW merge at CQE (weight rewrite) | Not adopted (side-path policy) |
 
 ---
@@ -663,13 +607,12 @@ Overlap **user think-time** with MoE I/O: as the prompt is composed in the REPL,
 ## 5. Recommended next steps
 
 1. **Phase 14 (in progress)** — finish host warm turn-2 ≥3× bench; optional logits A/B; layer i∥i+1 QKV pipeline stretch
-2. **Phase 15 (planned)** — typing-time MoE prefetch/warm (compose-window I/O overlap; correctness unchanged)
-3. **Phase 13 wrap** — RSS / vs `gemma3:27b` write-up (13.1 absorbed into 14.4 docs)
-4. **Phase 6 follow-ups** — Wire real cluster launchers / CUDA backends into `job.remote` and `$LPC_LLM_CONVERT_CMD`
-5. **(Optional)** Pathfinder MoE catalog `qwen3:30b-a3b`
-6. **(Optional)** In-process adapter hot-reload / mid-chat hot-swap (Phase 1 + 7.3 leftovers)
-7. **(Optional)** Packaging that ships `/etc/lpc-llm/config_lpcllm` with `install.mode = "system"`
-8. **(Optional)** project-map 16GB-class regression bench / inotify delta watch; Gemma vision
+2. **Phase 13 wrap** — RSS / vs `gemma3:27b` write-up (13.1 absorbed into 14.4 docs)
+3. **Phase 6 follow-ups** — Wire real cluster launchers / CUDA backends into `job.remote` and `$LPC_LLM_CONVERT_CMD`
+4. **(Optional)** Pathfinder MoE catalog `qwen3:30b-a3b`
+5. **(Optional)** In-process adapter hot-reload / mid-chat hot-swap (Phase 1 + 7.3 leftovers)
+6. **(Optional)** Packaging that ships `/etc/lpc-llm/config_lpcllm` with `install.mode = "system"`
+7. **(Optional)** project-map 16GB-class regression bench / inotify delta watch; Gemma vision
 
 ---
 
@@ -720,7 +663,6 @@ Overlap **user think-time** with MoE I/O: as the prompt is composed in the REPL,
 | 拡張 / Phase 12 | Gemma 4 **26B-A4B（MoE）** hybrid テキスト実行 | **完了**（テキスト hybrid 検証済；レイテンシ磨き → Phase 13） |
 | 拡張 / Phase 13 | デコードスループット（MoE + Vulkan 端到端） | **完了**（~2×；≥3× → Phase 14） |
 | 拡張 / Phase 14 | 精度維持のままデコード高速化（≥3× / ストレッチ tok/s） | **進行中**（Softmax GPU · dual-scratch · 条件付き Q8_0 · MoE 重ね） |
-| 拡張 / Phase 15 | 入力中 MoE 投機ロード（タイピング中 prefetch） | **計画**（キャッシュ暖機のみ；回答は確定しない） |
 
 **いま使えるもの:**  
 `lpc-llm run <model> --adapter <name>`（Hybrid LoRA）、  
@@ -741,7 +683,6 @@ MoE GGUF では `experts.pack` + Top-K Expert DMA + **Expert RAM LRU キャッ�
 **Phase 12（完了）:** Gemma 4 **26B-A4B MoE**（総量 ~25.2B / 活性 ~3.8B）；常駐目標 ≤16 GiB。  
 **Phase 13（完了）:** DeviceAct + Top-K gate/up 融合 + shared∥expert 並列 + attn QKV DeviceAct + Gemma4 thought 抑制（`>>>` 回答）。ホスト **~1.8–2.4 tok/s**（≈2–2.4×）。
 **Phase 14（進行中）:** 精度維持の高速化 — Softmax GPU（大きな last-dim）、dual-scratch ping-pong、shared gate/up ∥ router CPU、条件付き融合 Q8_0 down；成功条件は暖機後 2 通目で ≥3×。
-**Phase 15（計画）:** ユーザーが入力している間に、使いそうな MoE Expert（と必要ならホット重み）を **RAM/VRAM へ DMA/warm** 開始 — キャッシュ暖機のみ。正しさは最終 Top-K が担保。
 
 ---
 
@@ -1211,59 +1152,6 @@ Phase 13 で量子化・Top-K を変えずに暖機後 **~2×** を得た。残�
 - [ ] 回帰: Gemma4 `>>>` UI + 裸の `thought` リークなし
 - [x] 本ファイル + README bench に Phase 14 経路を追記
 
-### Phase 15: 入力中 MoE 投機ロード — **計画**
-
-ユーザーの **考える時間** と MoE I/O を重ねる。REPL でプロンプトを打っているあいだに、当たりそうな Expert（必要なら関連ホットテンソル）のロードを始め、Enter 時点でキャッシュを暖かくする。hybrid テーマ（NVMe experts + RAM LRU + VRAM warm）および Phase 2/13 の prefetch 基盤と整合する。
-
-**制約（厳守）:** 投機がやってよいのは **prefetch / materialize / `warm_*` のみ**。回答トークンの確定や最終 forward の数値改変は禁止。外れ当ては許容 — 生成時の本物の Top-K が正しさのソース（現状の直前トークン Expert 投機 prefetch と同型）。
-
-**目標:** MoE（特に `gemma4:26b-a4b`）の **1 通目 TTFT** と turn-1 expert miss を、回答を変えずに下げる。  
-**成功条件（release、MoE hybrid）:** typeahead prefetch 有効時、同じプロンプトを「ゆっくり入力」した方が「即貼り付け」より **TTFT が短い**および／または **turn-1 expert hits が高い**；固定プロンプトで回答 / logits は prefetch 無しと一致。  
-**ストレッチ:** キーワード / 前ターン Top-K / 超軽量分類などのヒントで hit 率を上げる（メインモデルの本番推論は走らせない）。  
-**成功条件外:** キー入力ごとにフル prefill/decode；ドラフトを最終回答として表示；品質を変える Top-K 上書き。
-
-**依存:** Phase 2 `experts.pack` + `PrefetchRing`；Phase 13 Expert RAM LRU + `warm_expert_gpu`；`infer.rs` の rustyline REPL。Phase 14 とは独立（並行可）。
-
-#### 15.0 設計ルール
-
-- [ ] Prefetch はベストエフォートでキャンセル可能（新しいキー入力が進行中プランを無効化）
-- [ ] 予算: `--ram-mib` / Expert LRU 容量を尊重；推測のためにホット attn pin を追い出さない
-- [ ] MoE+hybrid 対話 REPL では既定 **オン**；無効化フラグ（例: `--no-typeahead-prefetch`）
-- [ ] ユーザー向け thought 表示は不要；任意で stderr にカウンタ程度
-
-#### 15.1 ヒント源（精度非依存）
-
-- [ ] 主ヒント: 層ごとの **前ターン Top-K Expert ID**（`last_experts`）
-- [ ] デバウンスした部分バッファ（例: アイドル 150–300 ms、または N 文字ごと）で候補を拡大
-- [ ] （任意）安価なキーワード / 用途ヒント（コード vs 雑談）→ `--agent` 風の soft affinity（**ヒントのみ**、ハード routing 禁止）
-- [ ] （任意・後）超軽量分類器（Phase 3 SmolLM2 は RAM 排他が許すときのみ；さもなくばスキップ）
-
-#### 15.2 ロード経路
-
-- [ ] ヒント ID → `start_dma_expert` / ring。readline スレッドを塞がない（worker / async）
-- [ ] RAM ヒット時は DMA スキップ；Vulkan なら未キャッシュ時のみ `warm_expert_gpu`
-- [ ] Enter 時: 古い prefetch をキャンセル；`generate` は既存キャッシュを使うだけ（数値経路は変更なし）
-- [ ] 同一 layer/expert 要求を合流；同時 DMA 数に上限
-
-#### 15.3 REPL 配線
-
-- [ ] `infer.rs`（rustyline）の入力中フック；デバウンス；部分文 + 履歴を hybrid へ
-- [ ] Ctrl-C / `/bye` / `/clear` で prefetch を干净に中断
-- [ ] 貼り付け一発のプロンプトは compose 窓が無く利得が小さいことを文書化
-
-#### 15.4 範囲外
-
-- 入力中にドラフト回答を確定表示すること
-- typeahead でルーター Top-K 結果そのものを変えること（affinity は既存 agent 級の soft まで）
-- 非 MoE dense（no-op でよい）
-
-#### 15.5 検証
-
-- [ ] A/B: ゆっくり入力 vs 即貼り付け — typeahead が走った側で TTFT / turn-1 miss が改善
-- [ ] 固定プロンプト: `--no-typeahead-prefetch` と回答 / logits 一致
-- [ ] `--ram-mib` 会計を超える RSS 膨張なし；圧力下で LRU が推測分を追い出せる
-- [ ] README + 本ファイルに運用メモを追記
-
 ---
 
 ## 4. 仕様書セクション別の対応状況
@@ -1318,7 +1206,6 @@ Phase 13 で量子化・Top-K を変えずに暖機後 **~2×** を得た。残�
 | Gemma 4 26B-A4B MoE hybrid テキスト実行 | **完了**（Phase 12；テキスト検証済） |
 | デコードスループット（MoE + Vulkan fuse / MoE I/O） | **完了**（Phase 13；~2×；≥3× → Phase 14） |
 | 精度維持のデコード高速化（≥3×） | **進行中**（Phase 14；Softmax GPU · dual-scratch · 条件付き Q8_0） |
-| 入力中 MoE 投機ロード | **計画**（Phase 15；入力中 prefetch/warm；回答は確定しない） |
 | CQE 時の ΔW マージ（重み書き換え） | 採用せず（サイドパス方針） |
 
 ---
@@ -1326,13 +1213,12 @@ Phase 13 で量子化・Top-K を変えずに暖機後 **~2×** を得た。残�
 ## 5. 推奨する次工程
 
 1. **Phase 14（進行中）** — ホスト暖機 2 通目 ≥3× 計測；任意 logits A/B；層 i∥i+1 QKV パイプライン（ストレッチ）
-2. **Phase 15（計画）** — 入力中 MoE prefetch/warm（compose 時間と I/O を重ねる；正しさは不変）
-3. **Phase 13 締め** — RSS / vs `gemma3:27b`（13.1 は 14.4 文書に吸収）
-4. **Phase 6 フォロー** — `job.remote` / `$LPC_LLM_CONVERT_CMD` に実クラスタ・CUDA 変換を接続
-5. **（任意）** 経路探査カタログ `qwen3:30b-a3b`
-6. **（任意）** プロセス内アダプタホットリロード / 会話途中ホットスワップ（Phase 1 + 7.3 残り）
-7. **（任意）** `install.mode = "system"` の `/etc/lpc-llm/config_lpcllm` を同梱するパッケージ化
-8. **（任意）** project-map 16GB 級回帰ベンチ / inotify 差分監視；Gemma vision
+2. **Phase 13 締め** — RSS / vs `gemma3:27b`（13.1 は 14.4 文書に吸収）
+3. **Phase 6 フォロー** — `job.remote` / `$LPC_LLM_CONVERT_CMD` に実クラスタ・CUDA 変換を接続
+4. **（任意）** 経路探査カタログ `qwen3:30b-a3b`
+5. **（任意）** プロセス内アダプタホットリロード / 会話途中ホットスワップ（Phase 1 + 7.3 残り）
+6. **（任意）** `install.mode = "system"` の `/etc/lpc-llm/config_lpcllm` を同梱するパッケージ化
+7. **（任意）** project-map 16GB 級回帰ベンチ / inotify 差分監視；Gemma vision
 
 ---
 
