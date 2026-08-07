@@ -290,37 +290,34 @@ fn resolve_run_model(
 }
 
 fn select_model_name(store: &LocalStore) -> Result<String> {
-    let catalog = catalog::catalog();
+    let loc = crate::i18n::Locale::load();
     let installed = store.list_installed()?;
-    let installed_set: std::collections::HashSet<_> =
-        installed.iter().map(|m| m.name.clone()).collect();
 
-    let mut labels: Vec<String> = catalog
-        .iter()
-        .map(|e| {
-            let tag = if installed_set.contains(&e.name) {
-                "local"
-            } else {
-                "pull"
-            };
-            format!("{:<16} [{tag}]  {} ({})", e.name, e.display, e.approx_size)
-        })
-        .collect();
-    let mut names: Vec<String> = catalog.iter().map(|e| e.name.clone()).collect();
+    if installed.is_empty() {
+        return Err(AppError::msg(loc.t("run.no_local")));
+    }
+
+    let mut labels: Vec<String> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
 
     for m in &installed {
-        if catalog::find(&m.name).is_some() {
-            continue;
+        if let Some(e) = catalog::find(&m.name) {
+            labels.push(format!(
+                "{:<16} [local]  {} ({})",
+                e.name, e.display, e.approx_size
+            ));
+        } else {
+            labels.push(format!(
+                "{:<16} [local]  {}",
+                m.name,
+                loc.t("list.custom_desc")
+            ));
         }
-        labels.push(format!(
-            "{:<16} [local]  trained/imported",
-            m.name
-        ));
         names.push(m.name.clone());
     }
 
     let idx = Select::new()
-        .with_prompt("Select a model to run")
+        .with_prompt(loc.t("run.select"))
         .items(&labels)
         .default(0)
         .interact()

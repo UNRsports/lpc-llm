@@ -51,8 +51,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// List catalog models and local install status
-    List,
+    /// List installed models (use `--all` for full catalog)
+    List {
+        /// Include catalog entries that are not installed locally
+        #[arg(long)]
+        all: bool,
+    },
 
     /// Download a model from the catalog (Hugging Face)
     Pull {
@@ -161,9 +165,21 @@ enum Commands {
         pull: bool,
     },
 
-    /// Remove a model from the local registry (downloaded blobs kept)
+    /// Remove a model from the local registry (use `--purge` to free disk)
     Rm {
         name: String,
+        /// Delete durable blobs + pack cache (full uninstall)
+        #[arg(long)]
+        purge: bool,
+        /// Delete pack cache only (blobs and registry kept)
+        #[arg(long)]
+        cache: bool,
+        /// With `--purge`, also delete LoRA adapters for this base model
+        #[arg(long)]
+        with_adapters: bool,
+        /// Skip confirmation for `--purge` / `--cache`
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 
     /// Show catalog + local metadata for a model
@@ -447,10 +463,20 @@ enum JobCmd {
 }
 
 fn main() -> ExitCode {
+    let argv: Vec<String> = std::env::args().collect();
+    match i18n::try_print_command_help(&argv) {
+        Ok(true) => return ExitCode::SUCCESS,
+        Ok(false) => {}
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
     let cli = Cli::parse();
     let result = match cli.command {
         None => commands::cmd_menu(),
-        Some(Commands::List) => commands::cmd_list(),
+        Some(Commands::List { all }) => commands::cmd_list(all),
         Some(Commands::Pull { name }) => commands::cmd_pull(&name),
         Some(Commands::Run {
             name,
@@ -674,7 +700,19 @@ fn main() -> ExitCode {
             ConfigCmd::Example => commands::cmd_config_example(),
         },
         Some(Commands::Prefetch { name, pull }) => commands::cmd_prefetch(&name, pull),
-        Some(Commands::Rm { name }) => commands::cmd_rm(&name),
+        Some(Commands::Rm {
+            name,
+            purge,
+            cache,
+            with_adapters,
+            yes,
+        }) => commands::cmd_rm(commands::rm::RmOpts {
+            name,
+            purge,
+            cache_only: cache,
+            with_adapters,
+            yes,
+        }),
         Some(Commands::Show { name }) => commands::cmd_show(&name),
         Some(Commands::Io(args)) => commands::io_demo::run(args),
     };

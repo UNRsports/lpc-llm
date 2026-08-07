@@ -48,6 +48,27 @@ pub struct InstalledAdapter {
     pub recorded_at_unix: u64,
 }
 
+/// Result of wiping pack cache or reporting deleted paths.
+#[derive(Debug, Default, Clone)]
+pub struct WipeReport {
+    pub bytes_freed: u64,
+    pub paths: Vec<PathBuf>,
+}
+
+/// Result of a full model purge (blobs + cache + optional adapters).
+#[derive(Debug, Default, Clone)]
+pub struct PurgeReport {
+    pub name: String,
+    pub registry_removed: bool,
+    pub bytes_freed: u64,
+    pub blob_paths: Vec<PathBuf>,
+    pub cache_paths: Vec<PathBuf>,
+    pub adapter_paths: Vec<PathBuf>,
+    pub adapters_removed: Vec<String>,
+    /// Blob paths kept because another model still references them.
+    pub skipped_shared: Vec<PathBuf>,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Manifest {
     models: BTreeMap<String, InstalledModel>,
@@ -141,13 +162,16 @@ impl LocalStore {
         self.adapter_path("user_profile")
     }
 
+    /// All engine pack versions for one catalog model: `cache/packs/<safe_name>/`.
+    pub fn pack_cache_model_dir(&self, model_name: &str) -> PathBuf {
+        let safe = model_name.replace([':', '/'], "_");
+        self.cache_dir().join("packs").join(safe)
+    }
+
     /// Pack cache for one catalog model, versioned by engine so layout can change
     /// without touching the GGUF.
     pub fn pack_cache_dir(&self, model_name: &str) -> PathBuf {
-        let safe = model_name.replace([':', '/'], "_");
-        self.cache_dir()
-            .join("packs")
-            .join(safe)
+        self.pack_cache_model_dir(model_name)
             .join(env!("CARGO_PKG_VERSION"))
     }
 
@@ -198,6 +222,7 @@ impl LocalStore {
     }
 
     /// Remove from the soft registry only. **Blobs are never deleted** (model module).
+    /// Prefer [`Self::purge_model`] when freeing disk is required.
     pub fn remove(&self, name: &str) -> Result<bool> {
         let mut m = self.load()?;
         let removed = m.models.remove(name).is_some();
@@ -205,6 +230,130 @@ impl LocalStore {
             self.save(&m)?;
         }
         Ok(removed)
+    }
+
+    /// Wipe regenerable pack cache for one model (`cache/packs/<safe>/`, all engine versions).
+    /// Does not touch blobs or the registry.
+    pub fn wipe_pack_cache(&self, name: &str) -> Result<WipeReport> {
+        let dir = self.pack_cache_model_dir(name);
+        let mut report = WipeReport::default();
+        if dir.exists() {
+            let bytes = dir_size(&dir)?;
+            fs::remove_dir_all(&dir)?;
+            report.bytes_freed = bytes;
+            report.paths.push(dir);
+        }
+        Ok(report)
+    }
+
+    /// Delete durable blobs + pack cache for `name`, then drop the soft registry entry.
+    ///
+    /// Shared blob / tokenizer paths used by other installed models are skipped.
+    /// When `with_adapters` is true, also removes LoRA adapters whose `base_model` matches.
+    pub fn purge_model(&self, name: &str, with_adapters: bool) -> Result<PurgeReport> {
+        let installed = self.resolve_name(name)?;
+        let mut report = PurgeReport {
+            name: name.to_string(),
+            ..PurgeReport::default()
+        };
+
+        let cache = self.wipe_pack_cache(name)?;
+        report.bytes_freed += cache.bytes_freed;
+        report.cache_paths = cache.paths;
+
+        if let Some(ref m) = installed {
+            let model_path = m.model_path.clone();
+            let tokenizer_path = m.tokenizer_path.clone();
+
+            if !self.path_used_by_other_models(name, &model_path)? {
+                report.bytes_freed += remove_file_and_empty_parents(&model_path, &self.blobs_dir())?;
+                report.blob_paths.push(model_path.clone());
+                // Incomplete downloads: `foo.gguf` → `foo.part` (see pull.rs).
+                let part = model_path.with_extension("part");
+                if part.exists() {
+                    report.bytes_freed +=
+                        remove_file_and_empty_parents(&part, &self.blobs_dir())?;
+                    report.blob_paths.push(part);
+                }
+                if let Some(parent) = model_path.parent() {
+                    try_remove_empty_dir_chain(parent, &self.blobs_dir())?;
+                }
+            } else {
+                report.skipped_shared.push(model_path);
+            }
+
+            if tokenizer_path != m.model_path {
+                if !self.path_used_by_other_models(name, &tokenizer_path)? {
+                    report.bytes_freed +=
+                        remove_file_and_empty_parents(&tokenizer_path, &self.blobs_dir())?;
+                    report.blob_paths.push(tokenizer_path.clone());
+                    if let Some(parent) = tokenizer_path.parent() {
+                        try_remove_empty_dir_chain(parent, &self.blobs_dir())?;
+                    }
+                } else {
+                    report.skipped_shared.push(tokenizer_path);
+                }
+            }
+        }
+
+        if with_adapters {
+            let adapters = self.adapters_for_base(name)?;
+            for a in adapters {
+                let dir = a.path.clone();
+                if dir.exists() {
+                    report.bytes_freed += dir_size(&dir)?;
+                    fs::remove_dir_all(&dir)?;
+                    report.adapter_paths.push(dir);
+                }
+                let _ = self.remove_adapter(&a.name)?;
+                report.adapters_removed.push(a.name);
+            }
+        }
+
+        report.registry_removed = self.remove(name)?;
+        Ok(report)
+    }
+
+    /// Soft-registry adapters whose `base_model` equals `base` (exact catalog name).
+    pub fn adapters_for_base(&self, base: &str) -> Result<Vec<InstalledAdapter>> {
+        let m = self.load()?;
+        Ok(m.adapters
+            .into_values()
+            .filter(|a| a.base_model == base)
+            .collect())
+    }
+
+    /// True if another installed (or discoverable catalog) model uses `path`
+    /// as its GGUF or tokenizer file.
+    fn path_used_by_other_models(&self, exclude_name: &str, path: &Path) -> Result<bool> {
+        let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        for m in self.list_installed()? {
+            if m.name == exclude_name {
+                continue;
+            }
+            let mp = fs::canonicalize(&m.model_path).unwrap_or_else(|_| m.model_path.clone());
+            let tp =
+                fs::canonicalize(&m.tokenizer_path).unwrap_or_else(|_| m.tokenizer_path.clone());
+            if mp == path || tp == path {
+                return Ok(true);
+            }
+        }
+        // Catalog entries not yet in the soft index but with durable blobs on disk.
+        for entry in catalog::catalog() {
+            if entry.name == exclude_name {
+                continue;
+            }
+            if let Some(found) = self.discover(&entry)? {
+                let mp =
+                    fs::canonicalize(&found.model_path).unwrap_or_else(|_| found.model_path.clone());
+                let tp = fs::canonicalize(&found.tokenizer_path)
+                    .unwrap_or_else(|_| found.tokenizer_path.clone());
+                if mp == path || tp == path {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Resolve a catalog entry: valid manifest → discover blobs → `None`.
@@ -293,7 +442,6 @@ impl LocalStore {
         self.save(&m)
     }
 
-    #[allow(dead_code)]
     pub fn remove_adapter(&self, name: &str) -> Result<bool> {
         let mut m = self.load()?;
         let removed = m.adapters.remove(name).is_some();
@@ -396,10 +544,218 @@ fn file_nonempty(path: &Path) -> Result<bool> {
     Ok(path.metadata()?.len() > 0)
 }
 
+fn file_size(path: &Path) -> u64 {
+    path.metadata().map(|m| m.len()).unwrap_or(0)
+}
+
+fn dir_size(path: &Path) -> Result<u64> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    if path.is_file() {
+        return Ok(file_size(path));
+    }
+    let mut total = 0u64;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let p = entry.path();
+        if p.is_dir() {
+            total = total.saturating_add(dir_size(&p)?);
+        } else {
+            total = total.saturating_add(file_size(&p));
+        }
+    }
+    Ok(total)
+}
+
+/// Remove a file and return its size. Empty-parent cleanup is separate.
+fn remove_file_and_empty_parents(path: &Path, stop_at: &Path) -> Result<u64> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let bytes = file_size(path);
+    if path.is_dir() {
+        let bytes = dir_size(path)?;
+        fs::remove_dir_all(path)?;
+        return Ok(bytes);
+    }
+    fs::remove_file(path)?;
+    if let Some(parent) = path.parent() {
+        try_remove_empty_dir_chain(parent, stop_at)?;
+    }
+    Ok(bytes)
+}
+
+/// Remove empty directories from `start` up to (but not including) `stop_at`.
+fn try_remove_empty_dir_chain(start: &Path, stop_at: &Path) -> Result<()> {
+    let stop = fs::canonicalize(stop_at).unwrap_or_else(|_| stop_at.to_path_buf());
+    let mut cur = start.to_path_buf();
+    loop {
+        let cur_canon = fs::canonicalize(&cur).unwrap_or_else(|_| cur.clone());
+        if cur_canon == stop || !cur_canon.starts_with(&stop) {
+            break;
+        }
+        match fs::remove_dir(&cur) {
+            Ok(()) => {
+                if let Some(parent) = cur.parent() {
+                    cur = parent.to_path_buf();
+                } else {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    Ok(())
+}
+
 pub fn now_unix() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+pub fn format_bytes(n: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let f = n as f64;
+    if f >= GIB {
+        format!("{:.2} GiB", f / GIB)
+    } else if f >= MIB {
+        format!("{:.1} MiB", f / MIB)
+    } else if f >= KIB {
+        format!("{:.0} KiB", f / KIB)
+    } else {
+        format!("{n} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AppConfig, ComputeDevicePref, InstallMode, UiLanguage};
+
+    fn temp_store() -> (PathBuf, LocalStore) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "lpc-llm-purge-test-{}-{}-{}",
+            std::process::id(),
+            now_unix(),
+            seq
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("temp root");
+        let cfg = AppConfig {
+            data_dir: root.clone(),
+            train_dir: root.join("train"),
+            bin_dir: root.join("bin"),
+            install_mode: InstallMode::User,
+            ui_language: UiLanguage::En,
+            compute_device: ComputeDevicePref::Auto,
+            runtime_device_configured: false,
+            loaded_from: Vec::new(),
+        };
+        let store = LocalStore::open_with(&cfg).expect("open store");
+        (root, store)
+    }
+
+    fn write_dummy_model(store: &LocalStore, name: &str) -> InstalledModel {
+        let entry = catalog::find(name).expect("catalog");
+        let model_path = store.blob_path(&entry.hf_repo, &entry.gguf_file);
+        let tokenizer_path = store.blob_path(&entry.tokenizer_repo, "tokenizer.json");
+        if let Some(p) = model_path.parent() {
+            fs::create_dir_all(p).unwrap();
+        }
+        if let Some(p) = tokenizer_path.parent() {
+            fs::create_dir_all(p).unwrap();
+        }
+        fs::write(&model_path, b"gguf-bytes").unwrap();
+        fs::write(&tokenizer_path, b"{}").unwrap();
+        let pack = store.pack_cache_dir(name);
+        fs::create_dir_all(&pack).unwrap();
+        fs::write(pack.join("layers.pack"), b"pack").unwrap();
+        let installed = InstalledModel {
+            name: name.to_string(),
+            model_path,
+            tokenizer_repo: entry.tokenizer_repo.clone(),
+            tokenizer_path,
+            hf_repo: entry.hf_repo.clone(),
+            gguf_file: entry.gguf_file.clone(),
+            pulled_at_unix: now_unix(),
+        };
+        store.record(installed.clone()).unwrap();
+        installed
+    }
+
+    #[test]
+    fn soft_remove_keeps_blobs_and_cache() {
+        let (root, store) = temp_store();
+        let m = write_dummy_model(&store, "smollm2:360m");
+        assert!(store.remove("smollm2:360m").unwrap());
+        assert!(m.model_path.exists());
+        assert!(store.pack_cache_dir("smollm2:360m").join("layers.pack").exists());
+        // reconcile will re-register from leftover blobs
+        let n = store.reconcile().unwrap();
+        assert!(n >= 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn wipe_pack_cache_only() {
+        let (root, store) = temp_store();
+        let m = write_dummy_model(&store, "smollm2:360m");
+        let report = store.wipe_pack_cache("smollm2:360m").unwrap();
+        assert!(report.bytes_freed > 0);
+        assert!(!store.pack_cache_model_dir("smollm2:360m").exists());
+        assert!(m.model_path.exists());
+        assert!(store.is_installed("smollm2:360m").unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn purge_removes_blobs_cache_and_registry() {
+        let (root, store) = temp_store();
+        let m = write_dummy_model(&store, "smollm2:360m");
+        let report = store.purge_model("smollm2:360m", false).unwrap();
+        assert!(report.bytes_freed > 0);
+        assert!(!m.model_path.exists());
+        assert!(!m.tokenizer_path.exists());
+        assert!(!store.pack_cache_model_dir("smollm2:360m").exists());
+        assert!(!store.is_installed("smollm2:360m").unwrap());
+        assert_eq!(store.reconcile().unwrap(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn purge_with_adapters_removes_matching_lora() {
+        let (root, store) = temp_store();
+        let _ = write_dummy_model(&store, "smollm2:360m");
+        let adapter_dir = store.adapter_path("demo-lora");
+        fs::create_dir_all(&adapter_dir).unwrap();
+        fs::write(
+            adapter_dir.join("adapter.json"),
+            r#"{"name":"demo-lora","base_model":"smollm2:360m","rank":8,"alpha":16.0,"layers":[]}"#,
+        )
+        .unwrap();
+        fs::write(adapter_dir.join("weights.bin"), b"ab").unwrap();
+        store
+            .record_adapter(InstalledAdapter {
+                name: "demo-lora".into(),
+                path: adapter_dir.clone(),
+                base_model: "smollm2:360m".into(),
+                recorded_at_unix: now_unix(),
+            })
+            .unwrap();
+
+        let report = store.purge_model("smollm2:360m", true).unwrap();
+        assert!(report.adapters_removed.iter().any(|n| n == "demo-lora"));
+        assert!(!adapter_dir.exists());
+        assert!(store.get_adapter("demo-lora").unwrap().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
 }

@@ -23,7 +23,7 @@
 
 Implementation status against the spec “MoE support · delta-adapter driven · lightweight agent integration”.  
 Project theme: **efficient LLM execution and model creation under constrained resources**  
-Last updated: 2026-08-06
+Last updated: 2026-08-07
 
 ## English table of contents
 
@@ -55,6 +55,8 @@ Last updated: 2026-08-06
 | Extension / Phase 12 | Gemma 4 **26B-A4B (MoE)** hybrid text run | **Done** (text hybrid verified; latency polish → Phase 13) |
 | Extension / Phase 13 | Decode throughput (MoE + Vulkan end-to-end) | **Done** (~2×; stretch ≥3× → Phase 14) |
 | Extension / Phase 14 | Accuracy-preserving decode speed (≥3× / stretch tok/s) | **In progress** (Softmax GPU · dual-scratch · conditional Q8_0 · MoE overlap) |
+| Extension / Phase 15 | Model uninstall: purge blobs + related engine cache via CLI | **Done** |
+| Extension / Phase 16 | Arch family backend template (static plugins; MoE add-without-core-churn) | **Planned** (compile-time inventory; no dlopen hot path) |
 
 **Available now:**  
 `lpc-llm run <model> --adapter <name>` (Hybrid LoRA),  
@@ -74,7 +76,9 @@ On MoE GGUF: `experts.pack` + Top-K expert DMA + **RAM LRU expert cache** (hybri
 **Phase 11 (done):** Gemma 3 **27B** dense instruct via `--hybrid` (text-only).  
 **Phase 12 (done):** Gemma 4 **26B-A4B MoE** (~25.2B / ~3.8B active); resident target ≤16 GiB.  
 **Phase 13 (done):** decode ~**1.8–2.4 tok/s** (~2–2.4× vs ~1 baseline) with DeviceAct, fused Top-K gate/up, shared∥expert, Gemma4 `>>>` UI.
-**Phase 14 (in progress):** accuracy-preserving speed — Softmax GPU (large last-dim), dual-scratch ping-pong, shared gate/up ∥ router CPU, conditional fused Q8_0 downs (≥4 + microbench); success ≥3× on warm turn 2+.
+**Phase 14 (in progress):** accuracy-preserving speed — Softmax GPU (large last-dim), dual-scratch ping-pong, shared gate/up ∥ router CPU, conditional fused Q8_0 downs (≥4 + microbench); success ≥3× on warm turn 2+.  
+**Phase 15 (done):** `lpc-llm rm` full uninstall — soft registry-only by default; `--purge` removes durable `blobs/` + regenerable `cache/packs/<model>/`; optional `--with-adapters` / `--cache`; `-y` skips confirm.  
+**Phase 16 (planned):** extract a **microkernel-shaped core** (packs · expert DMA · Vulkan QMatMul · adapters · session) and **compile-time family backends** (catalog + prompt + GGUF/MoE layout + forward quirks) so new MoE LLMs (Llama 4, gpt-oss, …) ship as templated modules **without** dlopen and **without** regressing accuracy or decode speed.
 
 ---
 
@@ -546,6 +550,93 @@ Phase 13 delivered **~2×** warm decode without changing GGUF quant or Top-K. Re
 - [ ] Regression: Gemma4 `>>>` UI + no bare `thought` leak
 - [x] Update this file + README bench blurb with Phase 14 path description
 
+### Phase 15: Model uninstall (blobs + related cache via CLI) — **Done**
+
+Today `lpc-llm rm` only drops the soft `manifest.json` entry. Durable GGUF/tokenizer under `blobs/` and regenerable packs under `cache/packs/<model>/` remain, so disk is not freed and `reconcile` may re-register from leftover blobs.
+
+**Goal:** Manage full local lifecycle from the CUI — list / pull / show / soft-rm / **purge** — without hand-deleting XDG paths.
+
+**Deps:** Existing `LocalStore` layout (`blobs/` · `cache/packs/` · `adapters/` · `manifest.json`). Independent of Phase 14 decode work.
+
+**Policy:**
+- Default `rm` stays **registry-only** (backward compatible).
+- `--purge` deletes that model’s **blobs** (GGUF + tokenizer dirs when unshared) and **all engine pack versions** under `cache/packs/<safe_name>/`, then the registry entry.
+- Adapters are **not** auto-deleted (trained assets). Opt-in `--with-adapters` (implies / requires `--purge`) removes LoRA dirs whose `base_model` matches.
+- `--cache` wipes pack cache only (blobs + registry kept) for “regenerate packs” ops.
+- Interactive confirm for destructive modes; `-y` / `--yes` skips.
+- Never delete another catalog model’s shared blob path (refcount / path-use check).
+- Do not touch `train/`, `cache/knowledge/`, `cache/projects/`, or unrelated adapters.
+
+#### 15.1 Store API
+
+- [x] `LocalStore::purge_model` / pack-cache wipe helpers (bytes freed report)
+- [x] Shared-path guard before deleting tokenizer or HF-repo blob dirs
+- [x] Unit tests with temp `data_dir` (soft rm vs purge vs cache-only)
+
+#### 15.2 CLI
+
+- [x] `lpc-llm rm <name> [--purge] [--cache] [--with-adapters] [-y|--yes]`
+- [x] Clear stderr/stdout summary of what was removed and approx. bytes freed
+- [x] Reject `--with-adapters` without `--purge`
+
+#### 15.3 Docs / verification
+
+- [x] README (EN + JA): `rm` table + data-layout note (`rm` no longer “blobs kept only”)
+- [x] Unit coverage for purge / cache-only / soft (manual host smoke optional)
+- [x] Mark this phase **Done**
+
+### Phase 16: Arch family backends (static plugins / MoE add template) — **Planned**
+
+Adding each MoE LLM today still fans out across `catalog.rs`, `PromptStyle`, `MoeFamily`, `gguf_map` / `moe`, and `hybrid.rs` forks. That works but does not scale cleanly to Llama 4 / gpt-oss / future families.
+
+**Goal:** Keep a thin **core** (I/O packs, expert Top-K DMA + LRU, Vulkan device path, LoRA side-path, chat session) and make each architecture a **family backend** registered at **compile time**, with a copy-paste template + checklist so new MoE models are added without rewriting the kernel.
+
+**Hard constraints (non-negotiable):**
+- **Accuracy:** no change to matmul / Top-K / quant math for existing verified paths (esp. `gemma4:26b-a4b`). Refactors are structural only; logits A/B must match within existing Phase 14 policy.
+- **Speed:** no measurable warm-decode regression vs Phase 14 baseline on the same host/flags. Prefer monomorphization / `enum` dispatch / `#[inline]` seams over `dyn Trait` on the token hot path.
+- **Flexibility:** new families can be added (and optionally `cargo` feature-gated) without editing core I/O or Vulkan kernels; catalog + prompt + MoE layout + forward quirks live behind one backend surface.
+
+**Architecture choice (speed-first “microkernel”):**
+- **Adopt:** compile-time **static plugin / inventory** — each family is a module (or optional crate) implementing a fixed backend trait/API; linked into one binary (monolithic artifact, modular source). Optional Cargo features (`family-gemma4`, `family-gpt-oss`, …) to shrink binaries.
+- **Reject for hot path:** `dlopen` / runtime `.so` plugins, interpretive graph VMs, or blanket `dyn` dispatch in decode — these sacrifice latency and complicate bit-exact paths under constrained RAM.
+- **Soft periphery OK as dyn:** catalog listing, prompt formatting, tokenizer selection, CLI help — not per-token MatMul.
+
+**Deps:** Phase 12–15 behaviors remain; ideally land after Phase 14 host ≥3× gate so speed regressions are measurable. Independent of Phase 15 purge.
+
+#### 16.1 Core vs family surface
+
+- [ ] Document and enforce boundary: **core** = `io/` packs · expert DMA · device QMatMul · adapter attach · `infer` session shell
+- [ ] **Family backend** owns: GGUF arch id(s) · `MoeLayout` / gating quirks · attention pattern (RoPE / window / sink) · prompt/chat template · catalog entries · any arch-specific hybrid forward hooks
+- [ ] Single registration table (inventory) maps `architecture` / catalog name → backend; no scattered `match` growth in `main`
+
+#### 16.2 Template & first extractions
+
+- [ ] Add `src/family/` (or `crates/lpc-family-*`) with **TEMPLATE** module + README checklist (“new MoE family in N steps”)
+- [ ] Extract **Gemma4** as the reference backend (must stay bit-equivalent)
+- [ ] Extract dense Gemma3 / small catalog models enough to prove the seam (or keep thin shims)
+- [ ] Leave stubs / issue notes for **Llama 4 MoE** and **gpt-oss** (MXFP4, Harmony, attention sinks) — implementation is later phases; Phase 16 only makes the slot real
+
+#### 16.3 Wiring without churn
+
+- [ ] `MoeFamily` / layout detection delegates to backend classifiers
+- [ ] `catalog` entries declare `family_id`; `pull`/`run` resolve via inventory
+- [ ] Hybrid load path selects backend once at session start (not per token)
+- [ ] Optional Cargo features: default features keep today’s full catalog; docs explain “add family → enable feature → rebuild”
+
+#### 16.4 Verification (accuracy + speed)
+
+- [ ] `cargo check` / unit tests for inventory + template compile
+- [ ] Gemma4 warm turn-2 tok/s and `[bench]` within noise of pre-refactor baseline (same release flags)
+- [ ] Spot logits A/B on fixed prompt (gemma4) — no user-visible drift
+- [ ] README (EN+JA): “adding a model family” + explicit **no dlopen** rationale
+- [ ] Mark phase **Done** only when template + Gemma4 extraction + regression gates pass
+
+#### 16.5 Out of scope
+
+- Shipping Llama 4 / gpt-oss inference itself (follow-on phases once slots exist)
+- Runtime plugin marketplaces; WASM model graphs
+- Any change that coarsens quant or reduces Top-K “to make plugins easier”
+
 ---
 
 ## 4. Spec section status
@@ -585,6 +676,7 @@ Phase 13 delivered **~2×** warm decode without changing GGUF quant or Top-K. Re
 | `project-map build|status|rebuild` | **Implemented** (Phase 8) |
 | `setup` / `config init --interactive` | **Implemented** (Phase 9 i18n device wizard) |
 | `run … --device <auto\|cpu\|cuda\|vulkan>` | **Implemented** (Phase 9) |
+| `rm <name> [--purge\|--cache] [-y]` | **Implemented** (Phase 15; default still registry-only) |
 
 ### Memory / I/O pipeline
 
@@ -600,6 +692,7 @@ Phase 13 delivered **~2×** warm decode without changing GGUF quant or Top-K. Re
 | Gemma 4 26B-A4B MoE hybrid text run | **Done** (Phase 12; text verified) |
 | Decode throughput (MoE + Vulkan fuse / MoE I/O) | **Done** (Phase 13; ~2×; ≥3× → Phase 14) |
 | Accuracy-preserving decode speed (≥3×) | **In progress** (Phase 14; Softmax GPU · dual-scratch · conditional Q8_0) |
+| Arch family backends (static plugins / MoE template) | **Planned** (Phase 16; compile-time inventory; no dlopen hot path) |
 | ΔW merge at CQE (weight rewrite) | Not adopted (side-path policy) |
 
 ---
@@ -607,12 +700,14 @@ Phase 13 delivered **~2×** warm decode without changing GGUF quant or Top-K. Re
 ## 5. Recommended next steps
 
 1. **Phase 14 (in progress)** — finish host warm turn-2 ≥3× bench; optional logits A/B; layer i∥i+1 QKV pipeline stretch
-2. **Phase 13 wrap** — RSS / vs `gemma3:27b` write-up (13.1 absorbed into 14.4 docs)
-3. **Phase 6 follow-ups** — Wire real cluster launchers / CUDA backends into `job.remote` and `$LPC_LLM_CONVERT_CMD`
-4. **(Optional)** Pathfinder MoE catalog `qwen3:30b-a3b`
-5. **(Optional)** In-process adapter hot-reload / mid-chat hot-swap (Phase 1 + 7.3 leftovers)
-6. **(Optional)** Packaging that ships `/etc/lpc-llm/config_lpcllm` with `install.mode = "system"`
-7. **(Optional)** project-map 16GB-class regression bench / inotify delta watch; Gemma vision
+2. **Phase 16 (planned)** — after 14 speed gate: core/family split + template; extract Gemma4 reference backend; inventory registration; regression A/B
+3. **Phase 13 wrap** — RSS / vs `gemma3:27b` write-up (13.1 absorbed into 14.4 docs)
+4. **Phase 6 follow-ups** — Wire real cluster launchers / CUDA backends into `job.remote` and `$LPC_LLM_CONVERT_CMD`
+5. **(Follow-on)** New MoE families via Phase 16 slots: Llama 4 / gpt-oss (separate phases once template lands)
+6. **(Optional)** Pathfinder MoE catalog `qwen3:30b-a3b`
+7. **(Optional)** In-process adapter hot-reload / mid-chat hot-swap (Phase 1 + 7.3 leftovers)
+8. **(Optional)** Packaging that ships `/etc/lpc-llm/config_lpcllm` with `install.mode = "system"`
+9. **(Optional)** project-map 16GB-class regression bench / inotify delta watch; Gemma vision
 
 ---
 
@@ -631,7 +726,7 @@ Phase 13 delivered **~2×** warm decode without changing GGUF quant or Top-K. Re
 
 仕様書「MoE 対応・差分アダプタ駆動・軽量エージェント統合」に対する実装状況。  
 プロジェクトテーマ: **限定的リソース下での LLM 効率化実行とモデル作成**  
-最終更新: 2026-08-06
+最終更新: 2026-08-07
 
 ## 日本語目次
 
@@ -663,6 +758,8 @@ Phase 13 delivered **~2×** warm decode without changing GGUF quant or Top-K. Re
 | 拡張 / Phase 12 | Gemma 4 **26B-A4B（MoE）** hybrid テキスト実行 | **完了**（テキスト hybrid 検証済；レイテンシ磨き → Phase 13） |
 | 拡張 / Phase 13 | デコードスループット（MoE + Vulkan 端到端） | **完了**（~2×；≥3× → Phase 14） |
 | 拡張 / Phase 14 | 精度維持のままデコード高速化（≥3× / ストレッチ tok/s） | **進行中**（Softmax GPU · dual-scratch · 条件付き Q8_0 · MoE 重ね） |
+| 拡張 / Phase 15 | モデル削除: blobs + 関連エンジンキャッシュを CLI で purge | **完了** |
+| 拡張 / Phase 16 | アーキテクチャ family バックエンド（静的プラグイン；MoE 追加をコア非破壊で） | **計画**（コンパイル時 inventory；ホットパスに dlopen なし） |
 
 **いま使えるもの:**  
 `lpc-llm run <model> --adapter <name>`（Hybrid LoRA）、  
@@ -682,7 +779,9 @@ MoE GGUF では `experts.pack` + Top-K Expert DMA + **Expert RAM LRU キャッ�
 **Phase 11（完了）:** Gemma 3 **27B** dense Instruct を `--hybrid` でテキスト実行。  
 **Phase 12（完了）:** Gemma 4 **26B-A4B MoE**（総量 ~25.2B / 活性 ~3.8B）；常駐目標 ≤16 GiB。  
 **Phase 13（完了）:** DeviceAct + Top-K gate/up 融合 + shared∥expert 並列 + attn QKV DeviceAct + Gemma4 thought 抑制（`>>>` 回答）。ホスト **~1.8–2.4 tok/s**（≈2–2.4×）。
-**Phase 14（進行中）:** 精度維持の高速化 — Softmax GPU（大きな last-dim）、dual-scratch ping-pong、shared gate/up ∥ router CPU、条件付き融合 Q8_0 down；成功条件は暖機後 2 通目で ≥3×。
+**Phase 14（進行中）:** 精度維持の高速化 — Softmax GPU（大きな last-dim）、dual-scratch ping-pong、shared gate/up ∥ router CPU、条件付き融合 Q8_0 down；成功条件は暖機後 2 通目で ≥3×。  
+**Phase 15（完了）:** `lpc-llm rm` で完全アンインストール — 既定はレジストリのみ；`--purge` で永続 `blobs/` + 再生成可 `cache/packs/<model>/`；任意で `--with-adapters` / `--cache`；`-y` で確認スキップ。  
+**Phase 16（計画）:** **コア**（packs · expert DMA · Vulkan QMatMul · adapters · session）と **コンパイル時 family バックエンド**（catalog + prompt + GGUF/MoE レイアウト + forward 差分）に分け、Llama 4 / gpt-oss 等をテンプレモジュールとして追加可能にする。**dlopen なし**。精度・デコード速度を落とさない。
 
 ---
 
@@ -1152,6 +1251,93 @@ Phase 13 で量子化・Top-K を変えずに暖機後 **~2×** を得た。残�
 - [ ] 回帰: Gemma4 `>>>` UI + 裸の `thought` リークなし
 - [x] 本ファイル + README bench に Phase 14 経路を追記
 
+### Phase 15: モデル削除（blobs + 関連キャッシュを CLI で） — **完了**
+
+現状の `lpc-llm rm` はソフトな `manifest.json` エントリだけを外す。`blobs/` の GGUF/tokenizer と `cache/packs/<model>/` のパックは残り、ディスクは空かず、`reconcile` で再登録されうる。
+
+**目標:** CUI だけでローカル寿命を完結（list / pull / show / soft-rm / **purge**）。XDG パスの手削除を不要にする。
+
+**Deps:** 既存 `LocalStore` レイアウト。Phase 14 とは独立。
+
+**方針:**
+- 既定 `rm` は **レジストリのみ**（後方互換）。
+- `--purge` はそのモデルの **blobs**（未共有なら tokenizer / HF-repo ディレクトリ）と `cache/packs/<safe_name>/` 配下の **全エンジン版パック**、およびレジストリを削除。
+- アダプタは自動削除しない。`--with-adapters`（`--purge` 必須）で `base_model` 一致の LoRA を削除。
+- `--cache` はパックキャッシュのみ削除（blobs・レジストリは維持）。
+- 破壊的モードは確認プロンプト；`-y` / `--yes` でスキップ。
+- 他カタログ名が共有する blob パスは消さない。
+- `train/`・`cache/knowledge/`・`cache/projects/`・無関係アダプタは触らない。
+
+#### 15.1 Store API
+
+- [x] `LocalStore::purge_model` / pack-cache 削除ヘルパ（解放バイト報告）
+- [x] tokenizer / HF-repo ディレクトリ削除前の共有パスガード
+- [x] 一時 `data_dir` のユニットテスト（soft / purge / cache-only）
+
+#### 15.2 CLI
+
+- [x] `lpc-llm rm <name> [--purge] [--cache] [--with-adapters] [-y|--yes]`
+- [x] 削除対象とおおよその解放バイトを表示
+- [x] `--with-adapters` は `--purge` なしで拒否
+
+#### 15.3 ドキュメント / 検証
+
+- [x] README（EN + JA）: `rm` 表とデータレイアウト注記を更新
+- [x] purge / cache-only / soft のユニットカバレッジ（ホスト手動スモークは任意）
+- [x] 本フェーズを **完了** にする
+
+### Phase 16: アーキテクチャ family バックエンド（静的プラグイン / MoE 追加テンプレ） — **計画**
+
+現状、MoE LLM を足すたびに `catalog.rs`・`PromptStyle`・`MoeFamily`・`gguf_map` / `moe`・`hybrid.rs` へ分岐が増える。動くが、Llama 4 / gpt-oss / 将来 family にはスケールしづらい。
+
+**目標:** 薄い **コア**（I/O packs、expert Top-K DMA + LRU、Vulkan、LoRA サイドパス、チャット session）を保ち、各アーキテクチャを **コンパイル時登録の family バックエンド**にする。テンプレ＋チェックリストで、カーネルを書き換えずに MoE モデルを追加できるようにする。
+
+**厳守制約:**
+- **精度:** 既存検証済み経路（特に `gemma4:26b-a4b`）の MatMul / Top-K / 量子化演算を変えない。リファクタは構造のみ。logits A/B は Phase 14 方針どおり一致。
+- **速度:** 同一ホスト・同一フラグで暖機デコードが Phase 14 基準から測って劣化しない。ホットパスはモノモルフィゼーション / `enum` ディスパッチ / `#[inline]` 境界を優先し、トークン経路の `dyn Trait` は避ける。
+- **柔軟性:** 新 family を（必要なら Cargo feature で）コア I/O・Vulkan カーネルを触らず追加できる。catalog・prompt・MoE レイアウト・forward 差分は一つのバックエンド面に集約。
+
+**アーキテクチャ方針（速度優先の「マイクロカーネル的」分割）:**
+- **採用:** コンパイル時 **静的プラグイン / inventory** — family ごとにモジュール（または任意クレート）が固定 API を実装し、**一つのバイナリにリンク**（成果物はモノリシック、ソースはモジュラー）。任意で `family-gemma4` 等の feature。
+- **ホットパスで不採用:** `dlopen` / 実行時 `.so`、解釈型グラフ VM、デコード中の包括的 `dyn` — レイテンシとビット等価を損なう。
+- **周辺のみ dyn 可:** カタログ列挙、プロンプト整形、tokenizer 選択、CLI ヘルプ — トークン毎 MatMul ではない。
+
+**Deps:** Phase 12–15 の挙動を維持。速度回帰を測れるよう **Phase 14 のホスト ≥3× ゲート後**が望ましい。Phase 15 purge とは独立。
+
+#### 16.1 コアと family の境界
+
+- [ ] 境界を文書化・強制: **コア** = `io/` packs · expert DMA · device QMatMul · adapter · `infer` session 殻
+- [ ] **family バックエンド**が担う: GGUF arch id · `MoeLayout` / gating · attention（RoPE / window / sink）· prompt · catalog · hybrid forward の arch 差分
+- [ ] 登録表（inventory）で `architecture` / catalog 名 → バックエンド；`main` への `match` 拡散をやめる
+
+#### 16.2 テンプレと最初の切り出し
+
+- [ ] `src/family/`（または `crates/lpc-family-*`）に **TEMPLATE** と README チェックリスト（「新 MoE family を N 手順で」）
+- [ ] 参照実装として **Gemma4** を切り出し（ビット等価必須）
+- [ ] 密な Gemma3 / 小型カタログも境界実証に足るだけ切り出す（薄いシム可）
+- [ ] **Llama 4 MoE** / **gpt-oss**（MXFP4・Harmony・attention sink）はスタブ／課題メモのみ — 実装は後続フェーズ；Phase 16 はスロットを実体化する
+
+#### 16.3 配線（コア非破壊）
+
+- [ ] `MoeFamily` / レイアウト検出はバックエンドの分類器へ委譲
+- [ ] `catalog` が `family_id` を持ち、`pull`/`run` は inventory 経由
+- [ ] hybrid ロードは session 開始時に一度だけバックエンド選択（トークン毎ではない）
+- [ ] 任意 Cargo feature: 既定は現行フルカタログ；「family 追加 → feature 有効 → 再ビルド」を文書化
+
+#### 16.4 検証（精度 + 速度）
+
+- [ ] inventory + テンプレの `cargo check` / 単体
+- [ ] Gemma4 暖機 2 通目 tok/s と `[bench]` がリファクタ前基準とノイズ内
+- [ ] 固定プロンプトで logits スポット A/B（gemma4）— 可視ドリフトなし
+- [ ] README（EN+JA）: 「モデル family の追加手順」と **dlopen しない理由**
+- [ ] テンプレ + Gemma4 切り出し + 回帰ゲート通過後に **完了**
+
+#### 16.5 範囲外
+
+- Llama 4 / gpt-oss 本体の推論実装（スロット後の別フェーズ）
+- 実行時プラグイン市場、WASM モデルグラフ
+- プラグイン化のために量子化を粗くする・Top-K を減らす変更
+
 ---
 
 ## 4. 仕様書セクション別の対応状況
@@ -1191,6 +1377,7 @@ Phase 13 で量子化・Top-K を変えずに暖機後 **~2×** を得た。残�
 | `project-map build|status|rebuild` | **実装済**（Phase 8） |
 | `setup` / `config init --interactive` | **実装済**（Phase 9 i18n デバイスウィザード） |
 | `run … --device <auto\|cpu\|cuda\|vulkan>` | **実装済**（Phase 9） |
+| `rm <name> [--purge\|--cache] [-y]` | **実装済**（Phase 15；既定はレジストリのみ） |
 
 ### メモリ・I/O パイプライン
 
@@ -1206,6 +1393,7 @@ Phase 13 で量子化・Top-K を変えずに暖機後 **~2×** を得た。残�
 | Gemma 4 26B-A4B MoE hybrid テキスト実行 | **完了**（Phase 12；テキスト検証済） |
 | デコードスループット（MoE + Vulkan fuse / MoE I/O） | **完了**（Phase 13；~2×；≥3× → Phase 14） |
 | 精度維持のデコード高速化（≥3×） | **進行中**（Phase 14；Softmax GPU · dual-scratch · 条件付き Q8_0） |
+| アーキテクチャ family バックエンド（静的プラグイン / MoE テンプレ） | **計画**（Phase 16；コンパイル時 inventory；ホットパスに dlopen なし） |
 | CQE 時の ΔW マージ（重み書き換え） | 採用せず（サイドパス方針） |
 
 ---
@@ -1213,12 +1401,14 @@ Phase 13 で量子化・Top-K を変えずに暖機後 **~2×** を得た。残�
 ## 5. 推奨する次工程
 
 1. **Phase 14（進行中）** — ホスト暖機 2 通目 ≥3× 計測；任意 logits A/B；層 i∥i+1 QKV パイプライン（ストレッチ）
-2. **Phase 13 締め** — RSS / vs `gemma3:27b`（13.1 は 14.4 文書に吸収）
-3. **Phase 6 フォロー** — `job.remote` / `$LPC_LLM_CONVERT_CMD` に実クラスタ・CUDA 変換を接続
-4. **（任意）** 経路探査カタログ `qwen3:30b-a3b`
-5. **（任意）** プロセス内アダプタホットリロード / 会話途中ホットスワップ（Phase 1 + 7.3 残り）
-6. **（任意）** `install.mode = "system"` の `/etc/lpc-llm/config_lpcllm` を同梱するパッケージ化
-7. **（任意）** project-map 16GB 級回帰ベンチ / inotify 差分監視；Gemma vision
+2. **Phase 16（計画）** — 14 の速度ゲート後: コア/family 分割 + テンプレ；Gemma4 参照バックエンド切り出し；inventory；回帰 A/B
+3. **Phase 13 締め** — RSS / vs `gemma3:27b`（13.1 は 14.4 文書に吸収）
+4. **Phase 6 フォロー** — `job.remote` / `$LPC_LLM_CONVERT_CMD` に実クラスタ・CUDA 変換を接続
+5. **（後続）** Phase 16 スロット経由で新 MoE family: Llama 4 / gpt-oss（テンプレ後の別フェーズ）
+6. **（任意）** 経路探査カタログ `qwen3:30b-a3b`
+7. **（任意）** プロセス内アダプタホットリロード / 会話途中ホットスワップ（Phase 1 + 7.3 残り）
+8. **（任意）** `install.mode = "system"` の `/etc/lpc-llm/config_lpcllm` を同梱するパッケージ化
+9. **（任意）** project-map 16GB 級回帰ベンチ / inotify 差分監視；Gemma vision
 
 ---
 

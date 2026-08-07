@@ -25,16 +25,16 @@ pub fn cmd_pull(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_list() -> Result<()> {
-    list::run()
+pub fn cmd_list(all: bool) -> Result<()> {
+    list::run(all)
 }
 
 pub fn cmd_show(name: &str) -> Result<()> {
     show::run(name)
 }
 
-pub fn cmd_rm(name: &str) -> Result<()> {
-    rm::run(name)
+pub fn cmd_rm(opts: rm::RmOpts) -> Result<()> {
+    rm::run(opts)
 }
 
 pub fn cmd_run(opts: run::RunOpts) -> Result<()> {

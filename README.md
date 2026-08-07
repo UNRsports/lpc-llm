@@ -156,7 +156,7 @@ config_lpcllm.example
 | `cache/` | Yes | Regenerated on next hybrid / train run |
 | `manifest.json` | Yes | Restored by `reconcile` at startup |
 
-`rm` only removes the registry entry; it **does not delete blobs**.
+`rm` (no flags) only removes the registry entry. Use `rm --purge` to delete blobs + pack cache; `rm --cache` clears packs only. Adapters need `--purge --with-adapters`.
 
 ### Catalog models
 
@@ -450,11 +450,15 @@ lpc-llm io --help
 | Command | Description |
 |----------|------|
 | `lpc-llm` | Interactive menu |
-| `lpc-llm list` | Catalog and local / available |
+| `lpc-llm list` | Installed (local) models only |
+| `lpc-llm list --all` | Full catalog with local / available |
 | `lpc-llm pull <name>` | Fetch into blobs (reuse if present) |
 | `lpc-llm run [name] [options]` | Start chat |
 | `lpc-llm show <name>` | Catalog + local paths |
-| `lpc-llm rm <name>` | Remove from registry (blobs kept) |
+| `lpc-llm rm <name>` | Soft remove from registry (blobs kept) |
+| `lpc-llm rm <name> --purge [-y]` | Full uninstall: blobs + pack cache + registry |
+| `lpc-llm rm <name> --cache [-y]` | Wipe pack cache only |
+| `lpc-llm rm <name> --purge --with-adapters [-y]` | Purge + LoRA adapters for that base |
 | `lpc-llm adapter list` | List LoRA adapters |
 | `lpc-llm config show\|init\|get\|example` | Resolve / write `config_lpcllm` (data_dir, train_dir, bin_dir) |
 | `lpc-llm adapter create …` | Train LoRA from `--from` → `adapters/<out>/` |
@@ -706,7 +710,7 @@ config_lpcllm.example
 | `cache/` | 消してよい | 次回 hybrid / train で再生成 |
 | `manifest.json` | 消してよい | 起動時 `reconcile` で復旧 |
 
-`rm` はレジストリから外すだけで **blobs は削除しません**。
+`rm`（フラグなし）はレジストリから外すだけです。ディスク解放は `rm --purge`（blobs + pack cache）。パックのみは `rm --cache`。アダプタは `--purge --with-adapters`。
 
 ### カタログモデル
 
@@ -976,11 +980,15 @@ lpc-llm io --help
 | コマンド | 説明 |
 |----------|------|
 | `lpc-llm` | 対話メニュー |
-| `lpc-llm list` | カタログと local / available |
+| `lpc-llm list` | 導入済み（local）のみ |
+| `lpc-llm list --all` | カタログ全体（local / available） |
 | `lpc-llm pull <name>` | blobs へ取得（既存は再利用） |
 | `lpc-llm run [name] [options]` | チャット起動 |
 | `lpc-llm show <name>` | カタログ + ローカルパス |
-| `lpc-llm rm <name>` | レジストリから削除（blobs は残す） |
+| `lpc-llm rm <name>` | レジストリのみ削除（blobs は残す） |
+| `lpc-llm rm <name> --purge [-y]` | 完全削除: blobs + pack cache + レジストリ |
+| `lpc-llm rm <name> --cache [-y]` | pack cache のみ削除 |
+| `lpc-llm rm <name> --purge --with-adapters [-y]` | purge + そのベースの LoRA |
 | `lpc-llm adapter list` | LoRA アダプタ一覧 |
 | `lpc-llm config show\|init\|get\|example` | `config_lpcllm` の解決 / 作成（data_dir, train_dir, bin_dir） |
 | `lpc-llm adapter create …` | `--from` から LoRA 学習 → `adapters/<out>/` |
