@@ -57,6 +57,7 @@ Last updated: 2026-08-07
 | Extension / Phase 14 | Accuracy-preserving decode speed (≥3× / stretch tok/s) | **In progress** (Softmax GPU · dual-scratch · conditional Q8_0 · MoE overlap) |
 | Extension / Phase 15 | Model uninstall: purge blobs + related engine cache via CLI | **Done** |
 | Extension / Phase 16 | Arch family backend template (static plugins; MoE add-without-core-churn) | **Planned** (compile-time inventory; no dlopen hot path) |
+| Extension / Phase 17 | IDE-class coding agent (context · tools · index · safe write-back) | **Planned** (builds on Phase 7–8; constrained-RAM first) |
 
 **Available now:**  
 `lpc-llm run <model> --adapter <name>` (Hybrid LoRA),  
@@ -78,7 +79,8 @@ On MoE GGUF: `experts.pack` + Top-K expert DMA + **RAM LRU expert cache** (hybri
 **Phase 13 (done):** decode ~**1.8–2.4 tok/s** (~2–2.4× vs ~1 baseline) with DeviceAct, fused Top-K gate/up, shared∥expert, Gemma4 `>>>` UI.
 **Phase 14 (in progress):** accuracy-preserving speed — Softmax GPU (large last-dim), dual-scratch ping-pong, shared gate/up ∥ router CPU, conditional fused Q8_0 downs (≥4 + microbench); success ≥3× on warm turn 2+.  
 **Phase 15 (done):** `lpc-llm rm` full uninstall — soft registry-only by default; `--purge` removes durable `blobs/` + regenerable `cache/packs/<model>/`; optional `--with-adapters` / `--cache`; `-y` skips confirm.  
-**Phase 16 (planned):** extract a **microkernel-shaped core** (packs · expert DMA · Vulkan QMatMul · adapters · session) and **compile-time family backends** (catalog + prompt + GGUF/MoE layout + forward quirks) so new MoE LLMs (Llama 4, gpt-oss, …) ship as templated modules **without** dlopen and **without** regressing accuracy or decode speed.
+**Phase 16 (planned):** extract a **microkernel-shaped core** (packs · expert DMA · Vulkan QMatMul · adapters · session) and **compile-time family backends** (catalog + prompt + GGUF/MoE layout + forward quirks) so new MoE LLMs (Llama 4, gpt-oss, …) ship as templated modules **without** dlopen and **without** regressing accuracy or decode speed.  
+**Phase 17 (planned):** IDE-class **coding agent** on top of Phase 7–8 — richer context (docs + on-demand full files), tool loop (`read`/`grep`/`edit`/`shell`/`web_search`), better index (embeddings / delta watch), and **safe write-back**. Today `--agent` is only an adapter/expert **router**; Phase 7–8 only inject short code-map + web snippets into chat.
 
 ---
 
@@ -103,7 +105,7 @@ How to treat the following three requirements under the theme “efficient execu
 | Auto-attach `--adapter user_profile` | **Feasible** | Reuse Phase 1 hybrid side-path. Auto-load at `run` if present (no restart = in-process attach; daemon optional) |
 | Project AST/dep graph → `map.bin` | **Feasible** | Extract AST/symbols/call edges with tree-sitter etc. Light embeddings (hash or small model) as node attrs. Keep structured index on NVMe without loading all code into RAM |
 | `io_uring` on-demand symbol fetch | **Feasible** | Same shape as layer-pack DMA. Fixed-length node records + offset table, `O_DIRECT` prefetch. Millisecond delta updates = reparse changed files → rewrite affected subgraph only |
-| `--project-map` overview context | **Conditionally feasible** | Cannot dump hundreds of thousands of lines into the prompt. Synthesize **summaries / signature lists of relevant subgraphs**. Cursor-class IDE integration is out of scope; CLI graph RAG is the realistic endpoint |
+| `--project-map` overview context | **Conditionally feasible** | Cannot dump hundreds of thousands of lines into the prompt. Synthesize **summaries / signature lists of relevant subgraphs**. Full **IDE-class** agent loop is **Phase 17**; Phase 8 endpoint remains CLI graph RAG |
 
 **Conclusion:** Phases 7 and 8 are engineerable. Phase 7 auto-train needs Phase 4 done; Phase 8 DMA fetch extends the existing io_uring stack. Put constrained-resource intermediate artifacts first; approach the ideal (fully automatic, full overview) gradually.
 
@@ -637,6 +639,77 @@ Adding each MoE LLM today still fans out across `catalog.rs`, `PromptStyle`, `Mo
 - Runtime plugin marketplaces; WASM model graphs
 - Any change that coarsens quant or reduces Top-K “to make plugins easier”
 
+### Phase 17: IDE-class coding agent (context · tools · index · safe edits) — **Planned**
+
+Phase 7–8 give **chat-side RAG**: web chunks in `cache/knowledge/` and a short project-map overview (~signatures / previews). That is not yet an IDE-class loop that can **enumerate a tree, reason, search the web when needed, and apply code changes** under constrained RAM.
+
+**Gap today (what Phase 17 closes):**
+| Capability | Today | Target |
+|------------|--------|--------|
+| Agent / tool loop | `--agent` = SmolLM2 **router** only (adapters / experts) | Multi-step **read → search → edit → test** tool loop |
+| On-demand full file | Signatures + short previews in ~2.4 k-char overview | Budgeted full-file / chunk fetch into context |
+| Docs / configs index | Source extensions only (no manuals / md / configs) | Index docs, markdown, common configs as first-class |
+| Semantic retrieve | Hash n-grams + lexical overlap | Optional light neural embeds (still RAM-capped) |
+| Live index | Manual `project-map build` / `rebuild` | Delta reindex (inotify / mtime) without full rebuild |
+| Write-back | Chat text only; no apply path | Patch apply + review; destructive-op guards |
+
+**Strengths to reuse:** NVMe project-map + io_uring-style node fetch; Web → local knowledge store; hybrid low-RAM inference. Phase 17 is an **agent execution layer** on that substrate — not a second inference engine.
+
+**Goal:** Under the theme (≤16 GiB-class resident budgets, no always-on multi-GPU IDE), ship a CLI coding agent that can be trusted for multi-step repo work: fast-enough tree coverage, inference with tools, optional web, and **safe** file edits.
+
+**Hard constraints:**
+- Do **not** regress hybrid decode accuracy/speed (Phases 12–14).
+- Context injection stays **budgeted** (no dumping whole trees into the prompt).
+- Tools run with explicit allowlists / confirmations for destructive shell and mass deletes.
+- Keep Phase 3 router mode available; coding agent is a **distinct** mode (flag or subcommand), not a silent hijack of `--agent`.
+
+**Deps:** Phase 7 knowledge + Phase 8 project-map. Prefer Phase 14 speed gate and Phase 16 family slots so the main model can grow; Phase 17 can start context/tools in parallel with 16 if needed.
+
+**Build order (resource-safe):**
+1. Context layer → 2. Tool agent → 3. Index quality → 4. Edit safety.
+
+#### 17.1 Context layer expansion
+
+- [ ] Index **docs / markdown / common configs** alongside code (extension + size caps; skip binary)
+- [ ] **On-demand full-file / chunk read** tool API backed by project root + existing map hints
+- [ ] Hard **chunk / total context budgets** (configurable; default fits hybrid ≤16 GiB sessions)
+- [ ] Wire richer retrieve into `enrich_user` / agent turns without unbounded growth
+
+#### 17.2 Tool-using coding agent
+
+- [ ] New mode (e.g. `run … --coding-agent` or `lpc-llm agent …`) — **not** replacing Phase 3 router `--agent`
+- [ ] Tool surface: `read` · `grep` · `edit`/`apply_patch` · `shell` · `web_search` (reuse Phase 7 backend)
+- [ ] Multi-step loop: model proposes tool calls → host executes → observations back → until stop / budget
+- [ ] Memory exclusivity: pause or shed router/extra residents when coding-agent + large MoE share RAM (extend Phase 3 policy)
+- [ ] Structured tool protocol (JSON or tagged blocks) with strict parse + reject malformed calls
+
+#### 17.3 Index quality
+
+- [ ] Optional **tree-sitter** (or equivalent) extract where heuristics are weak; keep heuristic fallback
+- [ ] Optional **light embedding model** for semantic node/chunk retrieve (feature-gated; hash path remains default)
+- [ ] **Delta reindex**: mtime / inotify (Linux) rewrite affected subgraph only
+- [ ] Background `project-map` refresh job; status shows staleness
+
+#### 17.4 Edit safety
+
+- [ ] Patch apply with unified-diff / search-replace; dry-run + show diff before write (TTY confirm; `-y` opt-in)
+- [ ] Path allowlist (project root jail); refuse writes outside root / to `.git` unless opted in
+- [ ] Shell tool: allowlist or confirm; no unrestricted network/process by default in coding-agent policy
+- [ ] Audit log of applied edits under `cache/` (or user-configured path) for undo / review
+
+#### 17.5 Verification / docs
+
+- [ ] Fixture repo smoke: read → grep → patch → re-read; web_search optional
+- [ ] Context budget unit tests (hard cap never exceeded)
+- [ ] README (EN+JA): coding-agent vs router `--agent`; tool policy; security notes
+- [ ] Mark **Done** when 17.1–17.2 land with safe write-back MVP; 17.3–17.4 may trail as checklist remainder
+
+#### 17.6 Out of scope (this phase)
+
+- Full GUI IDE / LSP language server product
+- Unbounded “load whole monorepo into RAM”
+- Autonomous internet-facing bots without local confirm policy
+
 ---
 
 ## 4. Spec section status
@@ -662,7 +735,8 @@ Adding each MoE LLM today still fans out across `catalog.rs`, `PromptStyle`, `Mo
 | Command | Status |
 |----------|------|
 | `run … --adapter <name>` | **Implemented** |
-| `run … --agent` | **Implemented** (with `--agent-model`) |
+| `run … --agent` | **Implemented** (with `--agent-model`; Phase 3 **router** only) |
+| `run … --coding-agent` / `agent …` (tools) | **Planned** (Phase 17; distinct from router `--agent`) |
 | `run … --project-map` | **Implemented** (Phase 8; path or hash) |
 | `run … --knowledge` / `--no-user-profile` | **Implemented** (Phase 7) |
 | `adapter list` | **Implemented** |
@@ -693,6 +767,7 @@ Adding each MoE LLM today still fans out across `catalog.rs`, `PromptStyle`, `Mo
 | Decode throughput (MoE + Vulkan fuse / MoE I/O) | **Done** (Phase 13; ~2×; ≥3× → Phase 14) |
 | Accuracy-preserving decode speed (≥3×) | **In progress** (Phase 14; Softmax GPU · dual-scratch · conditional Q8_0) |
 | Arch family backends (static plugins / MoE template) | **Planned** (Phase 16; compile-time inventory; no dlopen hot path) |
+| IDE-class coding agent (context · tools · index · safe edits) | **Planned** (Phase 17; on Phase 7–8 substrate) |
 | ΔW merge at CQE (weight rewrite) | Not adopted (side-path policy) |
 
 ---
@@ -701,13 +776,14 @@ Adding each MoE LLM today still fans out across `catalog.rs`, `PromptStyle`, `Mo
 
 1. **Phase 14 (in progress)** — finish host warm turn-2 ≥3× bench; optional logits A/B; layer i∥i+1 QKV pipeline stretch
 2. **Phase 16 (planned)** — after 14 speed gate: core/family split + template; extract Gemma4 reference backend; inventory registration; regression A/B
-3. **Phase 13 wrap** — RSS / vs `gemma3:27b` write-up (13.1 absorbed into 14.4 docs)
-4. **Phase 6 follow-ups** — Wire real cluster launchers / CUDA backends into `job.remote` and `$LPC_LLM_CONVERT_CMD`
-5. **(Follow-on)** New MoE families via Phase 16 slots: Llama 4 / gpt-oss (separate phases once template lands)
-6. **(Optional)** Pathfinder MoE catalog `qwen3:30b-a3b`
-7. **(Optional)** In-process adapter hot-reload / mid-chat hot-swap (Phase 1 + 7.3 leftovers)
-8. **(Optional)** Packaging that ships `/etc/lpc-llm/config_lpcllm` with `install.mode = "system"`
-9. **(Optional)** project-map 16GB-class regression bench / inotify delta watch; Gemma vision
+3. **Phase 17 (planned)** — IDE-class coding agent: context budgets + docs index → tool loop → delta index → safe write-back (parallelizable with 16 after 7–8)
+4. **Phase 13 wrap** — RSS / vs `gemma3:27b` write-up (13.1 absorbed into 14.4 docs)
+5. **Phase 6 follow-ups** — Wire real cluster launchers / CUDA backends into `job.remote` and `$LPC_LLM_CONVERT_CMD`
+6. **(Follow-on)** New MoE families via Phase 16 slots: Llama 4 / gpt-oss (separate phases once template lands)
+7. **(Optional)** Pathfinder MoE catalog `qwen3:30b-a3b`
+8. **(Optional)** In-process adapter hot-reload / mid-chat hot-swap (Phase 1 + 7.3 leftovers)
+9. **(Optional)** Packaging that ships `/etc/lpc-llm/config_lpcllm` with `install.mode = "system"`
+10. **(Optional)** Gemma vision (project-map inotify absorbed into Phase 17.3)
 
 ---
 
@@ -760,6 +836,7 @@ Adding each MoE LLM today still fans out across `catalog.rs`, `PromptStyle`, `Mo
 | 拡張 / Phase 14 | 精度維持のままデコード高速化（≥3× / ストレッチ tok/s） | **進行中**（Softmax GPU · dual-scratch · 条件付き Q8_0 · MoE 重ね） |
 | 拡張 / Phase 15 | モデル削除: blobs + 関連エンジンキャッシュを CLI で purge | **完了** |
 | 拡張 / Phase 16 | アーキテクチャ family バックエンド（静的プラグイン；MoE 追加をコア非破壊で） | **計画**（コンパイル時 inventory；ホットパスに dlopen なし） |
+| 拡張 / Phase 17 | IDE 的コーディングエージェント（文脈 · ツール · 索引 · 安全な write-back） | **計画**（Phase 7–8 の上；制約 RAM 優先） |
 
 **いま使えるもの:**  
 `lpc-llm run <model> --adapter <name>`（Hybrid LoRA）、  
@@ -781,7 +858,8 @@ MoE GGUF では `experts.pack` + Top-K Expert DMA + **Expert RAM LRU キャッ�
 **Phase 13（完了）:** DeviceAct + Top-K gate/up 融合 + shared∥expert 並列 + attn QKV DeviceAct + Gemma4 thought 抑制（`>>>` 回答）。ホスト **~1.8–2.4 tok/s**（≈2–2.4×）。
 **Phase 14（進行中）:** 精度維持の高速化 — Softmax GPU（大きな last-dim）、dual-scratch ping-pong、shared gate/up ∥ router CPU、条件付き融合 Q8_0 down；成功条件は暖機後 2 通目で ≥3×。  
 **Phase 15（完了）:** `lpc-llm rm` で完全アンインストール — 既定はレジストリのみ；`--purge` で永続 `blobs/` + 再生成可 `cache/packs/<model>/`；任意で `--with-adapters` / `--cache`；`-y` で確認スキップ。  
-**Phase 16（計画）:** **コア**（packs · expert DMA · Vulkan QMatMul · adapters · session）と **コンパイル時 family バックエンド**（catalog + prompt + GGUF/MoE レイアウト + forward 差分）に分け、Llama 4 / gpt-oss 等をテンプレモジュールとして追加可能にする。**dlopen なし**。精度・デコード速度を落とさない。
+**Phase 16（計画）:** **コア**（packs · expert DMA · Vulkan QMatMul · adapters · session）と **コンパイル時 family バックエンド**（catalog + prompt + GGUF/MoE レイアウト + forward 差分）に分け、Llama 4 / gpt-oss 等をテンプレモジュールとして追加可能にする。**dlopen なし**。精度・デコード速度を落とさない。  
+**Phase 17（計画）:** Phase 7–8 の上に **IDE 的コーディングエージェント** — 文脈拡張（docs + オンデマンド全文）、ツールループ（`read`/`grep`/`edit`/`shell`/`web_search`）、索引品質（埋め込み / 差分監視）、**安全な write-back**。現状の `--agent` はアダプタ/Expert **ルーター**のみ；Phase 7–8 は短いコード地図と Web 断片の注入まで。
 
 ---
 
@@ -806,7 +884,7 @@ MoE GGUF では `experts.pack` + Top-K Expert DMA + **Expert RAM LRU キャッ�
 | `--adapter user_profile` 自動アタッチ | **可能** | Phase 1 の Hybrid サイドパスを流用。`run` 開始時に存在すれば自動ロード（再起動不要はプロセス内アタッチの意味；デーモン化は任意） |
 | プロジェクト AST/依存グラフ → `map.bin` | **可能** | tree-sitter 等で AST・シンボル・呼び出し辺を抽出。軽量 Embedding（ハッシュ or 小型モデル）をノード属性として付与。全コードを RAM 展開せず NVMe 上の構造化インデックスに保持 |
 | `io_uring` オンデマンド・シンボル引出 | **可能** | 既存の層パック DMA と同型。ノード単位の固定長レコード + オフセット表を `O_DIRECT` でプレフェッチ。ミリ秒差分更新は「変更ファイルの再パース → 影響サブグラフのみ書き換え」 |
-| `--project-map` 俯瞰コンテキスト | **条件付き可能** | 「数十万行を丸ごとプロンプト」は不可。**関連部分グラフの要約・シグネチャ列**を合成する。Cursor 級の IDE 統合は範囲外；CLI でのグラフ RAG が本リポの現実的な到達点 |
+| `--project-map` 俯瞰コンテキスト | **条件付き可能** | 「数十万行を丸ごとプロンプト」は不可。**関連部分グラフの要約・シグネチャ列**を合成する。本格的な **IDE 的**エージェントループは **Phase 17**；Phase 8 の到達点は CLI グラフ RAG |
 
 **結論:** Phase 7・8 ともエンジニアリングとして追える。Phase 7 の自動学習は Phase 4 完了後、Phase 8 の DMA 引出は既存 io_uring 基盤の延長。いずれも「限定リソース下で完結する中間成果物」を先に置き、理想仕様（完全自動・全量俯瞰）は段階的に近づける。
 
@@ -1338,6 +1416,77 @@ Phase 13 で量子化・Top-K を変えずに暖機後 **~2×** を得た。残�
 - 実行時プラグイン市場、WASM モデルグラフ
 - プラグイン化のために量子化を粗くする・Top-K を減らす変更
 
+### Phase 17: IDE 的コーディングエージェント（文脈 · ツール · 索引 · 安全な編集） — **計画**
+
+Phase 7–8 は **チャット側 RAG**（`cache/knowledge/` の Web 断片と、シグネチャ／プレビュー中心の短い project-map 概要）まで。制約 RAM 下で **ディレクトリを網羅し、推論し、必要なら Web を引き、コード変更を適用する** IDE 的ループにはまだ届いていない。
+
+**現状ギャップ（Phase 17 が埋めるもの）:**
+| 能力 | 現状 | 目標 |
+|------|------|------|
+| エージェント / ツールループ | `--agent` = SmolLM2 **ルーター**のみ（アダプタ / Expert） | **読む → 検索 → 編集 → テスト** の多段ツール実行 |
+| オンデマンド全文 | シグネチャ + 短いプレビュー（概要 ~2.4 k 文字） | 予算付きの全文 / チャンク取得 |
+| docs / 設定の索引 | ソース拡張子のみ（マニュアル / md / 設定なし） | docs・markdown・よく使う設定を一等市民として索引 |
+| セマンティック検索 | ハッシュ n-gram + 語彙オーバーラップ | 任意の軽量ニューラル埋め込み（RAM 上限付き） |
+| 常時索引 | 手動 `project-map build` / `rebuild` | 差分再索引（inotify / mtime）、フル rebuild 不要 |
+| write-back | チャット生成のみ；適用経路なし | パッチ適用 + レビュー；破壊的操作のガード |
+
+**再利用する強み:** NVMe 上の project-map + io_uring 風フェッチ；Web → ローカル知識ストア；低 RAM hybrid 推論。Phase 17 はその基板上の **エージェント実行層**であり、第二の推論エンジンではない。
+
+**目標:** テーマ（常駐 ≤16 GiB 級、常時マルチ GPU IDE なし）を崩さず、多段のリポジトリ作業に耐える CLI コーディングエージェントを出す。
+
+**厳守制約:**
+- Phase 12–14 の hybrid デコード精度・速度を落とさない。
+- 文脈注入は **予算付き**（ツリー全体のプロンプトダンプ禁止）。
+- 破壊的 shell / 大量削除は明示 allowlist / 確認。
+- Phase 3 ルーターモードは残す。コーディングエージェントは **別モード**（フラグまたはサブコマンド）。`--agent` の黙っての乗っ取りはしない。
+
+**Deps:** Phase 7 知識 + Phase 8 project-map。Phase 14 速度ゲートと Phase 16 family スロットがあると主モデル拡張と相性がよい。必要なら 16 と並行で 17.1–17.2 から着手可。
+
+**積み上げ順（リソース安全）:**
+1. 文脈層 → 2. ツール付きエージェント → 3. 索引品質 → 4. 編集安全性。
+
+#### 17.1 文脈層の拡張
+
+- [ ] **docs / markdown / よく使う設定** をコードと並んで索引（拡張子 + サイズ上限；バイナリ除外）
+- [ ] **オンデマンド全文 / チャンク read** API（プロジェクト root + 既存 map ヒント）
+- [ ] **チャンク / 総文脈の硬上限**（設定可；既定は hybrid ≤16 GiB セッション向け）
+- [ ] `enrich_user` / エージェントターンへ、無制限成長なしで接続
+
+#### 17.2 ツール付きコーディングエージェント
+
+- [ ] 新モード（例: `run … --coding-agent` または `lpc-llm agent …`）— Phase 3 ルーター `--agent` は置換しない
+- [ ] ツール: `read` · `grep` · `edit`/`apply_patch` · `shell` · `web_search`（Phase 7 バックエンド再利用）
+- [ ] 多段ループ: モデルがツール呼び出し → ホスト実行 → 観測を戻す → 停止 / 予算まで
+- [ ] メモリ排他: 大型 MoE と同居時はルーター等を pause / shed（Phase 3 方針の拡張）
+- [ ] 構造化ツールプロトコル（JSON またはタグブロック）+ 厳格パース + 不正呼び出し拒否
+
+#### 17.3 索引品質
+
+- [ ] 任意 **tree-sitter**（または同等）抽出；ヒューリスティックはフォールバック維持
+- [ ] 任意 **軽量埋め込みモデル**（feature ゲート；ハッシュ経路は既定のまま）
+- [ ] **差分再索引**: mtime / inotify（Linux）で影響サブグラフのみ書き換え
+- [ ] 背景 `project-map` 更新ジョブ；status で鮮度表示
+
+#### 17.4 編集安全性
+
+- [ ] unified-diff / search-replace のパッチ適用；書き込み前 dry-run + diff 表示（TTY 確認；`-y` は明示 opt-in）
+- [ ] パス allowlist（プロジェクト root jail）；root 外 / `.git` への書き込みはオプトインなしで拒否
+- [ ] shell ツール: allowlist または確認；コーディングエージェント方針では無制限ネットワーク／プロセスを既定禁止
+- [ ] 適用編集の監査ログ（`cache/` または設定パス）— undo / レビュー用
+
+#### 17.5 検証 / ドキュメント
+
+- [ ] fixture リポのスモーク: read → grep → patch → 再 read；web_search は任意
+- [ ] 文脈予算の単体（硬上限を超えない）
+- [ ] README（EN+JA）: coding-agent とルーター `--agent` の違い；ツール方針；セキュリティ注記
+- [ ] 17.1–17.2 + 安全 write-back MVP で **完了**可；17.3–17.4 はチェックリスト残りとして後追い可
+
+#### 17.6 範囲外（本フェーズ）
+
+- フル GUI IDE / LSP 製品化
+- 「モノレポ全体を RAM に載せる」無制限方式
+- ローカル確認方針なしの自律インターネットボット
+
 ---
 
 ## 4. 仕様書セクション別の対応状況
@@ -1363,7 +1512,8 @@ Phase 13 で量子化・Top-K を変えずに暖機後 **~2×** を得た。残�
 | コマンド | 現状 |
 |----------|------|
 | `run … --adapter <name>` | **実装済** |
-| `run … --agent` | **実装済**（`--agent-model` 付き） |
+| `run … --agent` | **実装済**（`--agent-model` 付き；Phase 3 **ルーター**のみ） |
+| `run … --coding-agent` / `agent …`（ツール） | **計画**（Phase 17；ルーター `--agent` とは別） |
 | `run … --project-map` | **実装済**（Phase 8；path または hash） |
 | `run … --knowledge` / `--no-user-profile` | **実装済**（Phase 7） |
 | `adapter list` | **実装済** |
@@ -1394,6 +1544,7 @@ Phase 13 で量子化・Top-K を変えずに暖機後 **~2×** を得た。残�
 | デコードスループット（MoE + Vulkan fuse / MoE I/O） | **完了**（Phase 13；~2×；≥3× → Phase 14） |
 | 精度維持のデコード高速化（≥3×） | **進行中**（Phase 14；Softmax GPU · dual-scratch · 条件付き Q8_0） |
 | アーキテクチャ family バックエンド（静的プラグイン / MoE テンプレ） | **計画**（Phase 16；コンパイル時 inventory；ホットパスに dlopen なし） |
+| IDE 的コーディングエージェント（文脈 · ツール · 索引 · 安全な編集） | **計画**（Phase 17；Phase 7–8 基板の上） |
 | CQE 時の ΔW マージ（重み書き換え） | 採用せず（サイドパス方針） |
 
 ---
@@ -1402,13 +1553,14 @@ Phase 13 で量子化・Top-K を変えずに暖機後 **~2×** を得た。残�
 
 1. **Phase 14（進行中）** — ホスト暖機 2 通目 ≥3× 計測；任意 logits A/B；層 i∥i+1 QKV パイプライン（ストレッチ）
 2. **Phase 16（計画）** — 14 の速度ゲート後: コア/family 分割 + テンプレ；Gemma4 参照バックエンド切り出し；inventory；回帰 A/B
-3. **Phase 13 締め** — RSS / vs `gemma3:27b`（13.1 は 14.4 文書に吸収）
-4. **Phase 6 フォロー** — `job.remote` / `$LPC_LLM_CONVERT_CMD` に実クラスタ・CUDA 変換を接続
-5. **（後続）** Phase 16 スロット経由で新 MoE family: Llama 4 / gpt-oss（テンプレ後の別フェーズ）
-6. **（任意）** 経路探査カタログ `qwen3:30b-a3b`
-7. **（任意）** プロセス内アダプタホットリロード / 会話途中ホットスワップ（Phase 1 + 7.3 残り）
-8. **（任意）** `install.mode = "system"` の `/etc/lpc-llm/config_lpcllm` を同梱するパッケージ化
-9. **（任意）** project-map 16GB 級回帰ベンチ / inotify 差分監視；Gemma vision
+3. **Phase 17（計画）** — IDE 的コーディングエージェント: 文脈予算 + docs 索引 → ツールループ → 差分索引 → 安全 write-back（7–8 後は 16 と並行可）
+4. **Phase 13 締め** — RSS / vs `gemma3:27b`（13.1 は 14.4 文書に吸収）
+5. **Phase 6 フォロー** — `job.remote` / `$LPC_LLM_CONVERT_CMD` に実クラスタ・CUDA 変換を接続
+6. **（後続）** Phase 16 スロット経由で新 MoE family: Llama 4 / gpt-oss（テンプレ後の別フェーズ）
+7. **（任意）** 経路探査カタログ `qwen3:30b-a3b`
+8. **（任意）** プロセス内アダプタホットリロード / 会話途中ホットスワップ（Phase 1 + 7.3 残り）
+9. **（任意）** `install.mode = "system"` の `/etc/lpc-llm/config_lpcllm` を同梱するパッケージ化
+10. **（任意）** Gemma vision（project-map inotify は Phase 17.3 に吸収）
 
 ---
 
